@@ -10,9 +10,11 @@ from pydantic import BaseModel
 from fast_agent import FastAgent
 
 # 1. 路径与配置初始化
-BASE_DIR = Path("D:/fast-agent-main/fast-agent-main")
+# 1. 路径与配置初始化
+BASE_DIR = Path(__file__).resolve().parent
 HOME_DIR = BASE_DIR / ".fast-agent"
 CONFIG_PATH = HOME_DIR / "fast-agent.yaml"
+
 
 # 创建 FastAgent 实例
 fast = FastAgent(
