@@ -1,0 +1,139 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CODESYS AI Assistant</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <style>
+        :root {
+            --bg-color: #0f0f0f;
+            --panel-color: #1a1a1a;
+            --border-color: #333333;
+            --text-primary: #e0e0e0;
+            --accent-blue: #3b82f6;
+        }
+        body { background-color: var(--bg-color); color: var(--text-primary); font-family: system-ui, -apple-system, sans-serif; overflow: hidden; }
+        .chat-container { border: 1px solid var(--border-color); background-color: var(--panel-color); box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
+        .message-ai { background-color: #242424; border: 1px solid #333; }
+        .message-user { background-color: var(--accent-blue); color: white; }
+        .markdown-body pre { background-color: #0d0d0d; padding: 1rem; border-radius: 6px; overflow-x: auto; border: 1px solid #222; margin: 0.5rem 0; }
+        .markdown-body code { font-family: monospace; background-color: #333; padding: 2px 4px; border-radius: 4px; font-size: 0.9em; }
+        ::-webkit-scrollbar { width: 5px; }
+        ::-webkit-scrollbar-thumb { background: #444; border-radius: 3px; }
+        
+        /* 正在输入动画 */
+        .typing { display: flex; gap: 4px; padding: 6px 0; }
+        .dot { width: 4px; height: 4px; background: #888; border-radius: 50%; animation: blink 1.4s infinite; }
+        .dot:nth-child(2) { animation-delay: 0.2s; }
+        .dot:nth-child(3) { animation-delay: 0.4s; }
+        @keyframes blink { 0%, 100% { opacity: 0.3; transform: scale(0.8); } 50% { opacity: 1; transform: scale(1.2); } }
+        
+        .fade-in { animation: fadeIn 0.3s ease-in-out; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
+    </style>
+</head>
+<body class="h-screen flex items-center justify-center p-4">
+    <div class="flex flex-col w-full max-w-4xl h-[90vh] chat-container rounded-2xl">
+        <header class="flex items-center justify-between px-6 py-4 border-b border-[#333]">
+            <div class="flex items-center gap-3">
+                <div class="w-1.5 h-5 bg-blue-500 rounded-full"></div>
+                <h1 class="text-md font-semibold tracking-tight">CODESYS <span class="text-blue-500">AI</span></h1>
+            </div>
+            <div id="status-box" class="flex items-center gap-2 px-3 py-1 rounded-full bg-black/40 border border-[#333]">
+                <div id="status-dot" class="w-2 h-2 rounded-full bg-gray-600"></div>
+                <span id="status-text" class="text-[10px] text-gray-500 font-bold uppercase">Connecting</span>
+            </div>
+        </header>
+
+        <main id="chat-box" class="flex-1 overflow-y-auto p-6 space-y-6">
+            <div id="welcome-msg" class="text-center py-20 opacity-20"><p class="text-sm italic">Waiting for instructions...</p></div>
+        </main>
+
+        <footer class="p-6 border-t border-[#333]">
+            <div class="flex gap-2 bg-[#252525] border border-[#444] rounded-xl p-1.5 focus-within:border-blue-500/50 transition-all">
+                <input type="text" id="user-input" placeholder="Ask anything..." class="flex-1 bg-transparent border-none outline-none px-3 text-sm text-white">
+                <button id="send-btn" class="bg-white text-black text-xs font-bold px-5 py-2 rounded-lg hover:bg-gray-200 transition-all">SEND</button>
+            </div>
+        </footer>
+    </div>
+    <script>
+        const chatBox = document.getElementById('chat-box');
+        const userInput = document.getElementById('user-input');
+        const sendBtn = document.getElementById('send-btn');
+        const statusDot = document.getElementById('status-dot');
+        const statusText = document.getElementById('status-text');
+
+        async function checkStatus() {
+            try {
+                const res = await fetch('/api/status');
+                const data = await res.json();
+                if (data.backend === 'online') {
+                    statusDot.className = `w-2 h-2 rounded-full ${data.mcp_ready ? 'bg-green-500' : 'bg-yellow-500'}`;
+                    statusText.textContent = data.mcp_ready ? 'Online' : 'No MCP';
+                }
+            } catch (e) {
+                statusDot.className = 'w-2 h-2 rounded-full bg-red-500';
+                statusText.textContent = 'Offline';
+            }
+        }
+        setInterval(checkStatus, 5000); checkStatus();
+
+        function addMsg(role, content, isTemp = false) {
+            const welcome = document.getElementById('welcome-msg');
+            if (welcome) welcome.remove();
+
+            const div = document.createElement('div');
+            div.className = `flex w-full ${role === 'user' ? 'justify-end' : 'justify-start'} fade-in`;
+            if (isTemp) div.id = 'temp-loading';
+
+            const inner = document.createElement('div');
+            inner.className = `max-w-[85%] px-4 py-3 rounded-xl text-sm ${role === 'user' ? 'message-user rounded-tr-none' : 'message-ai rounded-tl-none text-gray-300 markdown-body'}`;
+            
+            if (isTemp) {
+                inner.innerHTML = '<div class="typing"><div class="dot"></div><div class="dot"></div><div class="dot"></div></div>';
+            } else if (role === 'user') {
+                inner.textContent = content;
+            } else {
+                inner.innerHTML = marked.parse(content);
+            }
+            
+            div.appendChild(inner); chatBox.appendChild(div);
+            chatBox.scrollTo({ top: chatBox.scrollHeight, behavior: 'smooth' });
+        }
+
+        async function send() {
+            const text = userInput.value.trim(); if (!text) return;
+            addMsg('user', text); 
+            userInput.value = '';
+            userInput.disabled = sendBtn.disabled = true;
+
+            // 1. 先添加加载动画气泡
+            addMsg('ai', '', true);
+
+            try {
+                const res = await fetch('/api/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ message: text })
+                });
+                const data = await res.json();
+                
+                // 2. 移除加载气泡
+                const temp = document.getElementById('temp-loading');
+                if (temp) temp.remove();
+                
+                // 3. 显示真实回答
+                addMsg('ai', res.ok ? data.response : 'Error: ' + data.detail);
+            } catch (e) { 
+                const temp = document.getElementById('temp-loading');
+                if (temp) temp.remove();
+                addMsg('ai', 'Connection error.'); 
+            }
+            finally { userInput.disabled = sendBtn.disabled = false; userInput.focus(); }
+        }
+        sendBtn.onclick = send; userInput.onkeypress = (e) => { if (e.key === 'Enter') send(); };
+    </script>
+</body>
+</html>

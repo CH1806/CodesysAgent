@@ -1,0 +1,335 @@
+"""Tests for instruction building and refresh utilities."""
+
+import asyncio
+from pathlib import Path
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, cast
+
+from fast_agent.core.instruction_refresh import (
+    McpInstructionCapable,
+    build_instruction,
+    format_server_instructions,
+    rebuild_agent_instruction,
+    resolve_instruction_skill_manifests,
+)
+from fast_agent.core.instruction_utils import (
+    InstructionContextAgent,
+    build_agent_instruction_context,
+)
+from fast_agent.skills import SKILLS_DEFAULT
+
+if TYPE_CHECKING:
+    from fast_agent.core.instruction_refresh import ConfiguredMcpInstructionCapable
+    from fast_agent.mcp.mcp_aggregator import MCPAggregator
+
+
+class StubAggregator:
+    """Stub aggregator that returns predefined server instructions."""
+
+    def __init__(self, instructions: dict[str, tuple[str | None, list[str]]] | None = None):
+        self._instructions = instructions or {}
+
+    async def get_server_instructions(self) -> dict[str, tuple[str | None, list[str]]]:
+        return self._instructions
+
+
+class StubAgent:
+    """Stub that implements McpInstructionCapable for testing."""
+
+    def __init__(
+        self,
+        template: str = "Test instruction",
+        aggregator: StubAggregator | None = None,
+    ) -> None:
+        self.name = "stub"
+        self._instruction = template
+        self._instruction_template = template
+        self._instruction_context: dict[str, str] = {}
+        self._skill_manifests: list = []
+        self.config = SimpleNamespace(skills=SKILLS_DEFAULT)
+        self._skill_registry = None
+        self._aggregator = aggregator or StubAggregator()
+        self._skill_read_tool_name = "read_skill"
+
+    @property
+    def instruction(self) -> str:
+        return self._instruction
+
+    def set_instruction(self, instruction: str) -> None:
+        self._instruction = instruction
+
+    @property
+    def instruction_template(self) -> str:
+        return self._instruction_template
+
+    @property
+    def instruction_context(self) -> dict[str, str]:
+        return self._instruction_context
+
+    @property
+    def aggregator(self):
+        return self._aggregator
+
+    @property
+    def skill_manifests(self) -> list:
+        return self._skill_manifests
+
+    @property
+    def skill_registry(self):
+        return self._skill_registry
+
+    @skill_registry.setter
+    def skill_registry(self, value):
+        self._skill_registry = value
+
+    def set_skill_manifests(self, manifests) -> None:
+        self._skill_manifests = list(manifests)
+
+    def set_instruction_context(self, context: dict[str, str]) -> None:
+        self._instruction_context.update(context)
+
+    @property
+    def skill_read_tool_name(self) -> str:
+        return self._skill_read_tool_name
+
+
+# Ensure StubAgent is recognized as McpInstructionCapable
+assert isinstance(StubAgent(), McpInstructionCapable)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test format_server_instructions
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_format_server_instructions_empty() -> None:
+    result = format_server_instructions({})
+    assert result == ""
+
+
+def test_format_server_instructions_with_data() -> None:
+    data: dict[str, tuple[str | None, list[str]]] = {
+        "test-server": ("Do helpful things", ["tool1", "tool2"]),
+    }
+    result = format_server_instructions(data)
+    assert "test-server" in result
+    assert "Do helpful things" in result
+    assert "test-server__tool1" in result
+    assert "test-server__tool2" in result
+
+
+def test_format_server_instructions_skips_none() -> None:
+    data: dict[str, tuple[str | None, list[str]]] = {
+        "server1": ("Instructions", ["tool1"]),
+        "server2": (None, ["tool2"]),  # Should be skipped
+    }
+    result = format_server_instructions(data)
+    assert "server1" in result
+    assert "server2" not in result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test build_instruction
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_build_instruction_resolves_builtins() -> None:
+    template = "Today is {{currentDate}}. Platform: {{hostPlatform}}"
+    result = asyncio.run(build_instruction(template))
+    # Should not contain the placeholders anymore
+    assert "{{currentDate}}" not in result
+    assert "{{hostPlatform}}" not in result
+
+
+def test_build_instruction_with_context() -> None:
+    template = "Root: {{workspaceRoot}}"
+    result = asyncio.run(build_instruction(template, context={"workspaceRoot": "/test/path"}))
+    assert result == "Root: /test/path"
+
+
+def test_build_instruction_resolves_file_placeholder(tmp_path: Path) -> None:
+    instruction_file = tmp_path / "instructions.md"
+    instruction_file.write_text("Read me", encoding="utf-8")
+
+    result = asyncio.run(
+        build_instruction(
+            "Context: {{file:instructions.md}}",
+            context={"workspaceRoot": str(tmp_path)},
+        )
+    )
+
+    assert result == "Context: Read me"
+
+
+def test_build_instruction_normalizes_padded_file_placeholder(tmp_path: Path) -> None:
+    instruction_file = tmp_path / "instructions.md"
+    instruction_file.write_text("Read me", encoding="utf-8")
+
+    result = asyncio.run(
+        build_instruction(
+            "Context: {{file:  instructions.md  }}",
+            context={"workspaceRoot": str(tmp_path)},
+        )
+    )
+
+    assert result == "Context: Read me"
+
+
+def test_build_instruction_silent_file_placeholder_returns_empty_for_missing(
+    tmp_path: Path,
+) -> None:
+    result = asyncio.run(
+        build_instruction(
+            "Context: {{file_silent:missing.md}}",
+            context={"workspaceRoot": str(tmp_path)},
+        )
+    )
+
+    assert result == "Context: "
+
+
+def test_build_instruction_rejects_absolute_file_placeholder(tmp_path: Path) -> None:
+    absolute_path = tmp_path / "instructions.md"
+
+    try:
+        asyncio.run(build_instruction(f"{{{{file:{absolute_path}}}}}"))
+    except ValueError as exc:
+        assert "must be relative" in str(exc)
+    else:
+        raise AssertionError("absolute file placeholder should fail")
+
+
+def test_build_instruction_falls_back_for_agent_directory_in_cwd(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    cwd = tmp_path / "cwd"
+    workspace.mkdir()
+    fallback_file = cwd / ".fast-agent" / "agents" / "reviewer.md"
+    fallback_file.parent.mkdir(parents=True)
+    fallback_file.write_text("Fallback instructions", encoding="utf-8")
+    monkeypatch.chdir(cwd)
+
+    result = asyncio.run(
+        build_instruction(
+            "{{file:.fast-agent/agents/reviewer.md}}",
+            context={"workspaceRoot": str(workspace)},
+        )
+    )
+
+    assert result == "Fallback instructions"
+
+
+def test_build_instruction_with_model_specific_context() -> None:
+    agent = SimpleNamespace(
+        name="gpt-agent",
+        instruction="",
+        agent_type="basic",
+        config=SimpleNamespace(
+            name="gpt-agent",
+            agent_type="basic",
+            source_path=None,
+            model="gpt-5.4",
+        ),
+    )
+    context = build_agent_instruction_context(cast("InstructionContextAgent", agent))
+
+    result = asyncio.run(build_instruction("Base\n{{model_specific}}", context=context))
+
+    assert "Before making tool calls, send a brief preamble" in result
+    assert "{{model_specific}}" not in result
+
+
+def test_build_instruction_with_aggregator() -> None:
+    template = "{{serverInstructions}}"
+    aggregator = StubAggregator({"my-server": ("Be helpful", ["do_thing"])})
+    result = asyncio.run(build_instruction(template, aggregator=cast("MCPAggregator", aggregator)))
+    assert "my-server" in result
+    assert "Be helpful" in result
+
+
+def test_resolve_instruction_skill_manifests_inherits_shared_context_for_default_skills() -> None:
+    agent = StubAgent()
+    agent.set_instruction_context({"agentSkills": "shared skills"})
+
+    assert (
+        resolve_instruction_skill_manifests(cast("ConfiguredMcpInstructionCapable", agent), [])
+        is None
+    )
+
+
+def test_resolve_instruction_skill_manifests_blanks_default_skills_without_shared_context() -> None:
+    agent = StubAgent()
+
+    resolved_manifests = resolve_instruction_skill_manifests(
+        cast("ConfiguredMcpInstructionCapable", agent),
+        [],
+    )
+
+    assert resolved_manifests == []
+    result = asyncio.run(
+        build_instruction("Skills:\n{{agentSkills}}", skill_manifests=resolved_manifests)
+    )
+    assert "{{agentSkills}}" not in result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test rebuild_agent_instruction
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_rebuild_agent_instruction_updates_fields() -> None:
+    agent = StubAgent(template="Hello {{workspaceRoot}}")
+    result = asyncio.run(
+        rebuild_agent_instruction(
+            agent,
+            context={"workspaceRoot": "/my/path"},
+        )
+    )
+    assert agent.instruction == "Hello /my/path"
+    assert agent.instruction_context == {"workspaceRoot": "/my/path"}
+    assert result.updated_context is True
+    assert result.rebuilt_instruction is True
+
+
+def test_rebuild_agent_instruction_updates_skill_manifests() -> None:
+    agent = StubAgent()
+    result = asyncio.run(
+        rebuild_agent_instruction(
+            agent,
+            skill_manifests=["manifest1", "manifest2"],
+        )
+    )
+    assert agent.skill_manifests == ["manifest1", "manifest2"]
+    assert result.updated_skill_manifests is True
+
+
+def test_rebuild_agent_instruction_updates_skill_registry() -> None:
+    agent = StubAgent()
+    result = asyncio.run(
+        rebuild_agent_instruction(
+            agent,
+            skill_registry="my-registry",
+        )
+    )
+    assert agent.skill_registry == "my-registry"
+    assert result.updated_skill_registry is True
+
+
+def test_rebuild_agent_instruction_handles_non_mcp_agent() -> None:
+    class MinimalAgent:
+        pass
+
+    agent = MinimalAgent()
+    result = asyncio.run(rebuild_agent_instruction(agent))
+    assert result.updated_skill_manifests is False
+    assert result.updated_context is False
+    assert result.updated_skill_registry is False
+    assert result.rebuilt_instruction is False
+
+
+def test_rebuild_agent_instruction_handles_empty_template() -> None:
+    agent = StubAgent(template="")
+    result = asyncio.run(rebuild_agent_instruction(agent))
+    assert result.rebuilt_instruction is False

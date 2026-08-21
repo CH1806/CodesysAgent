@@ -1,0 +1,796 @@
+"""
+Unit tests for ACP content block conversion to MCP format.
+"""
+
+from __future__ import annotations
+
+import base64
+from typing import TYPE_CHECKING, cast
+
+from acp.schema import (
+    AudioContentBlock,
+    BlobResourceContents,
+    EmbeddedResourceContentBlock,
+    ImageContentBlock,
+    ResourceContentBlock,
+    TextContentBlock,
+    TextResourceContents,
+)
+from mcp_types import AudioContent as MCPAudioContent
+from mcp_types import (
+    BlobResourceContents as MCPBlobResourceContents,
+)
+from mcp_types import (
+    EmbeddedResource as MCPEmbeddedResource,
+)
+from mcp_types import (
+    ImageContent as MCPImageContent,
+)
+from mcp_types import ResourceLink as MCPResourceLink
+from mcp_types import (
+    TextContent as MCPTextContent,
+)
+from mcp_types import (
+    TextResourceContents as MCPTextResourceContents,
+)
+
+from fast_agent.acp.content_conversion import (
+    _file_uri_to_path,
+    convert_acp_content_to_mcp,
+    convert_acp_prompt_to_mcp_content_blocks,
+    inline_resources_for_slash_command,
+)
+
+if TYPE_CHECKING:
+    from acp.helpers import ContentBlock as ACPContentBlock
+
+
+def _acp_prompt(*blocks: ACPContentBlock) -> list[ACPContentBlock]:
+    """Build an ACP prompt with the widened content-block type expected by helpers."""
+    return list(blocks)
+
+
+class TestTextContentConversion:
+    """Test conversion of TextContentBlock."""
+
+    def test_basic_text_conversion(self):
+        """Test basic text content conversion."""
+        acp_text = TextContentBlock(
+            type="text",
+            text="Hello, world!",
+        )
+
+        mcp_content = convert_acp_content_to_mcp(acp_text)
+
+        assert isinstance(mcp_content, MCPTextContent)
+        assert mcp_content.type == "text"
+        assert mcp_content.text == "Hello, world!"
+        assert mcp_content.annotations is None
+
+    def test_text_with_annotations(self):
+        """Test text content with annotations."""
+        # Note: annotations are optional and may not be present
+        acp_text = TextContentBlock(
+            type="text",
+            text="Important message",
+        )
+
+        mcp_content = convert_acp_content_to_mcp(acp_text)
+
+        assert isinstance(mcp_content, MCPTextContent)
+        assert mcp_content.text == "Important message"
+
+
+class TestImageContentConversion:
+    """Test conversion of ImageContentBlock."""
+
+    def test_basic_image_conversion(self):
+        """Test basic image content conversion."""
+        # Create a simple base64 encoded image data
+        image_data = base64.b64encode(b"fake-image-data").decode("utf-8")
+
+        acp_image = ImageContentBlock(
+            type="image",
+            data=image_data,
+            mime_type="image/png",
+        )
+
+        mcp_content = convert_acp_content_to_mcp(acp_image)
+
+        assert isinstance(mcp_content, MCPImageContent)
+        assert mcp_content.type == "image"
+        assert mcp_content.data == image_data
+        assert mcp_content.mime_type == "image/png"
+
+    def test_image_with_uri(self):
+        """Test image content with URI (should be preserved)."""
+        image_data = base64.b64encode(b"fake-image-data").decode("utf-8")
+
+        acp_image = ImageContentBlock(
+            type="image",
+            data=image_data,
+            mime_type="image/jpeg",
+            uri="file:///path/to/image.jpg",
+        )
+
+        mcp_content = convert_acp_content_to_mcp(acp_image)
+
+        assert isinstance(mcp_content, MCPImageContent)
+        assert mcp_content.data == image_data
+        assert mcp_content.mime_type == "image/jpeg"
+
+
+class TestAudioContentConversion:
+    """Test conversion of AudioContentBlock."""
+
+    def test_basic_audio_conversion(self):
+        """Test basic audio content conversion."""
+        audio_data = base64.b64encode(b"fake-audio-data").decode("utf-8")
+
+        acp_audio = AudioContentBlock(
+            type="audio",
+            data=audio_data,
+            mime_type="audio/wav",
+        )
+
+        mcp_content = convert_acp_content_to_mcp(acp_audio)
+
+        assert isinstance(mcp_content, MCPAudioContent)
+        assert mcp_content.type == "audio"
+        assert mcp_content.data == audio_data
+        assert mcp_content.mime_type == "audio/wav"
+
+
+class TestResourceLinkConversion:
+    """Test conversion of ResourceLink."""
+
+    def test_basic_resource_link_conversion(self):
+        """Test basic resource link conversion."""
+        acp_link = ResourceContentBlock(
+            type="resource_link",
+            name="Demo resource",
+            uri="https://example.com/resource.pdf",
+            mime_type="application/pdf",
+            size=1234,
+            description="A resource",
+            title="Demo",
+        )
+
+        mcp_content = convert_acp_content_to_mcp(acp_link)
+
+        assert isinstance(mcp_content, MCPResourceLink)
+        assert mcp_content.type == "resource_link"
+        assert mcp_content.name == "Demo resource"
+        assert str(mcp_content.uri) == "https://example.com/resource.pdf"
+        assert mcp_content.mime_type == "application/pdf"
+        assert mcp_content.size == 1234
+        assert mcp_content.description == "A resource"
+        assert mcp_content.title == "Demo"
+
+
+class TestEmbeddedResourceConversion:
+    """Test conversion of EmbeddedResourceContentBlock."""
+
+    def test_text_resource_conversion(self):
+        """Test conversion of embedded text resource."""
+        acp_resource = EmbeddedResourceContentBlock(
+            type="resource",
+            resource=TextResourceContents(
+                uri="file:///path/to/file.py",
+                mime_type="text/x-python",
+                text="def hello():\n    print('Hello')",
+            ),
+        )
+
+        mcp_content = convert_acp_content_to_mcp(acp_resource)
+
+        assert isinstance(mcp_content, MCPEmbeddedResource)
+        assert mcp_content.type == "resource"
+        assert isinstance(mcp_content.resource, MCPTextResourceContents)
+        assert str(mcp_content.resource.uri) == "file:///path/to/file.py"
+        assert mcp_content.resource.mime_type == "text/x-python"
+        assert mcp_content.resource.text == "def hello():\n    print('Hello')"
+
+    def test_blob_resource_conversion(self):
+        """Test conversion of embedded blob resource."""
+        blob_data = base64.b64encode(b"fake-binary-data").decode("utf-8")
+
+        acp_resource = EmbeddedResourceContentBlock(
+            type="resource",
+            resource=BlobResourceContents(
+                uri="file:///path/to/file.pdf",
+                mime_type="application/pdf",
+                blob=blob_data,
+            ),
+        )
+
+        mcp_content = convert_acp_content_to_mcp(acp_resource)
+
+        assert isinstance(mcp_content, MCPEmbeddedResource)
+        assert mcp_content.type == "resource"
+        assert isinstance(mcp_content.resource, MCPBlobResourceContents)
+        assert str(mcp_content.resource.uri) == "file:///path/to/file.pdf"
+        assert mcp_content.resource.mime_type == "application/pdf"
+        assert mcp_content.resource.blob == blob_data
+
+    def test_text_resource_without_mimetype(self):
+        """Test text resource without MIME type."""
+        acp_resource = EmbeddedResourceContentBlock(
+            type="resource",
+            resource=TextResourceContents(
+                uri="file:///path/to/file.txt",
+                text="Hello, world!",
+            ),
+        )
+
+        mcp_content = convert_acp_content_to_mcp(acp_resource)
+
+        assert isinstance(mcp_content, MCPEmbeddedResource)
+        assert isinstance(mcp_content.resource, MCPTextResourceContents)
+        assert str(mcp_content.resource.uri) == "file:///path/to/file.txt"
+        assert mcp_content.resource.mime_type is None
+        assert mcp_content.resource.text == "Hello, world!"
+
+
+class TestPromptConversion:
+    """Test conversion of complete ACP prompts to MCP content blocks."""
+
+    def test_mixed_content_prompt(self):
+        """Test conversion of prompt with mixed content types."""
+        image_data = base64.b64encode(b"fake-image").decode("utf-8")
+
+        acp_prompt = _acp_prompt(
+            TextContentBlock(type="text", text="Please analyze this code:"),
+            EmbeddedResourceContentBlock(
+                type="resource",
+                resource=TextResourceContents(
+                    uri="file:///main.py",
+                    mime_type="text/x-python",
+                    text="print('hello')",
+                ),
+            ),
+            TextContentBlock(type="text", text="And this screenshot:"),
+            ImageContentBlock(
+                type="image",
+                data=image_data,
+                mime_type="image/png",
+            ),
+        )
+
+        mcp_blocks = convert_acp_prompt_to_mcp_content_blocks(acp_prompt)
+
+        assert len(mcp_blocks) == 4
+        assert isinstance(mcp_blocks[0], MCPTextContent)
+        assert mcp_blocks[0].text == "Please analyze this code:"
+        assert isinstance(mcp_blocks[1], MCPEmbeddedResource)
+        assert str(mcp_blocks[1].resource.uri) == "file:///main.py"
+        assert isinstance(mcp_blocks[2], MCPTextContent)
+        assert mcp_blocks[2].text == "And this screenshot:"
+        assert isinstance(mcp_blocks[3], MCPImageContent)
+        assert mcp_blocks[3].data == image_data
+
+    def test_audio_and_resource_link_prompt_blocks_are_preserved(self):
+        """Test media/link content is not skipped during prompt conversion."""
+        audio_data = base64.b64encode(b"fake-audio").decode("utf-8")
+        acp_prompt = _acp_prompt(
+            TextContentBlock(type="text", text="Review this media:"),
+            AudioContentBlock(
+                type="audio",
+                data=audio_data,
+                mime_type="audio/wav",
+            ),
+            ResourceContentBlock(
+                type="resource_link",
+                name="Demo resource",
+                uri="https://example.com/video.mp4",
+                mime_type="video/mp4",
+            ),
+        )
+
+        mcp_blocks = convert_acp_prompt_to_mcp_content_blocks(acp_prompt)
+
+        assert len(mcp_blocks) == 3
+        assert isinstance(mcp_blocks[0], MCPTextContent)
+        assert isinstance(mcp_blocks[1], MCPAudioContent)
+        assert mcp_blocks[1].data == audio_data
+        assert isinstance(mcp_blocks[2], MCPResourceLink)
+        assert str(mcp_blocks[2].uri) == "https://example.com/video.mp4"
+
+    def test_empty_prompt(self):
+        """Test conversion of empty prompt."""
+        acp_prompt: list[ACPContentBlock] = []
+        mcp_blocks = convert_acp_prompt_to_mcp_content_blocks(acp_prompt)
+        assert mcp_blocks == []
+
+    def test_text_only_prompt(self):
+        """Test conversion of text-only prompt."""
+        acp_prompt = _acp_prompt(
+            TextContentBlock(type="text", text="First message"),
+            TextContentBlock(type="text", text="Second message"),
+        )
+
+        mcp_blocks = convert_acp_prompt_to_mcp_content_blocks(acp_prompt)
+
+        assert len(mcp_blocks) == 2
+        assert all(isinstance(block, MCPTextContent) for block in mcp_blocks)
+        assert isinstance(mcp_blocks[0], MCPTextContent)
+        assert isinstance(mcp_blocks[1], MCPTextContent)
+        assert mcp_blocks[0].text == "First message"
+        assert mcp_blocks[1].text == "Second message"
+
+
+class TestUnsupportedContent:
+    """Test handling of unsupported content types."""
+
+    def test_unsupported_content_returns_none(self):
+        """Test that unsupported content types return None."""
+
+        # Create a mock unsupported content type
+        class UnsupportedContent:
+            type = "audio"
+            data = "base64-audio-data"
+
+        result = convert_acp_content_to_mcp(cast("ACPContentBlock", UnsupportedContent()))
+        assert result is None
+
+    def test_prompt_with_unsupported_content_skips_it(self):
+        """Test that unsupported content is skipped in prompt conversion."""
+
+        class UnsupportedContent:
+            type = "audio"
+
+        acp_prompt: list[ACPContentBlock] = [
+            TextContentBlock(type="text", text="Hello"),
+            cast("ACPContentBlock", UnsupportedContent()),
+            TextContentBlock(type="text", text="World"),
+        ]
+
+        mcp_blocks = convert_acp_prompt_to_mcp_content_blocks(acp_prompt)
+
+        # Should only have the two text blocks
+        assert len(mcp_blocks) == 2
+        assert all(isinstance(block, MCPTextContent) for block in mcp_blocks)
+        assert isinstance(mcp_blocks[0], MCPTextContent)
+        assert isinstance(mcp_blocks[1], MCPTextContent)
+        assert mcp_blocks[0].text == "Hello"
+        assert mcp_blocks[1].text == "World"
+
+
+class TestInlineResourcesForSlashCommand:
+    """Test inlining of resource paths into slash command text."""
+
+    def test_inline_single_resource_windows(self):
+        """Windows file:// URI is converted to local path."""
+        acp_prompt = _acp_prompt(
+            TextContentBlock(type="text", text="/card load "),
+            EmbeddedResourceContentBlock(
+                type="resource",
+                resource=TextResourceContents(
+                    uri="file:///X:/temp/foo.txt",
+                    text="",
+                ),
+            ),
+        )
+
+        result = inline_resources_for_slash_command(acp_prompt)
+
+        assert len(result) == 1
+        assert isinstance(result[0], TextContentBlock)
+        assert result[0].text == "/card load X:/temp/foo.txt"
+
+    def test_inline_single_resource_unix_path(self):
+        """Unix file:// URIs are converted to local paths."""
+        acp_prompt = _acp_prompt(
+            TextContentBlock(type="text", text="/card load "),
+            EmbeddedResourceContentBlock(
+                type="resource",
+                resource=TextResourceContents(
+                    uri="file:///home/user/foo.txt",
+                    text="",
+                ),
+            ),
+        )
+
+        result = inline_resources_for_slash_command(acp_prompt)
+
+        assert len(result) == 1
+        assert isinstance(result[0], TextContentBlock)
+        assert result[0].text == "/card load /home/user/foo.txt"
+
+    def test_inline_multiple_resources(self):
+        """Multiple resources become space-separated paths."""
+        acp_prompt = _acp_prompt(
+            TextContentBlock(type="text", text="/hash "),
+            EmbeddedResourceContentBlock(
+                type="resource",
+                resource=TextResourceContents(
+                    uri="file:///a.txt",
+                    text="",
+                ),
+            ),
+            EmbeddedResourceContentBlock(
+                type="resource",
+                resource=TextResourceContents(
+                    uri="file:///b.txt",
+                    text="",
+                ),
+            ),
+        )
+
+        result = inline_resources_for_slash_command(acp_prompt)
+
+        assert len(result) == 1
+        assert isinstance(result[0], TextContentBlock)
+        assert result[0].text == "/hash /a.txt /b.txt"
+
+    def test_inline_resource_path_with_spaces_is_quoted(self):
+        """Paths with spaces are quoted before being appended to command text."""
+        acp_prompt = _acp_prompt(
+            TextContentBlock(type="text", text="/card load "),
+            EmbeddedResourceContentBlock(
+                type="resource",
+                resource=TextResourceContents(
+                    uri="file:///home/user/My%20Folder/foo.txt",
+                    text="",
+                ),
+            ),
+        )
+
+        result = inline_resources_for_slash_command(acp_prompt)
+
+        assert len(result) == 1
+        assert isinstance(result[0], TextContentBlock)
+        assert result[0].text == "/card load '/home/user/My Folder/foo.txt'"
+
+    def test_no_inline_without_slash(self):
+        """Regular prompts with resources remain unchanged."""
+        acp_prompt = _acp_prompt(
+            TextContentBlock(type="text", text="Please analyze this file"),
+            EmbeddedResourceContentBlock(
+                type="resource",
+                resource=TextResourceContents(
+                    uri="file:///foo.txt",
+                    text="file contents",
+                ),
+            ),
+        )
+
+        result = inline_resources_for_slash_command(acp_prompt)
+
+        # Should return original prompt unchanged
+        assert len(result) == 2
+        assert result is acp_prompt
+
+    def test_no_inline_text_only(self):
+        """Pure text slash commands remain unchanged."""
+        acp_prompt = _acp_prompt(
+            TextContentBlock(type="text", text="/card load foo.txt"),
+        )
+
+        result = inline_resources_for_slash_command(acp_prompt)
+
+        # Should return original prompt unchanged (no resources to inline)
+        assert len(result) == 1
+        assert result is acp_prompt
+
+    def test_preserves_existing_arguments(self):
+        """/card load @file.txt --as-tool preserves all text."""
+        acp_prompt = _acp_prompt(
+            TextContentBlock(type="text", text="/card load "),
+            EmbeddedResourceContentBlock(
+                type="resource",
+                resource=TextResourceContents(
+                    uri="file:///foo.txt",
+                    text="",
+                ),
+            ),
+        )
+
+        result = inline_resources_for_slash_command(acp_prompt)
+
+        assert len(result) == 1
+        assert isinstance(result[0], TextContentBlock)
+        assert result[0].text == "/card load /foo.txt"
+
+    def test_empty_prompt_unchanged(self):
+        """Empty prompt list returns unchanged."""
+        acp_prompt: list[ACPContentBlock] = []
+
+        result = inline_resources_for_slash_command(acp_prompt)
+
+        assert result == []
+
+    def test_first_block_not_text_unchanged(self):
+        """Prompt starting with non-text block remains unchanged."""
+        acp_prompt = _acp_prompt(
+            EmbeddedResourceContentBlock(
+                type="resource",
+                resource=TextResourceContents(
+                    uri="file:///foo.txt",
+                    text="file contents",
+                ),
+            ),
+            TextContentBlock(type="text", text="/card load"),
+        )
+
+        result = inline_resources_for_slash_command(acp_prompt)
+
+        # Should return original prompt unchanged
+        assert result is acp_prompt
+
+    def test_slash_with_leading_whitespace(self):
+        """Slash commands with leading whitespace are still detected."""
+        acp_prompt = _acp_prompt(
+            TextContentBlock(type="text", text="  /card load "),
+            EmbeddedResourceContentBlock(
+                type="resource",
+                resource=TextResourceContents(
+                    uri="file:///foo.txt",
+                    text="",
+                ),
+            ),
+        )
+
+        result = inline_resources_for_slash_command(acp_prompt)
+
+        assert len(result) == 1
+        assert isinstance(result[0], TextContentBlock)
+        assert result[0].text == "  /card load /foo.txt"
+
+    def test_blob_resource_inlined(self):
+        """Blob resources (PDFs, etc.) also have their paths inlined."""
+        blob_data = "ZmFrZS1wZGYtZGF0YQ=="  # base64 encoded "fake-pdf-data"
+        acp_prompt = _acp_prompt(
+            TextContentBlock(type="text", text="/hash "),
+            EmbeddedResourceContentBlock(
+                type="resource",
+                resource=BlobResourceContents(
+                    uri="file:///document.pdf",
+                    mime_type="application/pdf",
+                    blob=blob_data,
+                ),
+            ),
+        )
+
+        result = inline_resources_for_slash_command(acp_prompt)
+
+        assert len(result) == 1
+        assert isinstance(result[0], TextContentBlock)
+        assert result[0].text == "/hash /document.pdf"
+
+    def test_at_reference_replaced_with_path(self):
+        """@filename in text is replaced with local path from matching resource."""
+        acp_prompt = _acp_prompt(
+            TextContentBlock(type="text", text="/card load @tortie.md"),
+            EmbeddedResourceContentBlock(
+                type="resource",
+                resource=TextResourceContents(
+                    uri="file:///home/shaun/source/toad/tortie.md",
+                    text="---\nname: tortie\n...",
+                ),
+            ),
+        )
+
+        result = inline_resources_for_slash_command(acp_prompt)
+
+        assert len(result) == 1
+        assert isinstance(result[0], TextContentBlock)
+        assert result[0].text == "/card load /home/shaun/source/toad/tortie.md"
+
+    def test_at_reference_replaced_with_quoted_path(self):
+        """@filename replacements quote matching paths when needed."""
+        acp_prompt = _acp_prompt(
+            TextContentBlock(type="text", text="/card load @foo.txt"),
+            EmbeddedResourceContentBlock(
+                type="resource",
+                resource=TextResourceContents(
+                    uri="file:///home/user/My%20Folder/foo.txt",
+                    text="content",
+                ),
+            ),
+        )
+
+        result = inline_resources_for_slash_command(acp_prompt)
+
+        assert len(result) == 1
+        assert isinstance(result[0], TextContentBlock)
+        assert result[0].text == "/card load '/home/user/My Folder/foo.txt'"
+
+    def test_quoted_at_reference_with_spaces_replaced(self):
+        """Quoted @filename references can match attached filenames with spaces."""
+        acp_prompt = _acp_prompt(
+            TextContentBlock(type="text", text='/card load @"My Agent.md" --as-tool'),
+            EmbeddedResourceContentBlock(
+                type="resource",
+                resource=TextResourceContents(
+                    uri="file:///home/user/My%20Agent.md",
+                    text="content",
+                ),
+            ),
+        )
+
+        result = inline_resources_for_slash_command(acp_prompt)
+
+        assert len(result) == 1
+        assert isinstance(result[0], TextContentBlock)
+        assert result[0].text == "/card load '/home/user/My Agent.md' --as-tool"
+
+    def test_escaped_space_at_reference_replaced(self):
+        """Escaped spaces in @filename references match attached resources."""
+        acp_prompt = _acp_prompt(
+            TextContentBlock(type="text", text=r"/card load @My\ Agent.md"),
+            EmbeddedResourceContentBlock(
+                type="resource",
+                resource=TextResourceContents(
+                    uri="file:///home/user/My%20Agent.md",
+                    text="content",
+                ),
+            ),
+        )
+
+        result = inline_resources_for_slash_command(acp_prompt)
+
+        assert len(result) == 1
+        assert isinstance(result[0], TextContentBlock)
+        assert result[0].text == "/card load '/home/user/My Agent.md'"
+
+    def test_at_reference_with_flags(self):
+        """@filename with other flags is handled correctly."""
+        acp_prompt = _acp_prompt(
+            TextContentBlock(type="text", text="/card load @myagent.md --as-tool"),
+            EmbeddedResourceContentBlock(
+                type="resource",
+                resource=TextResourceContents(
+                    uri="file:///path/to/myagent.md",
+                    text="agent content",
+                ),
+            ),
+        )
+
+        result = inline_resources_for_slash_command(acp_prompt)
+
+        assert len(result) == 1
+        assert isinstance(result[0], TextContentBlock)
+        assert result[0].text == "/card load /path/to/myagent.md --as-tool"
+
+    def test_multiple_at_references_replaced(self):
+        """Multiple @filename references are all replaced."""
+        acp_prompt = _acp_prompt(
+            TextContentBlock(type="text", text="/hash @a.txt @b.txt"),
+            EmbeddedResourceContentBlock(
+                type="resource",
+                resource=TextResourceContents(
+                    uri="file:///path/a.txt",
+                    text="content a",
+                ),
+            ),
+            EmbeddedResourceContentBlock(
+                type="resource",
+                resource=TextResourceContents(
+                    uri="file:///other/b.txt",
+                    text="content b",
+                ),
+            ),
+        )
+
+        result = inline_resources_for_slash_command(acp_prompt)
+
+        assert len(result) == 1
+        assert isinstance(result[0], TextContentBlock)
+        assert result[0].text == "/hash /path/a.txt /other/b.txt"
+
+    def test_at_reference_no_matching_resource_appends_attached_path(self):
+        """Unmatched @text does not cause attached resources to be dropped."""
+        acp_prompt = _acp_prompt(
+            TextContentBlock(type="text", text="/card load @nonexistent.md"),
+            EmbeddedResourceContentBlock(
+                type="resource",
+                resource=TextResourceContents(
+                    uri="file:///path/to/different.md",
+                    text="different content",
+                ),
+            ),
+        )
+
+        result = inline_resources_for_slash_command(acp_prompt)
+
+        assert len(result) == 1
+        assert isinstance(result[0], TextContentBlock)
+        assert result[0].text == "/card load @nonexistent.md /path/to/different.md"
+
+    def test_at_reference_no_matching_handle_appends_attached_path(self):
+        """Ordinary @handles do not cause attached resources to be dropped."""
+        acp_prompt = _acp_prompt(
+            TextContentBlock(type="text", text="/card load "),
+            EmbeddedResourceContentBlock(
+                type="resource",
+                resource=TextResourceContents(
+                    uri="file:///tmp/foo.md",
+                    text="card content",
+                ),
+            ),
+        )
+
+        result = inline_resources_for_slash_command(acp_prompt)
+
+        assert len(result) == 1
+        assert isinstance(result[0], TextContentBlock)
+        assert result[0].text == "/card load /tmp/foo.md"
+
+    def test_at_reference_replacement_does_not_rewrite_longer_token_prefix(self):
+        """Replacing @a.txt leaves @a.txt.bak untouched."""
+        acp_prompt = _acp_prompt(
+            TextContentBlock(type="text", text="/hash @a.txt @a.txt.bak"),
+            EmbeddedResourceContentBlock(
+                type="resource",
+                resource=TextResourceContents(
+                    uri="file:///tmp/a.txt",
+                    text="content",
+                ),
+            ),
+        )
+
+        result = inline_resources_for_slash_command(acp_prompt)
+
+        assert len(result) == 1
+        assert isinstance(result[0], TextContentBlock)
+        assert result[0].text == "/hash /tmp/a.txt @a.txt.bak"
+
+    def test_at_reference_windows_path(self):
+        """@filename works with Windows-style file URIs."""
+        acp_prompt = _acp_prompt(
+            TextContentBlock(type="text", text="/card load @config.yaml"),
+            EmbeddedResourceContentBlock(
+                type="resource",
+                resource=TextResourceContents(
+                    uri="file:///C:/Users/test/config.yaml",
+                    text="config: value",
+                ),
+            ),
+        )
+
+        result = inline_resources_for_slash_command(acp_prompt)
+
+        assert len(result) == 1
+        assert isinstance(result[0], TextContentBlock)
+        assert result[0].text == "/card load C:/Users/test/config.yaml"
+
+
+class TestFileUriToPath:
+    """Test conversion of file:// URIs to local paths."""
+
+    def test_unix_path(self):
+        """Unix file:// URI converts to Unix path."""
+        assert _file_uri_to_path("file:///home/user/foo.txt") == "/home/user/foo.txt"
+
+    def test_unix_root_path(self):
+        """Unix file:// URI at root level."""
+        assert _file_uri_to_path("file:///foo.txt") == "/foo.txt"
+
+    def test_windows_path(self):
+        """Windows file:// URI converts to Windows path."""
+        assert _file_uri_to_path("file:///C:/Users/test/foo.txt") == "C:/Users/test/foo.txt"
+
+    def test_windows_path_lowercase_drive(self):
+        """Windows file:// URI with lowercase drive letter."""
+        assert _file_uri_to_path("file:///c:/temp/foo.txt") == "c:/temp/foo.txt"
+
+    def test_localhost_windows_path(self):
+        """localhost file:// URI with Windows drive is treated as a local path."""
+        assert _file_uri_to_path("file://localhost/C:/Users/test/foo.txt") == (
+            "C:/Users/test/foo.txt"
+        )
+
+    def test_already_a_path_unchanged(self):
+        """Regular paths pass through unchanged."""
+        assert _file_uri_to_path("/home/user/foo.txt") == "/home/user/foo.txt"
+        assert _file_uri_to_path("C:/Users/test/foo.txt") == "C:/Users/test/foo.txt"
+
+    def test_file_with_two_slashes(self):
+        """file:// with two slashes (malformed but handled)."""
+        assert _file_uri_to_path("file://foo.txt") == "foo.txt"
+
+    def test_http_url_unchanged(self):
+        """HTTP URLs pass through unchanged."""
+        assert _file_uri_to_path("http://example.com/foo.txt") == "http://example.com/foo.txt"
+        assert _file_uri_to_path("https://example.com/foo.txt") == "https://example.com/foo.txt"

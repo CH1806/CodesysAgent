@@ -1,0 +1,109 @@
+"""Shared constants for CLI routing and commands."""
+
+RESUME_LATEST_SENTINEL = "__latest__"
+
+
+def normalize_convenience_flag_args(args: list[str], *, start_index: int = 0) -> None:
+    """Expand exact convenience flags before command routing and option parsing."""
+    index = start_index
+    while index < len(args):
+        if args[index] == "--":
+            return
+        if args[index] == "-xx":
+            args[index : index + 1] = ["--shell", "--subagents"]
+            index += 2
+            continue
+        index += 1
+
+
+def normalize_resume_flag_args(args: list[str], *, start_index: int = 0) -> None:
+    index = start_index
+    while index < len(args):
+        arg = args[index]
+        if arg == "--resume=":
+            args[index] = "--resume"
+            args.insert(index + 1, RESUME_LATEST_SENTINEL)
+            index += 1
+        elif arg == "--resume":
+            next_arg = args[index + 1] if index + 1 < len(args) else None
+            if next_arg is None or next_arg.startswith("-"):
+                args.insert(index + 1, RESUME_LATEST_SENTINEL)
+                index += 1
+        index += 1
+
+
+# Options that should automatically route to the 'go' command
+GO_SPECIFIC_OPTIONS = {
+    "--npx",
+    "--uvx",
+    "--stdio",
+    "--pack",
+    "--card-pack",
+    "--pack-registry",
+    "--url",
+    "--mcp-protocol",
+    "--model",
+    "--models",
+    "--agent",
+    "--instruction",
+    "-i",
+    "--message",
+    "-m",
+    "--prompt-file",
+    "-p",
+    "--attach",
+    "-a",
+    "--json-schema",
+    "--schema-model",
+    "--structured-tool-policy",
+    "--results",
+    "--trajectory-output",
+    "--trajectory-format",
+    "--servers",
+    "--auth",
+    "--environment",
+    "-E",
+    "--client-metadata-url",
+    "--name",
+    "--config-path",
+    "-c",
+    "--shell",
+    "--no-shell",
+    "-x",
+    "--subagents",
+    "--no-subagents",
+    "--subagent-model",
+    "--skills",
+    "--skills-dir",
+    "--agent-cards",
+    "--card",
+    "--card-tool",
+    "--a2a",
+    "--a2a-transport",
+    "--a2a-oauth",
+    "--no-a2a-oauth",
+    "--home",
+    "--workspace",
+    "--no-home",
+    "--watch",
+    "--reload",
+    "--resume",
+}
+
+# Known subcommands that should not trigger auto-routing
+KNOWN_SUBCOMMANDS = {
+    "go",
+    "serve",
+    "acp",
+    "scaffold",
+    "check",
+    "cards",
+    "plugins",
+    "skills",
+    "auth",
+    "bootstrap",
+    "quickstart",
+    "--help",
+    "-h",
+    "--version",
+}

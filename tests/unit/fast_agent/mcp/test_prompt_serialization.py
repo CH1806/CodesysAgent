@@ -1,0 +1,272 @@
+"""
+Tests for serializing PromptMessageExtended objects to delimited format.
+"""
+
+from datetime import datetime, timezone
+
+import pytest
+from mcp_types import EmbeddedResource, ImageContent, TextContent, TextResourceContents
+
+from fast_agent.core.exceptions import AgentConfigError
+from fast_agent.mcp.prompt_message_extended import PromptMessageExtended
+from fast_agent.mcp.prompt_serialization import (
+    from_json,
+    load_messages,
+    multipart_messages_to_delimited_format,
+    save_messages,
+    to_json,
+    to_json_bytes,
+)
+from fast_agent.types import COMMENTARY_PHASE
+
+
+class TestPromptSerialization:
+    """Tests for prompt serialization and delimited format conversion."""
+
+    def test_json_serialization_and_deserialization(self):
+        """Test the new JSON serialization and deserialization approach."""
+        # Create multipart messages with various content types
+        original_messages = [
+            PromptMessageExtended(
+                role="user",
+                content=[
+                    TextContent(type="text", text="Here's a resource:"),
+                    EmbeddedResource(
+                        type="resource",
+                        resource=TextResourceContents(
+                            uri="resource://data.json",
+                            mime_type="application/json",
+                            text='{"key": "value"}',
+                        ),
+                    ),
+                ],
+            ),
+            PromptMessageExtended(
+                role="assistant",
+                content=[
+                    TextContent(type="text", text="I've processed your resource."),
+                    ImageContent(type="image", data="base64EncodedImage", mime_type="image/jpeg"),
+                ],
+            ),
+        ]
+
+        # Convert to JSON
+        json_str = to_json(original_messages)
+
+        # Verify JSON contains expected elements
+        assert "user" in json_str
+        assert "assistant" in json_str
+        assert "resource://data.json" in json_str
+        assert "application/json" in json_str
+        assert "base64EncodedImage" in json_str
+        assert "image/jpeg" in json_str
+
+        # Convert back from JSON
+        parsed_messages = from_json(json_str)
+
+        # Verify round-trip conversion
+        assert len(parsed_messages) == len(original_messages)
+        assert parsed_messages[0].role == original_messages[0].role
+        assert parsed_messages[1].role == original_messages[1].role
+
+        # Check first message
+        assert len(parsed_messages[0].content) == 2
+        first_block = parsed_messages[0].content[0]
+        assert isinstance(first_block, TextContent)
+        assert first_block.type == "text"
+        assert first_block.text == "Here's a resource:"
+        resource_block = parsed_messages[0].content[1]
+        assert isinstance(resource_block, EmbeddedResource)
+        assert resource_block.type == "resource"
+        resource = resource_block.resource
+        assert isinstance(resource, TextResourceContents)
+        assert str(resource.uri) == "resource://data.json"
+        assert resource.mime_type == "application/json"
+        assert resource.text == '{"key": "value"}'
+
+        # Check second message
+        assert len(parsed_messages[1].content) == 2
+        assistant_block = parsed_messages[1].content[0]
+        assert isinstance(assistant_block, TextContent)
+        assert assistant_block.type == "text"
+        assert assistant_block.text == "I've processed your resource."
+        image_block = parsed_messages[1].content[1]
+        assert isinstance(image_block, ImageContent)
+        assert image_block.type == "image"
+        assert image_block.data == "base64EncodedImage"
+        assert image_block.mime_type == "image/jpeg"
+
+    def test_json_bytes_match_text_serialization(self) -> None:
+        messages = [
+            PromptMessageExtended(
+                role="assistant",
+                content=[TextContent(type="text", text="Résumé ✓")],
+            )
+        ]
+
+        encoded = to_json_bytes(messages, indent=None)
+
+        assert encoded.decode() == to_json(messages, indent=None)
+        assert from_json(encoded.decode())[0].all_text() == "Résumé ✓"
+
+    def test_enhanced_json_round_trips_assistant_phase(self):
+        original_messages = [
+            PromptMessageExtended(
+                role="assistant",
+                content=[TextContent(type="text", text="Planning next action.")],
+                phase=COMMENTARY_PHASE,
+            )
+        ]
+
+        json_str = to_json(original_messages)
+        parsed_messages = from_json(json_str)
+
+        assert len(parsed_messages) == 1
+        assert parsed_messages[0].phase == COMMENTARY_PHASE
+        assert parsed_messages[0].all_text() == "Planning next action."
+
+    def test_enhanced_json_round_trips_message_timestamp(self):
+        timestamp = datetime(2026, 4, 20, 23, 42, 9, 871720, tzinfo=timezone.utc)
+        original_messages = [
+            PromptMessageExtended(
+                role="user",
+                content=[TextContent(type="text", text="hello")],
+                timestamp=timestamp,
+            )
+        ]
+
+        json_str = to_json(original_messages)
+        parsed_messages = from_json(json_str)
+
+        assert len(parsed_messages) == 1
+        assert parsed_messages[0].timestamp == timestamp
+
+    def test_multipart_to_delimited_format(self):
+        """Test converting PromptMessageExtended to delimited format for saving."""
+        # Create multipart messages
+        multipart_messages = [
+            PromptMessageExtended(
+                role="user",
+                content=[
+                    TextContent(type="text", text="Hello!"),
+                    TextContent(type="text", text="Can you help me?"),
+                ],
+            ),
+            PromptMessageExtended(
+                role="assistant",
+                content=[
+                    TextContent(type="text", text="Sure, I'd be happy to help."),
+                    TextContent(type="text", text="What do you need assistance with?"),
+                ],
+            ),
+        ]
+
+        # Convert to delimited format
+        delimited_content = multipart_messages_to_delimited_format(multipart_messages)
+
+        # Verify results
+        assert len(delimited_content) == 4
+        assert delimited_content[0] == "---USER"
+        assert delimited_content[1] == "Hello!\n\nCan you help me?"
+        assert delimited_content[2] == "---ASSISTANT"
+        assert (
+            delimited_content[3]
+            == "Sure, I'd be happy to help.\n\nWhat do you need assistance with?"
+        )
+
+    def test_multipart_with_resources_to_delimited_format(self):
+        """Test converting PromptMessageExtended with resources to delimited format."""
+        # Create multipart messages with resources
+        multipart_messages = [
+            PromptMessageExtended(
+                role="user",
+                content=[
+                    TextContent(type="text", text="Check this code:"),
+                    EmbeddedResource(
+                        type="resource",
+                        resource=TextResourceContents(
+                            uri="resource://example.py",
+                            mime_type="text/x-python",
+                            text="def hello():\n    print('Hello, world!')",
+                        ),
+                    ),
+                ],
+            ),
+        ]
+
+        # Convert to delimited format
+        delimited_content = multipart_messages_to_delimited_format(multipart_messages)
+
+        # Verify results
+        assert len(delimited_content) == 4
+        assert delimited_content[0] == "---USER"
+        assert "Check this code:" in delimited_content[1]
+        assert delimited_content[2] == "---RESOURCE"
+
+        # Resource is now in JSON format
+        resource_json = delimited_content[3]
+        assert "type" in resource_json
+        assert "resource" in resource_json
+        assert "uri" in resource_json.lower()
+        assert "example.py" in resource_json
+        assert "def hello()" in resource_json
+
+    def test_multi_role_messages_to_delimited_format(self):
+        """Test converting a list of PromptMessageExtended objects with different roles to delimited format."""
+        # Create multipart messages with different roles
+        messages = [
+            PromptMessageExtended(
+                role="user",
+                content=[TextContent(type="text", text="You are a helpful assistant.")],
+            ),
+            PromptMessageExtended(
+                role="user",
+                content=[
+                    TextContent(type="text", text="Hello!"),
+                    TextContent(type="text", text="Can you help me?"),
+                ],
+            ),
+            PromptMessageExtended(
+                role="assistant",
+                content=[
+                    TextContent(type="text", text="I'd be happy to help."),
+                    TextContent(type="text", text="What can I assist you with today?"),
+                ],
+            ),
+        ]
+
+        # Convert to delimited format
+        delimited = multipart_messages_to_delimited_format(messages)
+
+        # Verify results
+        assert len(delimited) == 6  # 3 delimiters + 3 content blocks
+        assert delimited[0] == "---USER"
+        assert delimited[1] == "You are a helpful assistant."
+        assert delimited[2] == "---USER"
+        assert delimited[3] == "Hello!\n\nCan you help me?"
+        assert delimited[4] == "---ASSISTANT"
+        assert delimited[5] == "I'd be happy to help.\n\nWhat can I assist you with today?"
+
+    def test_invalid_json_prompt_raises_agent_config_error(self, tmp_path):
+        bad_path = tmp_path / "bad.json"
+        bad_path.write_text('{"messages": ["bad\x00"]}', encoding="utf-8")
+
+        with pytest.raises(AgentConfigError) as exc_info:
+            load_messages(str(bad_path))
+
+        assert "Failed to parse JSON prompt file" in str(exc_info.value)
+
+    def test_uppercase_json_suffix_uses_json_serialization(self, tmp_path):
+        prompt_path = tmp_path / "PROMPT.JSON"
+        messages = [
+            PromptMessageExtended(
+                role="user",
+                content=[TextContent(type="text", text="Hello.")],
+            )
+        ]
+
+        save_messages(messages, str(prompt_path))
+
+        saved = prompt_path.read_text(encoding="utf-8")
+        assert '"messages"' in saved
+        assert load_messages(str(prompt_path))[0].first_text() == "Hello."

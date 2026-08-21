@@ -1,0 +1,300 @@
+"""
+Logger module for the MCP Agent, which provides:
+- Local + optional remote event transport
+- Async event bus
+- OpenTelemetry tracing decorators (for distributed tracing)
+- Automatic injection of trace_id/span_id into events
+- Developer-friendly Logger that can be used anywhere
+"""
+
+import asyncio
+import logging
+import sys
+import threading
+import traceback
+from dataclasses import dataclass
+from typing import Any
+
+from fast_agent.core.logging.events import Event, EventContext, EventFilter, EventType
+from fast_agent.core.logging.listeners import (
+    BatchingListener,
+    LoggingListener,
+    ProgressListener,
+)
+from fast_agent.core.logging.transport import AsyncEventBus, EventTransport
+from fast_agent.utils.async_utils import ensure_event_loop
+
+
+@dataclass(frozen=True)
+class ExceptionDetails:
+    exc_type: type[BaseException]
+    exc_value: BaseException
+    exc_tb: Any
+
+
+def _exception_details_from_tuple(
+    exc_info: tuple[object, object, object],
+) -> ExceptionDetails | None:
+    maybe_type, maybe_value, maybe_tb = exc_info
+    if not (
+        isinstance(maybe_type, type)
+        and issubclass(maybe_type, BaseException)
+        and isinstance(maybe_value, BaseException)
+    ):
+        return None
+    return ExceptionDetails(maybe_type, maybe_value, maybe_tb)
+
+
+def _exception_details(exc_info: object) -> ExceptionDetails | None:
+    if exc_info is True:
+        current = sys.exc_info()
+        if current[0] is None or current[1] is None:
+            return None
+        return ExceptionDetails(current[0], current[1], current[2])
+    if isinstance(exc_info, BaseException):
+        return ExceptionDetails(type(exc_info), exc_info, exc_info.__traceback__)
+    if isinstance(exc_info, tuple) and len(exc_info) == 3:
+        return _exception_details_from_tuple((exc_info[0], exc_info[1], exc_info[2]))
+    return None
+
+
+def _merge_exception_details(
+    data: dict[str, Any],
+    *,
+    exc_info: object,
+    details: ExceptionDetails | None,
+) -> dict[str, Any]:
+    if details is None:
+        data.setdefault("exception", str(exc_info))
+        return data
+
+    data.setdefault("error", str(details.exc_value))
+    data.setdefault("error_type", details.exc_value.__class__.__name__)
+    data["exception"] = "".join(
+        traceback.format_exception(
+            details.exc_type,
+            details.exc_value,
+            details.exc_tb,
+        )
+    )
+    return data
+
+
+class Logger:
+    """
+    Developer-friendly logger that sends events to the AsyncEventBus.
+    - `type` is a broad category (INFO, ERROR, etc.).
+    - `name` can be a custom domain-specific event name, e.g. "ORDER_PLACED".
+    """
+
+    def __init__(self, namespace: str) -> None:
+        self.namespace = namespace
+        self.event_bus = AsyncEventBus.get()
+
+    def _emit_event(self, event: Event) -> None:
+        """Emit an event by running it in the event loop."""
+        # AsyncEventBus is a singleton that tests may reset between runs.
+        # Logger instances are cached globally and can therefore outlive a bus
+        # reset. Always re-resolve the current bus before emitting to avoid
+        # dispatching to a stale, stopped bus instance.
+        self.event_bus = AsyncEventBus.get()
+
+        loop = ensure_event_loop()
+        if loop.is_running():
+            # If we're in a thread with a running loop, schedule the coroutine
+            asyncio.create_task(self.event_bus.emit(event))
+        else:
+            # If no loop is running, run it until the emit completes
+            loop.run_until_complete(self.event_bus.emit(event))
+
+    @staticmethod
+    def _coerce_exc_info(data: dict[str, Any]) -> dict[str, Any]:
+        """Normalize stdlib-style ``exc_info`` into structured event payload fields."""
+        if "exc_info" not in data:
+            return data
+
+        merged = dict(data)
+        exc_info = merged.pop("exc_info", None)
+        if not exc_info:
+            return merged
+
+        return _merge_exception_details(
+            merged,
+            exc_info=exc_info,
+            details=_exception_details(exc_info),
+        )
+
+    def event(
+        self,
+        etype: EventType,
+        ename: str | None,
+        message: str,
+        context: EventContext | None,
+        data: dict,
+    ) -> None:
+        """Create and emit an event."""
+        evt = Event(
+            type=etype,
+            name=ename,
+            namespace=self.namespace,
+            message=message,
+            context=context,
+            data=data,
+        )
+        self._emit_event(evt)
+
+    def debug(
+        self,
+        message: str,
+        name: str | None = None,
+        context: EventContext | None = None,
+        **data,
+    ) -> None:
+        """Log a debug message."""
+        self.event("debug", name, message, context, self._coerce_exc_info(data))
+
+    def info(
+        self,
+        message: str,
+        name: str | None = None,
+        context: EventContext | None = None,
+        **data,
+    ) -> None:
+        """Log an info message."""
+        self.event("info", name, message, context, self._coerce_exc_info(data))
+
+    def warning(
+        self,
+        message: str,
+        name: str | None = None,
+        context: EventContext | None = None,
+        **data,
+    ) -> None:
+        """Log a warning message."""
+        self.event("warning", name, message, context, self._coerce_exc_info(data))
+
+    def error(
+        self,
+        message: str,
+        name: str | None = None,
+        context: EventContext | None = None,
+        **data,
+    ) -> None:
+        """Log an error message."""
+        self.event("error", name, message, context, self._coerce_exc_info(data))
+
+    def exception(
+        self,
+        message: str,
+        name: str | None = None,
+        context: EventContext | None = None,
+        **data,
+    ) -> None:
+        """Log an error message with exception info."""
+        import sys
+
+        exc_info = sys.exc_info()
+        if exc_info[0] is not None:
+            tb_str = "".join(traceback.format_exception(*exc_info))
+            data["exception"] = tb_str
+        self.event("error", name, message, context, self._coerce_exc_info(data))
+
+    def progress(
+        self,
+        message: str,
+        name: str | None = None,
+        percentage: float | None = None,
+        context: EventContext | None = None,
+        **data,
+    ) -> None:
+        """Log a progress message."""
+        merged_data = dict(percentage=percentage, **data)
+        self.event("progress", name, message, context, merged_data)
+
+
+class LoggingConfig:
+    """Global configuration for the logging system."""
+
+    _initialized = False
+
+    @classmethod
+    async def configure(
+        cls,
+        event_filter: EventFilter | None = None,
+        transport: EventTransport | None = None,
+        batch_size: int = 100,
+        flush_interval: float = 2.0,
+        **kwargs: Any,
+    ) -> None:
+        """
+        Configure the logging system.
+
+        Args:
+            event_filter: Default filter for all loggers
+            transport: Transport for sending events to external systems
+            batch_size: Default batch size for batching listener
+            flush_interval: Default flush interval for batching listener
+            **kwargs: Additional configuration options
+        """
+        if cls._initialized:
+            return
+
+        # Suppress boto3/botocore logging to prevent flooding
+        logging.getLogger("boto3").setLevel(logging.WARNING)
+        logging.getLogger("botocore").setLevel(logging.WARNING)
+        logging.getLogger("urllib3").setLevel(logging.WARNING)
+        logging.getLogger("s3transfer").setLevel(logging.WARNING)
+
+        bus = AsyncEventBus.get(transport=transport)
+
+        # Add standard listeners
+        if "logging" not in bus.listeners:
+            bus.add_listener("logging", LoggingListener(event_filter=event_filter))
+
+        # Only add progress listener if enabled in settings
+        if "progress" not in bus.listeners and kwargs.get("progress_display", True):
+            bus.add_listener("progress", ProgressListener())
+
+        if "batching" not in bus.listeners:
+            bus.add_listener(
+                "batching",
+                BatchingListener(
+                    event_filter=event_filter,
+                    batch_size=batch_size,
+                    flush_interval=flush_interval,
+                ),
+            )
+
+        await bus.start()
+        cls._initialized = True
+
+    @classmethod
+    async def shutdown(cls) -> None:
+        """Shutdown the logging system gracefully."""
+        if not cls._initialized:
+            return
+        bus = AsyncEventBus.get()
+        await bus.stop()
+        cls._initialized = False
+
+
+_logger_lock = threading.Lock()
+_loggers: dict[str, Logger] = {}
+
+
+def get_logger(namespace: str) -> Logger:
+    """
+    Get a logger instance for a given namespace.
+    Creates a new logger if one doesn't exist for this namespace.
+
+    Args:
+        namespace: The namespace for the logger (e.g. "agent.helper", "workflow.demo")
+
+    Returns:
+        A Logger instance for the given namespace
+    """
+
+    with _logger_lock:
+        if namespace not in _loggers:
+            _loggers[namespace] = Logger(namespace)
+        return _loggers[namespace]

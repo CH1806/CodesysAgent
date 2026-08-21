@@ -1,0 +1,215 @@
+import pytest
+
+from fast_agent.commands.context import CommandContext
+from fast_agent.commands.handlers import prompts as prompt_handlers
+from fast_agent.mcp.mcp_aggregator import SEP
+
+
+class StubPromptArgument:
+    def __init__(self, name: str, required: bool, description: str | None = None) -> None:
+        self.name = name
+        self.required = required
+        self.description = description
+
+
+class StubPrompt:
+    def __init__(
+        self,
+        name: str,
+        *,
+        title: str | None = None,
+        description: str | None = None,
+        arguments: list[StubPromptArgument] | None = None,
+    ) -> None:
+        self.name = name
+        self.title = title
+        self.description = description
+        self.arguments = arguments
+
+
+class StubPromptResult:
+    def __init__(self) -> None:
+        self.messages = ["message"]
+
+
+class StubAgent:
+    def __init__(self, prompt_result: StubPromptResult) -> None:
+        self._prompt_result = prompt_result
+        self.prompt_calls: list[tuple[str, dict[str, str]]] = []
+        self.generated_messages: list[object] | None = None
+
+    async def get_prompt(
+        self, namespaced_name: str, arg_values: dict[str, str]
+    ) -> StubPromptResult:
+        self.prompt_calls.append((namespaced_name, arg_values))
+        return self._prompt_result
+
+    async def generate(self, messages, _):
+        self.generated_messages = messages
+
+
+class StubHistoryAgent:
+    name = "test-agent"
+    usage_accumulator = None
+
+    def __init__(self) -> None:
+        self.message_history = []
+        self.loaded_messages = None
+        self.cleared_prompts = None
+
+    def load_message_history(self, messages):
+        self.loaded_messages = messages
+        self.message_history = messages or []
+
+    def pop_last_message(self):
+        return None
+
+    def clear(self, *, clear_prompts: bool = False) -> None:
+        self.cleared_prompts = clear_prompts
+
+
+class StubAgentProvider:
+    def __init__(self, prompts: dict[str, list[StubPrompt]], agent: object) -> None:
+        self._prompts = prompts
+        self._agent_instance = agent
+
+    def _agent(self, name: str) -> object:
+        return self._agent_instance
+
+    def visible_agent_names(self, *, force_include: str | None = None):
+        del force_include
+        return ["test-agent"]
+
+    def registered_agent_names(self):
+        return ["test-agent"]
+
+    def registered_agents(self):
+        return {"test-agent": self._agent_instance}
+
+    def resolve_target_agent_name(self, agent_name: str | None = None):
+        return agent_name or "test-agent"
+
+    async def list_prompts(self, namespace, agent_name=None):
+        return self._prompts
+
+
+class StubCommandIO:
+    def __init__(self, arg_values: dict[str, str]) -> None:
+        self._arg_values = arg_values
+        self.prompted_args: list[tuple[str, str | None, bool]] = []
+        self.emitted: list[object] = []
+
+    async def emit(self, message):
+        self.emitted.append(message)
+
+    async def prompt_text(
+        self,
+        prompt: str,
+        *,
+        default: str | None = None,
+        allow_empty: bool = True,
+    ) -> str | None:
+        return default
+
+    async def prompt_selection(
+        self,
+        prompt: str,
+        *,
+        options,
+        allow_cancel: bool = False,
+        default: str | None = None,
+    ) -> str | None:
+        return default
+
+    async def prompt_model_selection(
+        self,
+        *,
+        initial_provider: str | None = None,
+        default_model: str | None = None,
+    ) -> str | None:
+        del initial_provider, default_model
+        return None
+
+    async def prompt_argument(
+        self,
+        arg_name: str,
+        *,
+        description: str | None = None,
+        required: bool = True,
+    ) -> str | None:
+        self.prompted_args.append((arg_name, description, required))
+        return self._arg_values.get(arg_name)
+
+    async def display_history_turn(self, *args, **kwargs):
+        return None
+
+    async def display_history_overview(self, *args, **kwargs):
+        return None
+
+    async def display_usage_report(self, *args, **kwargs):
+        return None
+
+    async def display_system_prompt(self, *args, **kwargs):
+        return None
+
+
+@pytest.mark.asyncio
+async def test_handle_select_prompt_prompts_for_required_args(monkeypatch):
+    prompt_args = [
+        StubPromptArgument("topic", True, "Choose a topic"),
+        StubPromptArgument("style", False, "Optional style"),
+    ]
+    prompt_obj = StubPrompt("demo", description="demo prompt", arguments=prompt_args)
+    prompt_result = StubPromptResult()
+    agent = StubAgent(prompt_result)
+    provider = StubAgentProvider({"server": [prompt_obj]}, agent)
+    io = StubCommandIO({"topic": "cats", "style": "haiku"})
+    ctx = CommandContext(
+        agent_provider=provider,
+        current_agent_name="test-agent",
+        io=io,
+    )
+
+    monkeypatch.setattr(
+        prompt_handlers.PromptMessageExtended,
+        "from_get_prompt_result",
+        lambda result: ["converted"],
+    )
+    monkeypatch.setattr(prompt_handlers.progress_display, "resume", lambda: None)
+    monkeypatch.setattr(prompt_handlers.progress_display, "pause", lambda: None)
+
+    await prompt_handlers.handle_select_prompt(ctx, agent_name="test-agent", prompt_index=1)
+
+    assert io.prompted_args == [
+        ("topic", "Choose a topic", True),
+        ("style", "Optional style", False),
+    ]
+    assert agent.prompt_calls == [
+        (f"server{SEP}demo", {"topic": "cats", "style": "haiku"}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_handle_load_prompt_prompts_for_local_file_template_args(tmp_path):
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("Hello {{name}}.", encoding="utf-8")
+
+    agent = StubHistoryAgent()
+    provider = StubAgentProvider({}, agent)
+    io = StubCommandIO({"name": "Ada"})
+    ctx = CommandContext(
+        agent_provider=provider,
+        current_agent_name="test-agent",
+        io=io,
+    )
+
+    outcome = await prompt_handlers.handle_load_prompt(
+        ctx,
+        agent_name="test-agent",
+        filename=str(prompt_path),
+    )
+
+    assert io.prompted_args == [("name", "", True)]
+    assert outcome.buffer_prefill == "Hello Ada."
+    assert agent.loaded_messages == []
+    assert agent.cleared_prompts is True

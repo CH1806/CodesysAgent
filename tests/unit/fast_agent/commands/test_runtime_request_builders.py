@@ -1,0 +1,1392 @@
+from pathlib import Path
+
+import pytest
+import typer
+
+from fast_agent.cli.runtime.request_builders import (
+    build_agent_run_request,
+    build_command_run_request,
+    merge_card_sources,
+    normalize_explicit_card_sources,
+    resolve_default_instruction,
+    resolve_instance_scope,
+    resolve_instruction_option,
+)
+from fast_agent.cli.runtime.run_request import AgentRunRequest
+
+
+def test_card_source_helpers_deduplicate_preserving_order(tmp_path: Path) -> None:
+    sources = ["cards/one", "cards/two", "cards/one"]
+
+    assert merge_card_sources(sources, tmp_path) == ["cards/one", "cards/two"]
+    assert normalize_explicit_card_sources(sources) == ["cards/one", "cards/two"]
+
+
+def test_build_agent_run_request_merges_url_servers_after_explicit_servers() -> None:
+    request = build_agent_run_request(
+        name="test-agent",
+        instruction="instruction",
+        config_path=None,
+        servers="alpha,beta",
+        urls=["http://localhost:9000/mcp"],
+        auth=None,
+        client_metadata_url=None,
+        agent_cards=None,
+        card_tools=None,
+        model=None,
+        message=None,
+        prompt_file=None,
+        result_file=None,
+        resume=None,
+        stdio_commands=None,
+        agent_name="agent",
+        target_agent_name=None,
+        skills_directory=None,
+        home=None,
+        shell_enabled=False,
+        mode="interactive",
+        transport="http",
+        host="127.0.0.1",
+        port=8000,
+        tool_description=None,
+        tool_name_template=None,
+        instance_scope="connection",
+        permissions_enabled=True,
+        reload=False,
+        watch=False,
+    )
+
+    assert request.server_list is not None
+    assert request.server_list[:2] == ["alpha", "beta"]
+    assert request.startup_mcp_servers is not None
+    assert request.server_list[2:] == list(request.startup_mcp_servers)
+
+
+def test_build_agent_run_request_includes_client_metadata_url_in_url_server_auth() -> None:
+    request = build_agent_run_request(
+        name="test-agent",
+        instruction="instruction",
+        config_path=None,
+        servers=None,
+        urls=["https://example.com/mcp"],
+        auth=None,
+        client_metadata_url="https://example.com/oauth/client-metadata.json",
+        agent_cards=None,
+        card_tools=None,
+        model=None,
+        message=None,
+        prompt_file=None,
+        result_file=None,
+        resume=None,
+        stdio_commands=None,
+        agent_name="agent",
+        target_agent_name=None,
+        skills_directory=None,
+        home=None,
+        shell_enabled=False,
+        mode="interactive",
+        transport="http",
+        host="127.0.0.1",
+        port=8000,
+        tool_description=None,
+        tool_name_template=None,
+        instance_scope="connection",
+        permissions_enabled=True,
+        reload=False,
+        watch=False,
+    )
+
+    assert request.startup_mcp_servers is not None
+    server_config = next(iter(request.startup_mcp_servers.values()))
+    assert server_config.auth is not None
+    assert server_config.auth.oauth is True
+    assert (
+        server_config.auth.client_metadata_url == "https://example.com/oauth/client-metadata.json"
+    )
+
+
+def test_startup_mcp_targets_share_ordered_naming_auth_and_protocol_semantics() -> None:
+    request = build_agent_run_request(
+        name="test-agent",
+        instruction="instruction",
+        config_path=None,
+        servers=None,
+        urls=[
+            "https://example.com/one,https://example.com/two",
+            "https://other.example/mcp",
+        ],
+        auth="Bearer shared-token",
+        client_metadata_url=None,
+        mcp_protocol="legacy",
+        agent_cards=None,
+        card_tools=None,
+        model=None,
+        message=None,
+        prompt_file=None,
+        result_file=None,
+        resume=None,
+        stdio_commands=["npx @scope/demo", "python server.py"],
+        agent_name="agent",
+        target_agent_name=None,
+        skills_directory=None,
+        home=None,
+        shell_enabled=False,
+        mode="interactive",
+        transport="http",
+        host="127.0.0.1",
+        port=8000,
+        tool_description=None,
+        tool_name_template=None,
+        instance_scope="shared",
+        permissions_enabled=True,
+        reload=False,
+        watch=False,
+    )
+
+    assert request.startup_mcp_servers is not None
+    assert list(request.startup_mcp_servers) == [
+        "example_com",
+        "example_com_1",
+        "other_example",
+        "demo",
+        "python",
+    ]
+    configs = list(request.startup_mcp_servers.values())
+    assert [config.access_token for config in configs] == [
+        "shared-token",
+        "shared-token",
+        "shared-token",
+        None,
+        None,
+    ]
+    assert {config.protocol_mode for config in configs} == {"legacy"}
+    assert request.server_list == list(request.startup_mcp_servers)
+    assert request.mcp_startup_notices[-1] == "Startup MCP server 'python': python server.py"
+    assert any(
+        "Automatic '/mcp' suffixing is deprecated" in item for item in request.mcp_startup_notices
+    )
+
+
+def test_startup_url_parity_is_case_insensitive_and_notices_are_redacted() -> None:
+    request = build_agent_run_request(
+        name="test-agent",
+        instruction="instruction",
+        config_path=None,
+        servers=None,
+        urls=["HTTPS://user:secret@example.com/api?token=secret"],
+        auth=None,
+        client_metadata_url=None,
+        agent_cards=None,
+        card_tools=None,
+        model=None,
+        message=None,
+        prompt_file=None,
+        result_file=None,
+        resume=None,
+        stdio_commands=None,
+        agent_name="agent",
+        target_agent_name=None,
+        skills_directory=None,
+        home=None,
+        shell_enabled=False,
+        mode="interactive",
+        transport="http",
+        host="127.0.0.1",
+        port=8000,
+        tool_description=None,
+        tool_name_template=None,
+        instance_scope="shared",
+        permissions_enabled=True,
+        reload=False,
+        watch=False,
+    )
+
+    assert request.startup_mcp_servers is not None
+    assert "example_com" in request.startup_mcp_servers
+    rendered = "\n".join(request.mcp_startup_notices)
+    assert "secret" not in rendered
+    assert "REDACTED" in rendered
+
+
+def test_startup_mcp_rejects_explicit_auth_with_forced_oauth_metadata() -> None:
+    with pytest.raises(typer.BadParameter, match="Cannot combine --auth"):
+        build_agent_run_request(
+            name="test-agent",
+            instruction="instruction",
+            config_path=None,
+            servers=None,
+            urls=["https://example.com/mcp"],
+            auth="explicit-token",
+            client_metadata_url="https://example.com/client-metadata.json",
+            agent_cards=None,
+            card_tools=None,
+            model=None,
+            message=None,
+            prompt_file=None,
+            result_file=None,
+            resume=None,
+            stdio_commands=None,
+            agent_name="agent",
+            target_agent_name=None,
+            skills_directory=None,
+            home=None,
+            shell_enabled=False,
+            mode="interactive",
+            transport="http",
+            host="127.0.0.1",
+            port=8000,
+            tool_description=None,
+            tool_name_template=None,
+            instance_scope="shared",
+            permissions_enabled=True,
+            reload=False,
+            watch=False,
+        )
+
+
+def test_build_agent_run_request_rejects_invalid_stdio_batch() -> None:
+    with pytest.raises(typer.BadParameter, match="No closing quotation"):
+        build_agent_run_request(
+            name="test-agent",
+            instruction="instruction",
+            config_path=None,
+            servers=None,
+            urls=None,
+            auth=None,
+            client_metadata_url=None,
+            agent_cards=None,
+            card_tools=None,
+            model=None,
+            message=None,
+            prompt_file=None,
+            result_file=None,
+            resume=None,
+            stdio_commands=["python good.py", 'python "unterminated'],
+            agent_name="agent",
+            target_agent_name=None,
+            skills_directory=None,
+            home=None,
+            shell_enabled=False,
+            mode="interactive",
+            transport="http",
+            host="127.0.0.1",
+            port=8000,
+            tool_description=None,
+            tool_name_template=None,
+            instance_scope="shared",
+            permissions_enabled=True,
+            reload=False,
+            watch=False,
+        )
+
+
+def test_build_command_run_request_resolves_defaults() -> None:
+    request = build_command_run_request(
+        name="cli",
+        instruction_option=None,
+        config_path=None,
+        servers=None,
+        urls=None,
+        auth=None,
+        client_metadata_url=None,
+        agent_cards=None,
+        card_tools=None,
+        model=None,
+        message=None,
+        prompt_file=None,
+        result_file="out.json",
+        resume=None,
+        npx=None,
+        uvx=None,
+        stdio=None,
+        target_agent_name=None,
+        skills_directory=None,
+        home=Path("."),
+        shell_enabled=False,
+        mode="serve",
+    )
+
+    assert request.instruction == resolve_default_instruction(None, "serve")
+    assert request.agent_name == "agent"
+    assert request.host == "127.0.0.1"
+    assert request.result_file == "out.json"
+    assert request.execution_mode == "repl"
+    assert request.environment is None
+
+
+def test_build_command_run_request_carries_environment_name() -> None:
+    request = build_command_run_request(
+        name="cli",
+        instruction_option=None,
+        config_path=None,
+        servers=None,
+        urls=None,
+        auth=None,
+        client_metadata_url=None,
+        agent_cards=None,
+        card_tools=None,
+        model=None,
+        message=None,
+        prompt_file=None,
+        result_file=None,
+        resume=None,
+        npx=None,
+        uvx=None,
+        stdio=None,
+        target_agent_name=None,
+        skills_directory=None,
+        home=Path("."),
+        shell_enabled=False,
+        mode="interactive",
+        environment="ubuntu",
+    )
+
+    assert request.environment == "ubuntu"
+    assert request.shell_runtime is True
+
+
+def test_build_command_run_request_no_shell_overrides_environment_shell() -> None:
+    request = build_command_run_request(
+        name="cli",
+        instruction_option=None,
+        config_path=None,
+        servers=None,
+        urls=None,
+        auth=None,
+        client_metadata_url=None,
+        agent_cards=None,
+        card_tools=None,
+        model=None,
+        message=None,
+        prompt_file=None,
+        result_file=None,
+        resume=None,
+        npx=None,
+        uvx=None,
+        stdio=None,
+        target_agent_name=None,
+        skills_directory=None,
+        home=Path("."),
+        shell_enabled=False,
+        no_shell=True,
+        mode="interactive",
+        environment="ubuntu",
+    )
+
+    assert request.environment == "ubuntu"
+    assert request.shell_runtime is False
+
+
+def test_build_command_run_request_propagates_timeout() -> None:
+    request = build_command_run_request(
+        name="cli",
+        instruction_option=None,
+        config_path=None,
+        servers=None,
+        urls=None,
+        auth=None,
+        client_metadata_url=None,
+        agent_cards=None,
+        card_tools=None,
+        model=None,
+        message="hello",
+        prompt_file=None,
+        result_file=None,
+        resume=None,
+        npx=None,
+        uvx=None,
+        stdio=None,
+        target_agent_name=None,
+        skills_directory=None,
+        home=Path("."),
+        shell_enabled=False,
+        mode="interactive",
+        timeout_seconds=120,
+    )
+
+    assert request.timeout_seconds == 120
+
+
+def test_build_command_run_request_rejects_non_positive_timeout() -> None:
+    with pytest.raises(ValueError, match="--timeout must be a positive integer"):
+        build_command_run_request(
+            name="cli",
+            instruction_option=None,
+            config_path=None,
+            servers=None,
+            urls=None,
+            auth=None,
+            client_metadata_url=None,
+            agent_cards=None,
+            card_tools=None,
+            model=None,
+            message="hello",
+            prompt_file=None,
+            result_file=None,
+            resume=None,
+            npx=None,
+            uvx=None,
+            stdio=None,
+            target_agent_name=None,
+            skills_directory=None,
+            home=Path("."),
+            shell_enabled=False,
+            mode="interactive",
+            timeout_seconds=0,
+        )
+
+
+def test_resolve_instruction_option_preserves_default_agent_name_for_url(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from fast_agent.core import instruction_source
+    from fast_agent.io import source_resolver
+
+    materialized = tmp_path / "fast-agent-random.md"
+    materialized.write_text("remote instruction", encoding="utf-8")
+
+    def fake_materialize_text_source(source: str, *, label: str, suffix: str | None = None) -> Path:
+        assert source == "https://example.com/instructions.md"
+        assert label == "instruction"
+        assert suffix is None
+        return materialized
+
+    def fake_resolve_instruction(instruction_path: Path) -> str:
+        return instruction_path.read_text(encoding="utf-8")
+
+    monkeypatch.setattr(source_resolver, "materialize_text_source", fake_materialize_text_source)
+    monkeypatch.setattr(instruction_source, "_resolve_instruction", fake_resolve_instruction)
+
+    resolved = resolve_instruction_option(
+        "https://example.com/instructions.md",
+        model=None,
+        mode="interactive",
+    )
+
+    assert resolved.instruction == "remote instruction"
+    assert resolved.agent_name == "agent"
+
+
+def test_resolve_instruction_option_preserves_default_agent_name_for_hf_uri(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from fast_agent.core import instruction_source
+    from fast_agent.io import source_resolver
+
+    materialized = tmp_path / "fast-agent-random.md"
+    materialized.write_text("remote instruction", encoding="utf-8")
+
+    def fake_materialize_text_source(source: str, *, label: str, suffix: str | None = None) -> Path:
+        assert source == "hf://buckets/evalstate/home/instructions.md"
+        assert label == "instruction"
+        assert suffix is None
+        return materialized
+
+    def fake_resolve_instruction(instruction_path: Path) -> str:
+        return instruction_path.read_text(encoding="utf-8")
+
+    monkeypatch.setattr(source_resolver, "materialize_text_source", fake_materialize_text_source)
+    monkeypatch.setattr(instruction_source, "_resolve_instruction", fake_resolve_instruction)
+
+    resolved = resolve_instruction_option(
+        "hf://buckets/evalstate/home/instructions.md",
+        model=None,
+        mode="interactive",
+    )
+
+    assert resolved.instruction == "remote instruction"
+    assert resolved.agent_name == "agent"
+
+
+def test_resolve_instruction_option_uses_local_file_stem_for_agent_name(tmp_path: Path) -> None:
+    instruction_path = tmp_path / "reviewer.md"
+    instruction_path.write_text("local instruction", encoding="utf-8")
+
+    resolved = resolve_instruction_option(
+        str(instruction_path),
+        model=None,
+        mode="interactive",
+    )
+
+    assert resolved.instruction == "local instruction"
+    assert resolved.agent_name == "reviewer"
+
+
+def test_build_command_run_request_defaults_acp_instance_scope_to_connection() -> None:
+    request = build_command_run_request(
+        name="cli",
+        instruction_option=None,
+        config_path=None,
+        servers=None,
+        urls=None,
+        auth=None,
+        client_metadata_url=None,
+        agent_cards=None,
+        card_tools=None,
+        model=None,
+        message=None,
+        prompt_file=None,
+        result_file=None,
+        resume=None,
+        npx=None,
+        uvx=None,
+        stdio=None,
+        target_agent_name=None,
+        skills_directory=None,
+        home=None,
+        shell_enabled=False,
+        mode="serve",
+        transport="acp",
+    )
+
+    assert request.instance_scope == "connection"
+
+
+def test_resolve_instance_scope_defaults_shared_for_non_acp() -> None:
+    assert resolve_instance_scope(transport="http", instance_scope=None) == "shared"
+
+
+@pytest.mark.parametrize("instance_scope", ["shared", "request"])
+def test_resolve_instance_scope_rejects_non_connection_acp_values(
+    instance_scope: str,
+) -> None:
+    with pytest.raises(ValueError, match="ACP is always connection-scoped"):
+        resolve_instance_scope(transport="acp", instance_scope=instance_scope)
+
+
+def test_build_command_run_request_marks_message_mode_one_shot() -> None:
+    request = build_command_run_request(
+        name="cli",
+        instruction_option=None,
+        config_path=None,
+        servers=None,
+        urls=None,
+        auth=None,
+        client_metadata_url=None,
+        agent_cards=None,
+        card_tools=None,
+        model=None,
+        message="hello",
+        prompt_file=None,
+        result_file=None,
+        resume=None,
+        npx=None,
+        uvx=None,
+        stdio=None,
+        target_agent_name=None,
+        skills_directory=None,
+        home=None,
+        shell_enabled=False,
+        mode="interactive",
+    )
+
+    assert request.execution_mode == "one_shot_message"
+
+
+def test_build_command_run_request_marks_prompt_file_mode_one_shot() -> None:
+    request = build_command_run_request(
+        name="cli",
+        instruction_option=None,
+        config_path=None,
+        servers=None,
+        urls=None,
+        auth=None,
+        client_metadata_url=None,
+        agent_cards=None,
+        card_tools=None,
+        model=None,
+        message=None,
+        prompt_file="prompt.txt",
+        result_file=None,
+        resume=None,
+        npx=None,
+        uvx=None,
+        stdio=None,
+        target_agent_name=None,
+        skills_directory=None,
+        home=None,
+        shell_enabled=False,
+        mode="interactive",
+    )
+
+    assert request.execution_mode == "one_shot_prompt_file"
+
+
+def test_build_command_run_request_accepts_json_schema_for_message_mode() -> None:
+    request = build_command_run_request(
+        name="cli",
+        instruction_option=None,
+        config_path=None,
+        servers=None,
+        urls=None,
+        auth=None,
+        client_metadata_url=None,
+        agent_cards=None,
+        card_tools=None,
+        model=None,
+        message="hello",
+        prompt_file=None,
+        json_schema="schema.json",
+        result_file=None,
+        resume=None,
+        npx=None,
+        uvx=None,
+        stdio=None,
+        target_agent_name=None,
+        skills_directory=None,
+        home=None,
+        shell_enabled=False,
+        mode="interactive",
+    )
+
+    assert request.json_schema == "schema.json"
+    assert request.quiet is True
+
+
+def test_build_command_run_request_accepts_structured_tool_policy_for_json_schema() -> None:
+    request = build_command_run_request(
+        name="cli",
+        instruction_option=None,
+        config_path=None,
+        servers=None,
+        urls=None,
+        auth=None,
+        client_metadata_url=None,
+        agent_cards=None,
+        card_tools=None,
+        model=None,
+        message="hello",
+        prompt_file=None,
+        json_schema="schema.json",
+        structured_tool_policy="defer",
+        result_file=None,
+        resume=None,
+        npx=None,
+        uvx=None,
+        stdio=None,
+        target_agent_name=None,
+        skills_directory=None,
+        home=None,
+        shell_enabled=False,
+        mode="interactive",
+    )
+
+    assert request.structured_tool_policy == "defer"
+    assert request.to_agent_setup_kwargs()["structured_tool_policy"] == "defer"
+
+
+def test_build_command_run_request_accepts_json_schema_for_prompt_file_mode() -> None:
+    request = build_command_run_request(
+        name="cli",
+        instruction_option=None,
+        config_path=None,
+        servers=None,
+        urls=None,
+        auth=None,
+        client_metadata_url=None,
+        agent_cards=None,
+        card_tools=None,
+        model=None,
+        message=None,
+        prompt_file="prompt.txt",
+        json_schema="schema.json",
+        result_file=None,
+        resume=None,
+        npx=None,
+        uvx=None,
+        stdio=None,
+        target_agent_name=None,
+        skills_directory=None,
+        home=None,
+        shell_enabled=False,
+        mode="interactive",
+    )
+
+    assert request.json_schema == "schema.json"
+    assert request.quiet is True
+
+
+def test_build_command_run_request_accepts_missing_shell_cwd_override() -> None:
+    request = build_command_run_request(
+        name="cli",
+        instruction_option=None,
+        config_path=None,
+        servers=None,
+        urls=None,
+        auth=None,
+        client_metadata_url=None,
+        agent_cards=None,
+        card_tools=None,
+        model=None,
+        message=None,
+        prompt_file=None,
+        result_file=None,
+        resume=None,
+        npx=None,
+        uvx=None,
+        stdio=None,
+        target_agent_name=None,
+        skills_directory=None,
+        home=None,
+        shell_enabled=False,
+        mode="serve",
+        missing_shell_cwd_policy="error",
+    )
+
+    assert request.missing_shell_cwd_policy == "error"
+
+
+def test_build_command_run_request_rejects_message_and_prompt_file() -> None:
+    with pytest.raises(typer.BadParameter, match="Cannot combine --message with --prompt-file"):
+        build_command_run_request(
+            name="cli",
+            instruction_option=None,
+            config_path=None,
+            servers=None,
+            urls=None,
+            auth=None,
+            client_metadata_url=None,
+            agent_cards=None,
+            card_tools=None,
+            model=None,
+            message="hello",
+            prompt_file="prompt.txt",
+            result_file=None,
+            resume=None,
+            npx=None,
+            uvx=None,
+            stdio=None,
+            target_agent_name=None,
+            skills_directory=None,
+            home=None,
+            shell_enabled=False,
+            mode="interactive",
+        )
+
+
+def test_build_command_run_request_rejects_json_schema_without_one_shot_input() -> None:
+    with pytest.raises(
+        typer.BadParameter, match="--json-schema requires --message or --prompt-file"
+    ):
+        build_command_run_request(
+            name="cli",
+            instruction_option=None,
+            config_path=None,
+            servers=None,
+            urls=None,
+            auth=None,
+            client_metadata_url=None,
+            agent_cards=None,
+            card_tools=None,
+            model=None,
+            message=None,
+            prompt_file=None,
+            json_schema="schema.json",
+            result_file=None,
+            resume=None,
+            npx=None,
+            uvx=None,
+            stdio=None,
+            target_agent_name=None,
+            skills_directory=None,
+            home=None,
+            shell_enabled=False,
+            mode="interactive",
+        )
+
+
+def test_build_command_run_request_rejects_json_schema_with_multi_model() -> None:
+    with pytest.raises(
+        typer.BadParameter, match="Cannot combine --json-schema with multiple models"
+    ):
+        build_command_run_request(
+            name="cli",
+            instruction_option=None,
+            config_path=None,
+            servers=None,
+            urls=None,
+            auth=None,
+            client_metadata_url=None,
+            agent_cards=None,
+            card_tools=None,
+            model="gpt-4.1,claude-sonnet-4-5",
+            message="hello",
+            prompt_file=None,
+            json_schema="schema.json",
+            result_file=None,
+            resume=None,
+            npx=None,
+            uvx=None,
+            stdio=None,
+            target_agent_name=None,
+            skills_directory=None,
+            home=None,
+            shell_enabled=False,
+            mode="interactive",
+        )
+
+
+def test_build_command_run_request_accepts_schema_model_for_one_shot() -> None:
+    request = build_command_run_request(
+        name="cli",
+        instruction_option=None,
+        config_path=None,
+        servers=None,
+        urls=None,
+        auth=None,
+        client_metadata_url=None,
+        agent_cards=None,
+        card_tools=None,
+        model=None,
+        message="hello",
+        prompt_file=None,
+        json_schema=None,
+        schema_model="tests.fixtures:Result",
+        result_file=None,
+        resume=None,
+        npx=None,
+        uvx=None,
+        stdio=None,
+        target_agent_name=None,
+        skills_directory=None,
+        home=None,
+        shell_enabled=False,
+        mode="interactive",
+    )
+
+    assert request.schema_model == "tests.fixtures:Result"
+    assert request.quiet is True
+
+
+def test_build_command_run_request_rejects_json_schema_with_schema_model() -> None:
+    with pytest.raises(
+        typer.BadParameter, match="Cannot combine --json-schema with --schema-model"
+    ):
+        build_command_run_request(
+            name="cli",
+            instruction_option=None,
+            config_path=None,
+            servers=None,
+            urls=None,
+            auth=None,
+            client_metadata_url=None,
+            agent_cards=None,
+            card_tools=None,
+            model=None,
+            message="hello",
+            prompt_file=None,
+            json_schema="schema.json",
+            schema_model="tests.fixtures:Result",
+            result_file=None,
+            resume=None,
+            npx=None,
+            uvx=None,
+            stdio=None,
+            target_agent_name=None,
+            skills_directory=None,
+            home=None,
+            shell_enabled=False,
+            mode="interactive",
+        )
+
+
+def test_build_command_run_request_rejects_structured_tool_policy_without_json_schema() -> None:
+    with pytest.raises(typer.BadParameter, match="--structured-tool-policy requires --json-schema"):
+        build_command_run_request(
+            name="cli",
+            instruction_option=None,
+            config_path=None,
+            servers=None,
+            urls=None,
+            auth=None,
+            client_metadata_url=None,
+            agent_cards=None,
+            card_tools=None,
+            model=None,
+            message="hello",
+            prompt_file=None,
+            structured_tool_policy="defer",
+            result_file=None,
+            resume=None,
+            npx=None,
+            uvx=None,
+            stdio=None,
+            target_agent_name=None,
+            skills_directory=None,
+            home=None,
+            shell_enabled=False,
+            mode="interactive",
+        )
+
+
+def test_build_command_run_request_rejects_structured_tool_policy_with_schema_model() -> None:
+    with pytest.raises(
+        typer.BadParameter,
+        match="--structured-tool-policy cannot be combined with --schema-model",
+    ):
+        build_command_run_request(
+            name="cli",
+            instruction_option=None,
+            config_path=None,
+            servers=None,
+            urls=None,
+            auth=None,
+            client_metadata_url=None,
+            agent_cards=None,
+            card_tools=None,
+            model=None,
+            message="hello",
+            prompt_file=None,
+            schema_model="tests.fixtures:Result",
+            structured_tool_policy="defer",
+            result_file=None,
+            resume=None,
+            npx=None,
+            uvx=None,
+            stdio=None,
+            target_agent_name=None,
+            skills_directory=None,
+            home=None,
+            shell_enabled=False,
+            mode="interactive",
+        )
+
+
+def test_build_command_run_request_rejects_invalid_structured_tool_policy() -> None:
+    with pytest.raises(typer.BadParameter, match="structured tool policy must be"):
+        build_command_run_request(
+            name="cli",
+            instruction_option=None,
+            config_path=None,
+            servers=None,
+            urls=None,
+            auth=None,
+            client_metadata_url=None,
+            agent_cards=None,
+            card_tools=None,
+            model=None,
+            message="hello",
+            prompt_file=None,
+            json_schema="schema.json",
+            structured_tool_policy="sometimes",
+            result_file=None,
+            resume=None,
+            npx=None,
+            uvx=None,
+            stdio=None,
+            target_agent_name=None,
+            skills_directory=None,
+            home=None,
+            shell_enabled=False,
+            mode="interactive",
+        )
+
+
+def test_build_agent_run_request_rejects_multi_model_with_explicit_cards() -> None:
+    with pytest.raises(typer.BadParameter, match="Cannot use multiple models with AgentCards"):
+        build_agent_run_request(
+            name="test-agent",
+            instruction="instruction",
+            config_path=None,
+            servers=None,
+            urls=None,
+            auth=None,
+            client_metadata_url=None,
+            agent_cards=["./cards"],
+            card_tools=None,
+            model="gpt-4.1,claude-sonnet-4-5",
+            message=None,
+            prompt_file=None,
+            result_file=None,
+            resume=None,
+            stdio_commands=None,
+            agent_name="agent",
+            target_agent_name=None,
+            skills_directory=None,
+            home=None,
+            shell_enabled=False,
+            mode="interactive",
+            transport="http",
+            host="127.0.0.1",
+            port=8000,
+            tool_description=None,
+            tool_name_template=None,
+            instance_scope="shared",
+            permissions_enabled=True,
+            reload=False,
+            watch=False,
+        )
+
+
+def test_build_agent_run_request_rejects_multi_model_with_implicit_cards(tmp_path: Path) -> None:
+    agent_cards_dir = tmp_path / "agent-cards"
+    agent_cards_dir.mkdir(parents=True)
+    (agent_cards_dir / "demo.md").write_text("---\nname: demo\n---\n")
+
+    with pytest.raises(typer.BadParameter, match="Implicit cards were found in your environment"):
+        build_agent_run_request(
+            name="test-agent",
+            instruction="instruction",
+            config_path=None,
+            servers=None,
+            urls=None,
+            auth=None,
+            client_metadata_url=None,
+            agent_cards=None,
+            card_tools=None,
+            model="gpt-4.1,claude-sonnet-4-5",
+            message=None,
+            prompt_file=None,
+            result_file=None,
+            resume=None,
+            stdio_commands=None,
+            agent_name="agent",
+            target_agent_name=None,
+            skills_directory=None,
+            home=tmp_path,
+            shell_enabled=False,
+            mode="interactive",
+            transport="http",
+            host="127.0.0.1",
+            port=8000,
+            tool_description=None,
+            tool_name_template=None,
+            instance_scope="shared",
+            permissions_enabled=True,
+            reload=False,
+            watch=False,
+        )
+
+
+def test_build_agent_run_request_no_home_keeps_explicit_cards_only() -> None:
+    request = build_agent_run_request(
+        name="test-agent",
+        instruction="instruction",
+        config_path=None,
+        servers=None,
+        urls=None,
+        auth=None,
+        client_metadata_url=None,
+        agent_cards=["./cards", "./cards", "./extra"],
+        card_tools=["./tools", "./tools"],
+        model=None,
+        message=None,
+        prompt_file=None,
+        result_file=None,
+        resume=None,
+        stdio_commands=None,
+        agent_name="agent",
+        target_agent_name=None,
+        skills_directory=None,
+        home=None,
+        shell_enabled=False,
+        mode="interactive",
+        transport="http",
+        host="127.0.0.1",
+        port=8000,
+        tool_description=None,
+        tool_name_template=None,
+        instance_scope="shared",
+        permissions_enabled=True,
+        reload=False,
+        watch=False,
+        no_home=True,
+    )
+
+    assert request.agent_cards == ["./cards", "./extra"]
+    assert request.card_tools == ["./tools"]
+    assert request.home is None
+
+
+def test_build_agent_run_request_no_home_forces_serve_permissions_off() -> None:
+    request = build_agent_run_request(
+        name="test-agent",
+        instruction="instruction",
+        config_path=None,
+        servers=None,
+        urls=None,
+        auth=None,
+        client_metadata_url=None,
+        agent_cards=None,
+        card_tools=None,
+        model=None,
+        message=None,
+        prompt_file=None,
+        result_file=None,
+        resume=None,
+        stdio_commands=None,
+        agent_name="agent",
+        target_agent_name=None,
+        skills_directory=None,
+        home=None,
+        shell_enabled=False,
+        mode="serve",
+        transport="acp",
+        host="127.0.0.1",
+        port=8000,
+        tool_description=None,
+        tool_name_template=None,
+        instance_scope="connection",
+        permissions_enabled=True,
+        reload=False,
+        watch=False,
+        no_home=True,
+    )
+
+    assert request.permissions_enabled is False
+
+
+def test_build_command_run_request_rejects_no_home_with_env() -> None:
+    with pytest.raises(typer.BadParameter, match="Cannot combine --no-home with --home"):
+        build_command_run_request(
+            name="cli",
+            instruction_option=None,
+            config_path=None,
+            servers=None,
+            urls=None,
+            auth=None,
+            client_metadata_url=None,
+            agent_cards=None,
+            card_tools=None,
+            model=None,
+            message=None,
+            prompt_file=None,
+            result_file=None,
+            resume=None,
+            npx=None,
+            uvx=None,
+            stdio=None,
+            target_agent_name=None,
+            skills_directory=None,
+            home=Path("."),
+            shell_enabled=False,
+            mode="interactive",
+            no_home=True,
+        )
+
+
+def test_build_command_run_request_rejects_no_home_with_resume() -> None:
+    with pytest.raises(typer.BadParameter, match="Cannot combine --no-home with --resume"):
+        build_command_run_request(
+            name="cli",
+            instruction_option=None,
+            config_path=None,
+            servers=None,
+            urls=None,
+            auth=None,
+            client_metadata_url=None,
+            agent_cards=None,
+            card_tools=None,
+            model=None,
+            message=None,
+            prompt_file=None,
+            result_file=None,
+            resume="latest",
+            npx=None,
+            uvx=None,
+            stdio=None,
+            target_agent_name=None,
+            skills_directory=None,
+            home=None,
+            shell_enabled=False,
+            mode="interactive",
+            no_home=True,
+        )
+
+
+def test_agent_run_request_rejects_no_home_with_resume_at_boundary() -> None:
+    with pytest.raises(ValueError, match="--no-home cannot be combined with --resume"):
+        AgentRunRequest(
+            name="cli",
+            instruction="instruction",
+            config_path=None,
+            server_list=None,
+            agent_cards=None,
+            card_tools=None,
+            model=None,
+            message=None,
+            prompt_file=None,
+            result_file=None,
+            resume="latest",
+            startup_mcp_servers=None,
+            mcp_startup_notices=(),
+            agent_name="agent",
+            target_agent_name=None,
+            skills_directory=None,
+            home=None,
+            no_home=True,
+            shell_runtime=False,
+            no_shell=False,
+            mode="interactive",
+            transport="http",
+            host="127.0.0.1",
+            port=8000,
+            tool_description=None,
+            tool_name_template=None,
+            instance_scope="shared",
+            permissions_enabled=True,
+            reload=False,
+            watch=False,
+        )
+
+
+def test_build_command_run_request_rejects_shell_with_no_shell() -> None:
+    with pytest.raises(typer.BadParameter, match="Cannot combine --shell with --no-shell"):
+        build_command_run_request(
+            name="cli",
+            instruction_option=None,
+            config_path=None,
+            servers=None,
+            urls=None,
+            auth=None,
+            client_metadata_url=None,
+            agent_cards=None,
+            card_tools=None,
+            model=None,
+            message=None,
+            prompt_file=None,
+            result_file=None,
+            resume=None,
+            npx=None,
+            uvx=None,
+            stdio=None,
+            target_agent_name=None,
+            skills_directory=None,
+            home=None,
+            shell_enabled=True,
+            no_shell=True,
+            mode="interactive",
+        )
+
+
+def test_build_command_run_request_propagates_no_shell() -> None:
+    request = build_command_run_request(
+        name="cli",
+        instruction_option=None,
+        config_path=None,
+        servers=None,
+        urls=None,
+        auth=None,
+        client_metadata_url=None,
+        agent_cards=None,
+        card_tools=None,
+        model=None,
+        message=None,
+        prompt_file=None,
+        result_file=None,
+        resume=None,
+        npx=None,
+        uvx=None,
+        stdio=None,
+        target_agent_name=None,
+        skills_directory=None,
+        home=None,
+        shell_enabled=False,
+        no_shell=True,
+        mode="interactive",
+    )
+
+    assert request.no_shell is True
+
+
+def test_build_command_run_request_rejects_malformed_url() -> None:
+    with pytest.raises(typer.BadParameter, match="URL must have http or https scheme"):
+        build_command_run_request(
+            name="cli",
+            instruction_option=None,
+            config_path=None,
+            servers=None,
+            urls=["not-a-url"],
+            auth=None,
+            client_metadata_url=None,
+            agent_cards=None,
+            card_tools=None,
+            model=None,
+            message=None,
+            prompt_file=None,
+            result_file=None,
+            resume=None,
+            npx=None,
+            uvx=None,
+            stdio=None,
+            target_agent_name=None,
+            skills_directory=None,
+            home=None,
+            shell_enabled=False,
+            mode="interactive",
+        )
+
+
+def test_build_command_run_request_redacts_malformed_url_error() -> None:
+    with pytest.raises(typer.BadParameter) as exc_info:
+        build_command_run_request(
+            name="cli",
+            instruction_option=None,
+            config_path=None,
+            servers=None,
+            urls=["ftp://user:secret@example.com/mcp?token=topsecret#private"],
+            auth=None,
+            client_metadata_url=None,
+            agent_cards=None,
+            card_tools=None,
+            model=None,
+            message=None,
+            prompt_file=None,
+            result_file=None,
+            resume=None,
+            npx=None,
+            uvx=None,
+            stdio=None,
+            target_agent_name=None,
+            skills_directory=None,
+            home=Path("."),
+            shell_enabled=False,
+            mode="interactive",
+        )
+
+    error = str(exc_info.value)
+    assert "secret" not in error
+    assert "topsecret" not in error
+    assert "REDACTED" in error
+
+
+@pytest.mark.parametrize(
+    "bad_url",
+    [
+        "https://user:secret@[bad/mcp?token=topsecret",
+        "https://user:secret@exa／mple.com/mcp?token=topsecret",
+    ],
+)
+def test_build_command_run_request_normalizes_invalid_authority_error(bad_url: str) -> None:
+    with pytest.raises(typer.BadParameter) as exc_info:
+        build_command_run_request(
+            name="cli",
+            instruction_option=None,
+            config_path=None,
+            servers=None,
+            urls=[bad_url],
+            auth=None,
+            client_metadata_url=None,
+            agent_cards=None,
+            card_tools=None,
+            model=None,
+            message=None,
+            prompt_file=None,
+            result_file=None,
+            resume=None,
+            npx=None,
+            uvx=None,
+            stdio=None,
+            target_agent_name=None,
+            skills_directory=None,
+            home=Path("."),
+            shell_enabled=False,
+            mode="interactive",
+        )
+
+    error = str(exc_info.value)
+    assert "secret" not in error
+    assert "topsecret" not in error
+    assert error == "URL occurrence 1 is invalid: [REDACTED INVALID URL]"

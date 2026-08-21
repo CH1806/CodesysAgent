@@ -1,0 +1,105 @@
+---
+social:
+  title: Tool Runner
+  tagline: Expose tools through a focused agent for safe, direct tool execution.
+  description: Expose tools through a focused agent for safe, direct tool execution.
+  alt: fast-agent social card — Tool Runner
+---
+
+# Tool Runner
+
+Tool Runner is the internal loop that powers tool calling for `ToolAgent` and MCP agents. It:
+- Sends messages to the LLM.
+- Detects tool requests.
+- Executes tools.
+- Feeds tool results back into the loop until the assistant is done.
+
+## Hooks (optional)
+
+You can attach lightweight hooks to the Tool Runner without changing the core agent protocol.
+Implement the `ToolRunnerHookCapable` capability and expose a `tool_runner_hooks` property.
+
+Available hook points:
+- `before_llm_call`
+- `after_llm_call`
+- `before_tool_call`
+- `after_tool_call`
+- `after_turn_complete`
+
+`after_llm_call` runs after every assistant response from the model, including
+intermediate responses that request tools. `before_tool_call` and
+`after_tool_call` wrap each tool-execution step. `after_turn_complete` runs once
+at the end of the whole user turn, after any model/tool/model loop has finished,
+and receives the final message for that turn.
+
+### Built-in hooks
+
+fast-agent ships several `after_turn_complete` hooks built on this mechanism,
+applied automatically and gated by config:
+
+- **Auto-compaction** — summarizes older history when context usage crosses
+  `compaction.threshold`. See [Compaction](../guides/compaction.md).
+- **History trimming** — `trim_tool_history: true` on an agent collapses a
+  multi-call tool loop to its last call, result, and final response.
+- **Session-history persistence** — saves the conversation after each turn when
+  `session_history` is enabled.
+
+These coexist with any hooks you attach: built-ins run in a fixed order
+(custom/trim → compact → session save) so a custom `after_turn_complete` hook
+still fires.
+
+## Minimal example
+
+```python
+import asyncio
+
+from fast_agent import FastAgent
+from fast_agent.agents.agent_types import AgentConfig
+from fast_agent.agents.tool_agent import ToolAgent
+from fast_agent.agents.tool_runner import ToolRunnerHooks
+from fast_agent.context import Context
+from fast_agent.interfaces import ToolRunnerHookCapable
+from fast_agent.types import PromptMessageExtended
+
+
+def get_video_call_transcript(video_id: str) -> str:
+    return "Assistant: Hi, how can I assist you today?\n\nCustomer: Hi, I wanted to ask you about last invoice I received..."
+
+
+class HookedToolAgent(ToolAgent, ToolRunnerHookCapable):
+    def __init__(self, config: AgentConfig, context: Context | None = None):
+        super().__init__(config, [get_video_call_transcript], context)
+        self._hooks = ToolRunnerHooks(
+            before_llm_call=self._add_style_hint,
+            after_tool_call=self._log_tool_result,
+        )
+
+    @property
+    def tool_runner_hooks(self) -> ToolRunnerHooks | None:
+        return self._hooks
+
+    async def _add_style_hint(self, runner, messages: list[PromptMessageExtended]) -> None:
+        if runner.iteration == 0:
+            runner.append_messages("Keep the answer to one short sentence.")
+
+    async def _log_tool_result(self, runner, message: PromptMessageExtended) -> None:
+        if message.tool_results:
+            tool_names = ", ".join(message.tool_results.keys())
+            print(f"[hook] tool results received: {tool_names}")
+
+
+fast = FastAgent("Example Tool Use Application (Hooks)")
+
+
+@fast.custom(HookedToolAgent)
+async def main() -> None:
+    async with fast.run() as agent:
+        await agent.default.generate("What is the topic of the video call no.1234?")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+The full runnable example lives in the repo at:
+`examples/tool-runner-hooks/tool_runner_hooks.py`

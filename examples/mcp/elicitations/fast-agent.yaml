@@ -1,0 +1,28 @@
+# Model string takes format:
+#   <provider>.<model_string>?reasoning=<value> (e.g. anthropic.claude-3-5-sonnet-20241022 or openai.o3-mini?reasoning=low)
+#
+# Can be overriden with a command line switch --model=<model>, or within the Agent decorator.
+# Check here for current details: https://fast-agent.ai/models/
+default_model: "passthrough"
+
+# Logging and Console Configuration
+logger:
+  level: "error"
+  type: "console"
+
+# MCP Server Configuration
+mcp:
+  servers:
+    # Modern MCP server: elicitation occurs while processing the tool request.
+    sandbox_server:
+      target: "uv run sandbox_server.py"
+      protocol_mode: modern
+      elicitation:
+        mode: "forms"
+
+    # Modern URL elicitation; url_demo.py supplies an explicit consent handler.
+    url_server:
+      target: "uv run url_server.py"
+      protocol_mode: modern
+      elicitation:
+        mode: "forms"

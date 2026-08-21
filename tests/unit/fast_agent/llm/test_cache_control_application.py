@@ -1,0 +1,200 @@
+import unittest
+from typing import Any, cast
+
+from mcp_types import TextContent
+
+from fast_agent.llm.provider.anthropic.multipart_converter_anthropic import AnthropicConverter
+from fast_agent.mcp.prompt_message_extended import PromptMessageExtended
+from fast_agent.utils.type_narrowing import is_str_object_dict
+
+
+def _as_dict(value: object) -> dict[str, Any]:
+    assert isinstance(value, dict)
+    return cast("dict[str, Any]", value)
+
+
+def _as_content_list(value: object) -> list[dict[str, Any]]:
+    assert isinstance(value, list)
+    for item in value:
+        assert isinstance(item, dict)
+    return cast("list[dict[str, Any]]", value)
+
+
+def apply_cache_control_to_message(message: object, position: int) -> bool:
+    """
+    Apply cache control to a message at the specified position.
+
+    Args:
+        message: The message dict to modify
+        position: The position in the message list (for logging/tracking)
+
+    Returns:
+        True if cache control was applied, False otherwise
+    """
+    if not isinstance(message, dict) or "content" not in message:
+        return False
+
+    message_dict = _as_dict(message)
+    content_list = message_dict["content"]
+    if not isinstance(content_list, list) or not content_list:
+        return False
+
+    # Apply cache control to the last content block of this message
+    for content_block in reversed(content_list):
+        if is_str_object_dict(content_block):
+            content_block["cache_control"] = {"type": "ephemeral"}
+            return True
+
+    return False
+
+
+class TestCacheControlApplication(unittest.TestCase):
+    """Test cache control application logic without mocks."""
+
+    def test_apply_cache_control_to_valid_message(self):
+        """Test applying cache control to a valid message."""
+        message = {"role": "user", "content": [{"type": "text", "text": "Hello world"}]}
+
+        success = apply_cache_control_to_message(message, 0)
+
+        self.assertTrue(success)
+        content_list = _as_content_list(message["content"])
+        self.assertIn("cache_control", content_list[0])
+        self.assertEqual(content_list[0]["cache_control"]["type"], "ephemeral")
+
+    def test_apply_cache_control_to_message_with_multiple_blocks(self):
+        """Test applying cache control to message with multiple content blocks."""
+        message = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "First block"},
+                {"type": "text", "text": "Second block"},
+            ],
+        }
+
+        success = apply_cache_control_to_message(message, 0)
+
+        self.assertTrue(success)
+        # Should apply to the last block
+        content_list = _as_content_list(message["content"])
+        self.assertNotIn("cache_control", content_list[0])
+        self.assertIn("cache_control", content_list[1])
+        self.assertEqual(content_list[1]["cache_control"]["type"], "ephemeral")
+
+    def test_apply_cache_control_to_invalid_message(self):
+        """Test that cache control is not applied to invalid messages."""
+        # Test with missing content
+        message1 = {"role": "user"}
+        success1 = apply_cache_control_to_message(message1, 0)
+        self.assertFalse(success1)
+
+        # Test with empty content
+        message2 = {"role": "user", "content": []}
+        success2 = apply_cache_control_to_message(message2, 0)
+        self.assertFalse(success2)
+
+        # Test with non-dict content
+        message3 = {"role": "user", "content": ["not a dict"]}
+        success3 = apply_cache_control_to_message(message3, 0)
+        self.assertFalse(success3)
+
+    def test_apply_cache_control_preserves_existing_content(self):
+        """Test that applying cache control preserves existing message content."""
+        original_text = "Important message"
+        message = {"role": "user", "content": [{"type": "text", "text": original_text}]}
+
+        success = apply_cache_control_to_message(message, 0)
+
+        self.assertTrue(success)
+        # Original content should be preserved
+        content_list = _as_content_list(message["content"])
+        self.assertEqual(content_list[0]["text"], original_text)
+        self.assertEqual(content_list[0]["type"], "text")
+        # Cache control should be added
+        self.assertIn("cache_control", content_list[0])
+
+    def test_multipart_to_anthropic_conversion_preserves_structure(self):
+        """Test that PromptMessageExtended -> Anthropic conversion preserves structure for caching."""
+        # Create a multipart message
+        text_content = TextContent(type="text", text="Test message for caching")
+        multipart = PromptMessageExtended(role="user", content=[text_content])
+
+        # Convert to Anthropic format
+        anthropic_msg = AnthropicConverter.convert_to_anthropic(multipart)
+
+        # Verify structure is suitable for cache control application
+        self.assertEqual(anthropic_msg["role"], "user")
+        content_list = list(anthropic_msg.get("content", []))
+        self.assertTrue(len(content_list) > 0)
+        self.assertIsInstance(content_list[0], dict)
+
+        # Apply cache control to the converted message
+        msg = _as_dict(anthropic_msg)
+        success = apply_cache_control_to_message(msg, 0)
+        self.assertTrue(success)
+        content_list = _as_content_list(msg["content"])
+        self.assertIn("cache_control", content_list[0])
+
+    def test_multiple_multipart_messages_conversion_and_caching(self):
+        """Test converting multiple multipart messages and applying cache to specific position."""
+        # Create multiple messages
+        messages = []
+        for i in range(4):
+            text_content = TextContent(type="text", text=f"Message {i}")
+            multipart = PromptMessageExtended(
+                role="user" if i % 2 == 0 else "assistant", content=[text_content]
+            )
+            anthropic_msg = AnthropicConverter.convert_to_anthropic(multipart)
+            messages.append(anthropic_msg)
+
+        # Apply cache control to position 2 (3rd message)
+        cache_position = 2
+        msg = messages[cache_position]
+        assert isinstance(msg, dict)
+        success = apply_cache_control_to_message(msg, cache_position)
+
+        self.assertTrue(success)
+
+        # Verify only the target message has cache control
+        for i, msg in enumerate(messages):
+            if i == cache_position:
+                content_list = _as_content_list(msg["content"])
+                self.assertIn("cache_control", content_list[0])
+                self.assertEqual(content_list[0]["cache_control"]["type"], "ephemeral")
+            else:
+                content_list = _as_content_list(msg["content"])
+                self.assertNotIn("cache_control", content_list[0])
+
+    def test_assistant_message_caching(self):
+        """Test that assistant messages can also receive cache control."""
+        text_content = TextContent(type="text", text="Assistant response")
+        multipart = PromptMessageExtended(role="assistant", content=[text_content])
+
+        anthropic_msg = AnthropicConverter.convert_to_anthropic(multipart)
+        msg = _as_dict(anthropic_msg)
+        success = apply_cache_control_to_message(msg, 0)
+
+        self.assertTrue(success)
+        self.assertEqual(anthropic_msg["role"], "assistant")
+        content_list = _as_content_list(msg["content"])
+        self.assertIn("cache_control", content_list[0])
+
+    def test_cache_control_application_idempotent(self):
+        """Test that applying cache control multiple times doesn't break anything."""
+        message = {"role": "user", "content": [{"type": "text", "text": "Test message"}]}
+
+        # Apply cache control twice
+        success1 = apply_cache_control_to_message(message, 0)
+        success2 = apply_cache_control_to_message(message, 0)
+
+        self.assertTrue(success1)
+        self.assertTrue(success2)
+
+        # Should still have cache control
+        content_list = _as_content_list(message["content"])
+        self.assertIn("cache_control", content_list[0])
+        self.assertEqual(content_list[0]["cache_control"]["type"], "ephemeral")
+
+
+if __name__ == "__main__":
+    unittest.main()

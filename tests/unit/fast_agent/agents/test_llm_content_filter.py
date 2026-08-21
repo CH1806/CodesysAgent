@@ -1,0 +1,391 @@
+import json
+from datetime import datetime
+
+import pytest
+from mcp_types import (
+    BlobResourceContents,
+    CallToolResult,
+    EmbeddedResource,
+    ImageContent,
+    ResourceLink,
+    TextContent,
+)
+
+from fast_agent.agents.agent_types import AgentConfig
+from fast_agent.agents.llm_decorator import LlmDecorator
+from fast_agent.constants import (
+    FAST_AGENT_ALERT_CHANNEL,
+    FAST_AGENT_ERROR_CHANNEL,
+    FAST_AGENT_REMOVED_METADATA_CHANNEL,
+)
+from fast_agent.interfaces import FastAgentLLMProtocol
+from fast_agent.llm.model_factory import ModelConfig
+from fast_agent.llm.model_info import ModelInfo
+from fast_agent.llm.provider_types import Provider
+from fast_agent.llm.resolved_model import ResolvedModelSpec
+from fast_agent.types import PromptMessageExtended, text_content
+
+
+class RecordingStubLLM(FastAgentLLMProtocol):
+    """Minimal FastAgentLLMProtocol implementation for testing."""
+
+    def __init__(self, model_name: str = "passthrough") -> None:
+        self._model_name = model_name
+        self._provider = Provider.FAST_AGENT
+        self._resolved_model = ResolvedModelSpec(
+            raw_input=model_name,
+            selected_model_name=model_name,
+            source="direct",
+            model_config=ModelConfig(provider=Provider.FAST_AGENT, model_name=model_name),
+            provider=Provider.FAST_AGENT,
+            wire_model_name=model_name,
+        )
+        self.generated_messages: list[PromptMessageExtended] | None = None
+        self._message_history: list[PromptMessageExtended] = []
+
+    #        self.usage_accumulator = None
+
+    @property
+    def model_name(self) -> str | None:
+        return self._model_name
+
+    @property
+    def provider(self) -> Provider:
+        return self._provider
+
+    @property
+    def resolved_model(self) -> ResolvedModelSpec:
+        return self._resolved_model
+
+    async def generate(self, messages, request_params=None, tools=None):
+        self.generated_messages = messages
+        self._message_history = messages
+        return PromptMessageExtended(
+            role="assistant",
+            content=[TextContent(type="text", text="ok")],
+        )
+
+    async def structured(self, messages, model, request_params=None):
+        await self.generate(messages, request_params)
+        return None, PromptMessageExtended(
+            role="assistant",
+            content=[TextContent(type="text", text="ok")],
+        )
+
+    async def apply_prompt_template(self, prompt_result, prompt_name: str) -> str:
+        return ""
+
+    @property
+    def message_history(self):
+        return self._message_history
+
+    @property
+    def model_info(self):
+        from fast_agent.llm.model_info import ModelInfo
+
+        model_name = self.model_name
+        if model_name is None:
+            return None
+        return ModelInfo.from_name(model_name, self.provider)
+
+
+class OverlayVisionStubLLM(RecordingStubLLM):
+    @property
+    def provider(self) -> Provider:
+        return Provider.OPENRESPONSES
+
+    @property
+    def model_info(self):
+        model_name = self.model_name or "overlay-model"
+        return ModelInfo(
+            name=model_name,
+            provider=self.provider,
+            context_window=75264,
+            max_output_tokens=2048,
+            tokenizes=["text/plain", "image/jpeg", "image/png", "image/webp"],
+            json_mode=None,
+            reasoning=None,
+        )
+
+
+class AnthropicStubLLM(RecordingStubLLM):
+    def __init__(self, model_name: str = "claude-sonnet-4-5") -> None:
+        super().__init__(model_name=model_name)
+        self._provider = Provider.ANTHROPIC
+        self._resolved_model = ResolvedModelSpec(
+            raw_input=model_name,
+            selected_model_name=model_name,
+            source="direct",
+            model_config=ModelConfig(provider=Provider.ANTHROPIC, model_name=model_name),
+            provider=Provider.ANTHROPIC,
+            wire_model_name=model_name,
+        )
+
+
+def make_decorator(model_name: str = "passthrough") -> tuple[LlmDecorator, RecordingStubLLM]:
+    config = AgentConfig(name="tester", model=model_name)
+    decorator = LlmDecorator(config=config)
+    stub = RecordingStubLLM(model_name=model_name)
+    decorator._llm = stub
+    return decorator, stub
+
+
+def make_overlay_vision_decorator() -> tuple[LlmDecorator, OverlayVisionStubLLM]:
+    model_name = "unsloth/Qwen3.5-9B-GGUF"
+    config = AgentConfig(name="tester", model=model_name)
+    decorator = LlmDecorator(config=config)
+    stub = OverlayVisionStubLLM(model_name=model_name)
+    decorator._llm = stub
+    return decorator, stub
+
+
+def make_anthropic_decorator() -> tuple[LlmDecorator, AnthropicStubLLM]:
+    model_name = "claude-sonnet-4-5"
+    config = AgentConfig(name="tester", model=model_name)
+    decorator = LlmDecorator(config=config)
+    stub = AnthropicStubLLM(model_name=model_name)
+    decorator._llm = stub
+    return decorator, stub
+
+
+def _parse_meta_categories(blocks) -> set[str]:
+    categories: set[str] = set()
+    for block in blocks or []:
+        text = getattr(block, "text", None)
+        if not text:
+            continue
+        try:
+            payload = json.loads(text)
+        except (TypeError, ValueError):
+            continue
+        if payload.get("type") != "fast-agent-removed":
+            continue
+        category = payload.get("category")
+        if category:
+            categories.add(category)
+    return categories
+
+
+def _parse_alert_flags(blocks) -> set[str]:
+    flags: set[str] = set()
+    for block in blocks or []:
+        text = getattr(block, "text", None)
+        if not text:
+            continue
+        try:
+            payload = json.loads(text)
+        except (TypeError, ValueError):
+            continue
+        if payload.get("type") != "unsupported_content_removed":
+            continue
+        block_flags = payload.get("flags")
+        if isinstance(block_flags, str):
+            block_flags = [block_flags]
+        if isinstance(block_flags, list):
+            for flag in block_flags:
+                if flag in {"T", "D", "V"}:
+                    flags.add(flag)
+    return flags
+
+
+def test_removed_block_segment_formats_count_and_mime_types():
+    assert (
+        LlmDecorator._removed_block_segment(
+            count=1,
+            label="vision",
+            mime_types=("image/png",),
+        )
+        == "1 vision block (image/png)"
+    )
+    assert (
+        LlmDecorator._removed_block_segment(
+            count=2,
+            label="document",
+            mime_types=("application/pdf", "text/csv"),
+        )
+        == "2 document blocks (application/pdf, text/csv)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_sanitizes_image_content_for_text_only_model():
+    decorator, stub = make_decorator("passthrough")
+
+    text_block = TextContent(type="text", text="Hello")
+    image_block = ImageContent(type="image", data="AAA", mime_type="image/png")
+    message = PromptMessageExtended(role="user", content=[text_block, image_block])
+
+    _, summary = decorator._sanitize_messages_for_llm([message])
+    assert summary is not None
+    assert "vision" in summary.message.lower()
+    assert "fast-agent-error" in summary.message
+
+    await decorator.generate_impl([message])
+
+    assert stub.generated_messages is not None
+    sent_message = stub.generated_messages[0]
+    # Only original text block remains - no placeholder since some content was kept
+    assert len(sent_message.content) == 1
+    assert isinstance(sent_message.content[0], TextContent)
+    assert sent_message.content[0].text == "Hello"
+
+    # Removed content should be in error channel
+    channels = sent_message.channels or {}
+    assert FAST_AGENT_ERROR_CHANNEL in channels
+    error_entries = channels[FAST_AGENT_ERROR_CHANNEL]
+    assert len(error_entries) == 2
+    assert isinstance(error_entries[0], TextContent)
+    assert "image/png" in error_entries[0].text
+    assert "vision" in error_entries[0].text
+    assert isinstance(error_entries[1], ImageContent)
+
+    meta_blocks = channels.get(FAST_AGENT_REMOVED_METADATA_CHANNEL, [])
+    categories = _parse_meta_categories(meta_blocks)
+    assert categories == {"vision"}
+
+    alert_blocks = channels.get(FAST_AGENT_ALERT_CHANNEL, [])
+    assert _parse_alert_flags(alert_blocks) == {"V"}
+
+
+@pytest.mark.asyncio
+async def test_overlay_model_info_keeps_supported_image_content():
+    decorator, stub = make_overlay_vision_decorator()
+
+    image_block = ImageContent(type="image", data="AAA", mime_type="image/png")
+    message = PromptMessageExtended(role="user", content=[image_block])
+
+    _, summary = decorator._sanitize_messages_for_llm([message])
+    assert summary is None
+
+    await decorator.generate_impl([message])
+
+    assert stub.generated_messages is not None
+    sent_message = stub.generated_messages[0]
+    assert len(sent_message.content) == 1
+    assert isinstance(sent_message.content[0], ImageContent)
+    assert sent_message.channels is None or FAST_AGENT_ERROR_CHANNEL not in sent_message.channels
+
+
+@pytest.mark.asyncio
+async def test_removes_unsupported_tool_result_content():
+    decorator, stub = make_decorator("passthrough")
+
+    resource = BlobResourceContents(
+        uri="file://example.pdf",
+        mime_type="application/pdf",
+        blob="AA==",
+    )
+    embedded = EmbeddedResource(type="resource", resource=resource)
+    tool_result = CallToolResult(content=[embedded], is_error=False)
+    message = PromptMessageExtended(role="user", tool_results={"tool1": tool_result})
+
+    _, summary = decorator._sanitize_messages_for_llm([message])
+    assert summary is not None
+    assert "document" in summary.message.lower()
+
+    await decorator.generate_impl([message])
+
+    assert stub.generated_messages is not None
+    sent_message = stub.generated_messages[0]
+    assert sent_message.tool_results is not None
+    sanitized_result = sent_message.tool_results["tool1"]
+    # Should have placeholder text since all content was removed
+    assert len(sanitized_result.content) == 1
+    assert isinstance(sanitized_result.content[0], TextContent)
+    assert "document" in sanitized_result.content[0].text.lower()
+    assert "removed" in sanitized_result.content[0].text.lower()
+
+    # Detailed info (including mime type) is in the error channel
+    channels = sent_message.channels or {}
+    error_entries = channels[FAST_AGENT_ERROR_CHANNEL]
+    assert isinstance(error_entries[0], TextContent)
+    assert "tool1" in error_entries[0].text
+    assert "application/pdf" in error_entries[0].text
+    assert isinstance(error_entries[1], EmbeddedResource)
+
+    meta_blocks = channels.get(FAST_AGENT_REMOVED_METADATA_CHANNEL, [])
+    categories = _parse_meta_categories(meta_blocks)
+    assert categories == {"document"}
+
+    alert_blocks = channels.get(FAST_AGENT_ALERT_CHANNEL, [])
+    assert _parse_alert_flags(alert_blocks) == {"D"}
+
+
+@pytest.mark.asyncio
+async def test_removes_remote_office_document_links_for_anthropic() -> None:
+    decorator, stub = make_anthropic_decorator()
+
+    resource = ResourceLink(
+        type="resource_link",
+        uri="https://example.com/report.docx",
+        mime_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        name="report.docx",
+    )
+    message = PromptMessageExtended(role="user", content=[resource])
+
+    _, summary = decorator._sanitize_messages_for_llm([message])
+    assert summary is not None
+    assert "document" in summary.message.lower()
+
+    await decorator.generate_impl([message])
+
+    assert stub.generated_messages is not None
+    sent_message = stub.generated_messages[0]
+    assert len(sent_message.content) == 1
+    assert isinstance(sent_message.content[0], TextContent)
+    assert "removed" in sent_message.content[0].text.lower()
+
+
+@pytest.mark.asyncio
+async def test_metadata_clears_when_supported_content_only():
+    decorator, stub = make_decorator("passthrough")
+
+    image_block = ImageContent(type="image", data="AAA", mime_type="image/png")
+    first_message = PromptMessageExtended(role="user", content=[image_block])
+    await decorator.generate_impl([first_message])
+
+    channels = (stub.generated_messages or [])[0].channels or {}
+    assert FAST_AGENT_REMOVED_METADATA_CHANNEL in channels
+
+    second_message = PromptMessageExtended(role="user", content=[text_content("Next turn")])
+    await decorator.generate_impl([second_message])
+
+    assert stub.generated_messages is not None
+    meta_blocks = (stub.generated_messages[0].channels or {}).get(
+        FAST_AGENT_REMOVED_METADATA_CHANNEL, []
+    )
+    assert not meta_blocks
+
+
+@pytest.mark.asyncio
+async def test_history_persists_alert_channel_but_strips_removed_metadata():
+    decorator, _ = make_decorator("passthrough")
+
+    image_block = ImageContent(type="image", data="AAA", mime_type="image/png")
+    message = PromptMessageExtended(role="user", content=[image_block])
+
+    await decorator.generate_impl([message])
+
+    assert decorator.message_history
+    persisted_user_message = decorator.message_history[0]
+    channels = persisted_user_message.channels or {}
+    assert FAST_AGENT_ALERT_CHANNEL in channels
+    assert _parse_alert_flags(channels[FAST_AGENT_ALERT_CHANNEL]) == {"V"}
+    assert FAST_AGENT_REMOVED_METADATA_CHANNEL not in channels
+
+
+@pytest.mark.asyncio
+async def test_history_persists_wall_clock_timestamps_for_user_and_assistant_messages():
+    decorator, _ = make_decorator("passthrough")
+
+    message = PromptMessageExtended(role="user", content=[text_content("hello")])
+
+    await decorator.generate_impl([message])
+
+    assert len(decorator.message_history) == 2
+    persisted_user_message = decorator.message_history[0]
+    persisted_assistant_message = decorator.message_history[1]
+
+    assert isinstance(persisted_user_message.timestamp, datetime)
+    assert isinstance(persisted_assistant_message.timestamp, datetime)
+    assert persisted_user_message.timestamp <= persisted_assistant_message.timestamp

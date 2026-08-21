@@ -1,0 +1,688 @@
+"""Bootstrap command to create example applications."""
+
+import shutil
+from contextlib import ExitStack
+from dataclasses import dataclass
+from importlib.resources import as_file, files
+from pathlib import Path
+
+import typer
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+
+from fast_agent.ui.console import console as shared_console
+from fast_agent.utils.count_display import format_count
+
+app = typer.Typer(
+    help="Create fast-agent quickstarts",
+    no_args_is_help=False,  # Allow showing our custom help instead
+    add_completion=False,
+)
+console = shared_console
+
+
+BASE_EXAMPLES_DIR = files("fast_agent").joinpath("resources").joinpath("examples")
+
+# Subdirectories to copy for toad-cards quickstart (used by hf-inference-acp too)
+TOAD_CARDS_SUBDIRS = ["agent-cards", "tool-cards", "skills", "shared", "hooks"]
+
+_NEXT_STEP_MESSAGES: dict[str, tuple[str, ...]] = {
+    "workflow": (
+        "1. Review chaining.py for the basic workflow example",
+        "2. Check other examples:",
+        "   - parallel.py: Run agents in parallel",
+        "   - router.py: Route requests between agents",
+        "   - evaluator.py: Add evaluation capabilities",
+        "   - human_input.py: Incorporate human feedback",
+        "3. Run an example with: uv run <example>.py",
+        "4. Try a different model with --model=<model>, or update the agent config",
+    ),
+    "researcher": (
+        "1. Set up the Brave MCP Server (get an API key from https://brave.com/search/api/)",
+        "2. Try `uv run researcher.py` for the basic version",
+        "3. Try `uv run researcher-eval.py` for the eval/optimize version",
+    ),
+    "data-analysis": (
+        "1. Run uv `analysis.py` to perform data analysis and visualization",
+        "2. The dataset is available in the mount-point directory:",
+        "   - mount-point/WA_Fn-UseC_-HR-Employee-Attrition.csv",
+        "On Windows platforms, please edit the fast-agent.yaml and adjust the volume mount point.",
+    ),
+    "elicitations": (
+        "1. Go to the `elicitations` subdirectory (cd elicitations)",
+        "2. Start a simulated t4-small sandbox: uv run sandbox_demo.py",
+        "3. Override form handling: uv run custom_handler_demo.py",
+        "4. Try modern URL elicitation: uv run url_demo.py",
+        "Check [cyan][link=https://fast-agent.ai/mcp/elicitations/]https://fast-agent.ai/mcp/elicitations/[/link][/cyan] for more details",
+    ),
+}
+
+
+@dataclass
+class ExampleConfig:
+    description: str
+    files: list[str]
+    create_subdir: bool
+    path_in_examples: list[str]
+    mount_point_files: list[str] | None = None
+
+
+_EXAMPLE_CONFIGS = {
+    "workflow": ExampleConfig(
+        description=(
+            "Example workflows, demonstrating each of the patterns in Anthropic's\n"
+            "'Building Effective Agents' paper. Some agents use the 'fetch'\n"
+            "and filesystem MCP Servers."
+        ),
+        files=[
+            "chaining.py",
+            "evaluator.py",
+            "human_input.py",
+            "orchestrator.py",
+            "parallel.py",
+            "router.py",
+            "short_story.txt",
+            "fast-agent.yaml",
+        ],
+        create_subdir=True,
+        path_in_examples=["workflows"],
+    ),
+    "researcher": ExampleConfig(
+        description=(
+            "Research agent example with additional evaluation/optimization\n"
+            "example. Uses Brave Search and Docker MCP Servers.\n"
+            "Creates examples in a 'researcher' subdirectory."
+        ),
+        files=["researcher.py", "researcher-eval.py", "fast-agent.yaml"],
+        create_subdir=True,
+        path_in_examples=["researcher"],
+    ),
+    "data-analysis": ExampleConfig(
+        description=(
+            "Data analysis agent examples that demonstrate working with\n"
+            "datasets, performing statistical analysis, and generating visualizations.\n"
+            "Creates examples in a 'data-analysis' subdirectory with mount-point for data.\n"
+            "Uses MCP 'roots' feature for mapping"
+        ),
+        files=["analysis.py", "fast-agent.yaml"],
+        mount_point_files=["WA_Fn-UseC_-HR-Employee-Attrition.csv"],
+        create_subdir=True,
+        path_in_examples=["data-analysis"],
+    ),
+    "elicitations": ExampleConfig(
+        description=(
+            "Modern request-scoped MCP elicitation examples.\n"
+            "Demonstrates forms, custom handlers, and URL navigation consent while an\n"
+            "originating tool request is active. Creates an 'elicitations' subdirectory."
+        ),
+        files=[
+            "custom_handler_demo.py",
+            "fast-agent.yaml",
+            "fast-agent.secrets.yaml.example",
+            "sandbox_demo.py",
+            "sandbox_server.py",
+            "url_demo.py",
+            "url_server.py",
+        ],
+        create_subdir=True,
+        path_in_examples=["mcp", "elicitations"],
+    ),
+    "tensorzero": ExampleConfig(
+        description=(
+            "A complete example showcasing the TensorZero integration.\n"
+            "Includes the T0 Gateway, an MCP server, an interactive agent, and \n"
+            "multi-modal functionality."
+        ),
+        files=[
+            ".env.sample",
+            "Makefile",
+            "README.md",
+            "agent.py",
+            "docker-compose.yml",
+            "fast-agent.yaml",
+            "image_demo.py",
+            "simple_agent.py",
+            "mcp_server/",
+            "demo_images/",
+            "tensorzero_config/",
+        ],
+        create_subdir=True,
+        path_in_examples=["tensorzero"],
+    ),
+    "toad-cards": ExampleConfig(
+        description=(
+            "Example Tool and Agent cards for (also used with Hugging Face Toad integration).\n"
+            "Includes ACP expert, MCP expert, and HF search tool cards.\n"
+            "Creates a '.fast-agent' directory in the current directory."
+        ),
+        files=[f"{d}/" for d in TOAD_CARDS_SUBDIRS],
+        create_subdir=False,
+        path_in_examples=["hf-toad-cards"],
+    ),
+}
+
+
+def _files_summary(info: ExampleConfig) -> str:
+    summary = format_count(len(info.files), "file")
+    if info.mount_point_files:
+        summary += f"\n+ {format_count(len(info.mount_point_files), 'data file')}"
+    return summary
+
+
+def _development_mode_fallback(example_info: ExampleConfig) -> Path:
+    """Fallback function for development mode."""
+    package_dir = Path(__file__).parent.parent.parent.parent.parent
+    for dir in example_info.path_in_examples:
+        package_dir = package_dir / dir
+    console.print(f"[blue]Using development directory: {package_dir}[/blue]")
+    return package_dir
+
+
+def copy_example_files(example_type: str, target_dir: Path, force: bool = False) -> list[str]:
+    """Copy example files from resources to target directory."""
+    # Determine if we should create a subdirectory for this example type
+    example_info = _EXAMPLE_CONFIGS.get(example_type)
+    if example_info is None:
+        console.print(f"Example type '{example_type}' not found.")
+        return []
+
+    if example_info.create_subdir:
+        target_dir = target_dir / example_type
+        if not target_dir.exists():
+            target_dir.mkdir(parents=True)
+            console.print(f"Created subdirectory: {target_dir}")
+
+    # Determine source directory - try package resources first, then fallback
+    use_as_file = False
+    # Try to use examples from the installed package first, or fall back to the top-level directory
+    try:
+        # First try to find examples in the package resources
+        source_dir_traversable = BASE_EXAMPLES_DIR
+        for dir in example_info.path_in_examples:
+            source_dir_traversable = source_dir_traversable.joinpath(dir)
+
+        # Check if we found a valid directory
+        if not source_dir_traversable.is_dir():
+            console.print(
+                f"[yellow]Resource directory not found: {source_dir_traversable}. "
+                "Falling back to development mode.[/yellow]"
+            )
+            # Fall back to the top-level directory for development mode
+            source_dir: Path = _development_mode_fallback(example_info)
+        else:
+            # We have a valid Traversable, will need to use as_file
+            source_dir = source_dir_traversable
+            use_as_file = True
+    except (ImportError, ModuleNotFoundError, ValueError) as e:
+        console.print(
+            f"[yellow]Error accessing resources: {e}. Falling back to development mode.[/yellow]"
+        )
+        source_dir = _development_mode_fallback(example_info)
+
+    # Use as_file context manager if source_dir is a Traversable, otherwise use directly
+    with ExitStack() as stack:
+        if use_as_file:
+            source_path = stack.enter_context(as_file(source_dir))
+        else:
+            assert isinstance(source_dir, Path)
+            source_path = source_dir
+
+        if not source_path.exists():
+            console.print(f"[red]Error: Source directory not found: {source_path}[/red]")
+            return []
+
+        return _copy_files_from_source(example_type, example_info, source_path, target_dir, force)
+
+
+def _relative_created_path(
+    *,
+    example_type: str,
+    filename: str,
+    target: Path,
+    target_dir: Path,
+) -> str:
+    try:
+        return str(target.relative_to(target_dir.parent))
+    except ValueError:
+        return f"{example_type}/{filename}"
+
+
+def _copy_example_file(
+    *,
+    source: Path,
+    target: Path,
+    display_name: str,
+    created_path: str,
+    force: bool,
+) -> str | None:
+    try:
+        if not source.exists():
+            console.print(f"[red]Error: Source file not found: {source}[/red]")
+            return None
+
+        if target.exists() and not force:
+            console.print(f"[yellow]Skipping[/yellow] {display_name} (already exists)")
+            return None
+
+        shutil.copy2(source, target)
+        console.print(f"[green]Created[/green] {created_path}")
+        return created_path
+
+    except Exception as e:
+        console.print(f"[red]Error copying {display_name}: {e!s}[/red]")
+        return None
+
+
+def _copy_regular_example_files(
+    example_type: str,
+    example_info: ExampleConfig,
+    source_dir: Path,
+    target_dir: Path,
+    force: bool,
+) -> list[str]:
+    created: list[str] = []
+    for filename in example_info.files:
+        target = target_dir / filename
+        copied = _copy_example_file(
+            source=source_dir / filename,
+            target=target,
+            display_name=filename,
+            created_path=_relative_created_path(
+                example_type=example_type,
+                filename=filename,
+                target=target,
+                target_dir=target_dir,
+            ),
+            force=force,
+        )
+        if copied is not None:
+            created.append(copied)
+    return created
+
+
+def _copy_mount_point_files(
+    example_type: str,
+    example_info: ExampleConfig,
+    source_dir: Path,
+    target_dir: Path,
+    force: bool,
+) -> list[str]:
+    mount_point_files = example_info.mount_point_files or []
+    if not mount_point_files:
+        return []
+
+    mount_point_dir = target_dir / "mount-point"
+    if not mount_point_dir.exists():
+        mount_point_dir.mkdir(parents=True)
+        console.print(f"Created mount-point directory: {mount_point_dir}")
+
+    created: list[str] = []
+    for filename in mount_point_files:
+        display_name = f"mount-point/{filename}"
+        copied = _copy_example_file(
+            source=source_dir / "mount-point" / filename,
+            target=mount_point_dir / filename,
+            display_name=display_name,
+            created_path=f"{example_type}/{display_name}",
+            force=force,
+        )
+        if copied is not None:
+            created.append(copied)
+    return created
+
+
+def _copy_files_from_source(
+    example_type: str, example_info: ExampleConfig, source_dir: Path, target_dir: Path, force: bool
+) -> list[str]:
+    """Helper function to copy files from a source directory."""
+    created = _copy_regular_example_files(example_type, example_info, source_dir, target_dir, force)
+    created.extend(
+        _copy_mount_point_files(example_type, example_info, source_dir, target_dir, force)
+    )
+
+    return created
+
+
+def copy_project_template(source_dir: Path, dest_dir: Path, console: Console, force: bool = False):
+    """
+    Recursively copies a project template directory.
+    This is a helper to handle project-based quickstarts like TensorZero.
+    """
+    if dest_dir.exists():
+        if force:
+            console.print(
+                f"[yellow]--force specified. Removing existing directory: {dest_dir}[/yellow]"
+            )
+            shutil.rmtree(dest_dir)
+        else:
+            console.print(
+                f"[bold yellow]Directory '{dest_dir.name}' already exists.[/bold yellow] Use --force to overwrite."
+            )
+            return False
+
+    try:
+        shutil.copytree(source_dir, dest_dir)
+        return True
+    except Exception as e:
+        console.print(f"[red]Error copying project template: {e}[/red]")
+        return False
+
+
+def show_overview() -> None:
+    """Display an overview of available examples in a nicely formatted table."""
+    console.print("\n[bold cyan]fast-agent quickstarts[/bold cyan]")
+    console.print("Build agents and compose workflows through practical examples\n")
+
+    # Create a table for better organization
+    table = Table(show_header=True, header_style="bold magenta", box=None, padding=(0, 2))
+    table.add_column("Example")
+    table.add_column("Description")
+    table.add_column("Files")
+
+    for name, info in _EXAMPLE_CONFIGS.items():
+        table.add_row(f"[green]{name}[/green]", info.description, _files_summary(info))
+
+    console.print(table)
+
+    # Show usage instructions in a panel
+    usage_text = (
+        "[bold]Usage:[/bold]\n"
+        "  [cyan]fast-agent[/cyan] [green]quickstart[/green] [yellow]<name>[/yellow] [dim]\\[directory][/dim]\n\n"
+        "[dim]directory optionally overrides the default subdirectory name[/dim]\n\n"
+        "[bold]Options:[/bold]\n"
+        "  [cyan]--force[/cyan]            Overwrite existing files"
+    )
+    console.print(Panel(usage_text, title="Usage", border_style="blue"))
+
+
+@app.command()
+def workflow(
+    directory: Path = typer.Argument(
+        Path(),
+        help="Directory where workflow examples will be created",
+    ),
+    force: bool = typer.Option(False, "--force", "-f", help="Force overwrite existing files"),
+) -> None:
+    """Create workflow pattern examples."""
+    target_dir = directory.resolve()
+    if not target_dir.exists():
+        target_dir.mkdir(parents=True)
+        console.print(f"Created directory: {target_dir}")
+
+    created = copy_example_files("workflow", target_dir, force)
+    _show_completion_message("workflow", created)
+
+
+@app.command()
+def researcher(
+    directory: Path = typer.Argument(
+        Path(),
+        help="Directory where researcher examples will be created (in 'researcher' subdirectory)",
+    ),
+    force: bool = typer.Option(False, "--force", "-f", help="Force overwrite existing files"),
+) -> None:
+    """Create researcher pattern examples."""
+    target_dir = directory.resolve()
+    if not target_dir.exists():
+        target_dir.mkdir(parents=True)
+        console.print(f"Created directory: {target_dir}")
+
+    created = copy_example_files("researcher", target_dir, force)
+    _show_completion_message("researcher", created)
+
+
+@app.command()
+def data_analysis(
+    directory: Path = typer.Argument(
+        Path(),
+        help="Directory where data analysis examples will be created (creates 'data-analysis' subdirectory with mount-point)",
+    ),
+    force: bool = typer.Option(False, "--force", "-f", help="Force overwrite existing files"),
+) -> None:
+    """Create data analysis examples with sample dataset."""
+    target_dir = directory.resolve()
+    if not target_dir.exists():
+        target_dir.mkdir(parents=True)
+        console.print(f"Created directory: {target_dir}")
+
+    created = copy_example_files("data-analysis", target_dir, force)
+    _show_completion_message("data-analysis", created)
+
+
+@app.command()
+def elicitations(
+    directory: Path = typer.Argument(
+        Path(),
+        help="Directory where elicitation examples will be created (in 'elicitations' subdirectory)",
+    ),
+    force: bool = typer.Option(False, "--force", "-f", help="Force overwrite existing files"),
+) -> None:
+    """Create interactive form examples using MCP elicitations."""
+    target_dir = directory.resolve()
+    if not target_dir.exists():
+        target_dir.mkdir(parents=True)
+        console.print(f"Created directory: {target_dir}")
+
+    created = copy_example_files("elicitations", target_dir, force)
+    _show_completion_message("elicitations", created)
+
+
+def _show_completion_message(example_type: str, created: list[str]) -> None:
+    """Show completion message and next steps."""
+    if created:
+        console.print("\n[green]Setup completed successfully![/green]")
+        console.print("\nCreated files:")
+        for f in created:
+            console.print(f"  - {f}")
+
+        console.print("\n[bold]Next Steps:[/bold]")
+        for line in _NEXT_STEP_MESSAGES.get(example_type, ()):
+            console.print(line)
+    else:
+        console.print("\n[yellow]No files were created.[/yellow]")
+
+
+@app.command(name="tensorzero", help="Create the TensorZero integration example project.")
+def tensorzero(
+    directory: Path = typer.Argument(
+        Path(),
+        help="Directory where the 'tensorzero' project folder will be created.",
+    ),
+    force: bool = typer.Option(
+        False, "--force", "-f", help="Force overwrite if project directory exists"
+    ),
+):
+    """Create the TensorZero project example."""
+    console.print("[bold green]Setting up the TensorZero quickstart example...[/bold green]")
+
+    dest_project_dir = directory.resolve() / "tensorzero"
+
+    # --- Find Source Directory ---
+    use_as_file = False
+    try:
+        # This path MUST match the "to" path from hatch_build.py
+        source_dir_traversable = (
+            files("fast_agent").joinpath("resources").joinpath("examples").joinpath("tensorzero")
+        )
+        if not source_dir_traversable.is_dir():
+            raise FileNotFoundError  # Fallback to dev mode if resource isn't a dir
+        source_dir = source_dir_traversable
+        use_as_file = True
+    except (ImportError, ModuleNotFoundError, FileNotFoundError):
+        console.print(
+            "[yellow]Package resources not found. Falling back to development mode.[/yellow]"
+        )
+        # This path is relative to the project root in a development environment
+        source_dir = Path(__file__).parent.parent.parent.parent / "examples" / "tensorzero"
+
+    # Use as_file context manager if needed
+    with ExitStack() as stack:
+        if use_as_file:
+            source_path = stack.enter_context(as_file(source_dir))
+        else:
+            assert isinstance(source_dir, Path)
+            source_path = source_dir
+
+        if not source_path.exists() or not source_path.is_dir():
+            console.print(
+                f"[red]Error: Source project directory not found at '{source_path}'[/red]"
+            )
+            raise typer.Exit(1)
+
+        console.print(f"Source directory: [dim]{source_path}[/dim]")
+        console.print(f"Destination: [dim]{dest_project_dir}[/dim]")
+
+        # --- Copy Project and Show Message ---
+        if copy_project_template(source_path, dest_project_dir, console, force):
+            console.print(
+                f"\n[bold green]✅ Success![/bold green] Your TensorZero project has been created in: [cyan]{dest_project_dir}[/cyan]"
+            )
+            console.print("\n[bold yellow]Next Steps:[/bold yellow]")
+            console.print("\n1. [bold]Navigate to your new project directory:[/bold]")
+            console.print(f"   [cyan]cd {dest_project_dir.relative_to(Path.cwd())}[/cyan]")
+
+            console.print("\n2. [bold]Set up your API keys:[/bold]")
+            console.print("   [cyan]cp .env.sample .env[/cyan]")
+            console.print(
+                "   [dim]Then, open the new '.env' file and add your OpenAI or Anthropic API key.[/dim]"
+            )
+
+            console.print(
+                "\n3. [bold]Start the required services (TensorZero Gateway & MCP Server):[/bold]"
+            )
+            console.print("   [cyan]docker compose up --build -d[/cyan]")
+            console.print(
+                "   [dim](This builds and starts the necessary containers in the background)[/dim]"
+            )
+
+            console.print("\n4. [bold]Run the interactive agent:[/bold]")
+            console.print("   [cyan]make agent[/cyan]  (or `uv run agent.py`)")
+            console.print("\nEnjoy exploring the TensorZero integration with fast-agent! ✨")
+
+
+@app.command(name="toad-cards")
+def toad_cards(
+    directory: Path = typer.Argument(
+        Path(),
+        help="Directory where .fast-agent will be created (defaults to current directory)",
+    ),
+    force: bool = typer.Option(False, "--force", "-f", help="Force overwrite existing files"),
+) -> None:
+    """Create .fast-agent directory with example agent and tool cards for HuggingFace Toad."""
+    console.print("[bold green]Setting up toad-cards example...[/bold green]")
+
+    target_base = directory.resolve()
+    fast_agent_dir = target_base / ".fast-agent"
+
+    # Create .fast-agent directory if it doesn't exist
+    if fast_agent_dir.exists():
+        if not force:
+            console.print(
+                f"[bold yellow]Directory '{fast_agent_dir}' already exists.[/bold yellow] "
+                "Use --force to overwrite."
+            )
+            # Continue anyway, but will skip existing files
+        else:
+            console.print("[yellow]--force specified. Overwriting existing files...[/yellow]")
+    else:
+        fast_agent_dir.mkdir(parents=True, exist_ok=True)
+        console.print(f"Created directory: {fast_agent_dir}")
+
+    created = _copy_toad_cards(fast_agent_dir, force)
+    _show_toad_cards_completion_message(created)
+
+
+def _copy_toad_cards(target_dir: Path, force: bool = False) -> list[str]:
+    """Copy toad-cards files from resources to .fast-agent directory."""
+    created: list[str] = []
+
+    # Determine source directory - try package resources first, then fallback
+    use_as_file = False
+    try:
+        source_dir_traversable = BASE_EXAMPLES_DIR.joinpath("hf-toad-cards")
+        if not source_dir_traversable.is_dir():
+            console.print(
+                "[yellow]Package resources not found. Falling back to development mode.[/yellow]"
+            )
+            source_dir: Path = (
+                Path(__file__).parent.parent.parent.parent.parent / "examples" / "hf-toad-cards"
+            )
+        else:
+            source_dir = source_dir_traversable
+            use_as_file = True
+    except (ImportError, ModuleNotFoundError, FileNotFoundError):
+        source_dir = (
+            Path(__file__).parent.parent.parent.parent.parent / "examples" / "hf-toad-cards"
+        )
+
+    with ExitStack() as stack:
+        if use_as_file:
+            source_path: Path = stack.enter_context(as_file(source_dir))
+        else:
+            assert isinstance(source_dir, Path)
+            source_path = source_dir
+
+        if not source_path.exists():
+            console.print(f"[red]Error: Source directory not found: {source_path}[/red]")
+            return []
+
+        # Copy each subdirectory
+        for subdir_name in TOAD_CARDS_SUBDIRS:
+            source_subdir: Path = source_path / subdir_name
+            target_subdir = target_dir / subdir_name
+
+            if not source_subdir.exists():
+                continue
+
+            # Create target subdirectory
+            target_subdir.mkdir(parents=True, exist_ok=True)
+
+            # Copy all files recursively
+            for src_file in source_subdir.rglob("*"):
+                if src_file.is_file():
+                    rel_path = src_file.relative_to(source_subdir)
+                    dest_file = target_subdir / rel_path
+
+                    # Create parent directories if needed
+                    dest_file.parent.mkdir(parents=True, exist_ok=True)
+
+                    if dest_file.exists() and not force:
+                        console.print(
+                            f"[yellow]Skipping[/yellow] {subdir_name}/{rel_path} (already exists)"
+                        )
+                        continue
+
+                    shutil.copy2(src_file, dest_file)
+                    created.append(f".fast-agent/{subdir_name}/{rel_path}")
+                    console.print(f"[green]Created[/green] .fast-agent/{subdir_name}/{rel_path}")
+
+    return created
+
+
+def _show_toad_cards_completion_message(created: list[str]) -> None:
+    """Show completion message for toad-cards command."""
+    if created:
+        console.print("\n[green]Toad cards setup completed successfully![/green]")
+        console.print(f"\nCreated {format_count(len(created), 'file')} in .fast-agent/")
+        console.print("\n[bold]Directory structure:[/bold]")
+        console.print("  .fast-agent/")
+        console.print("  ├── agent-cards/          # Agent card definitions")
+        console.print("  ├── tool-cards/           # Tool card definitions")
+        console.print("  ├── shared/               # Shared context snippets")
+        console.print("  ├── skills/               # Agent Skills (loaded on-demand)")
+        console.print("  ├── hooks/                # Hook scripts for agent workflows")
+
+        console.print("\n[bold]Next Steps:[/bold]")
+        console.print("1. The cards are automatically loaded when running hf-inference-acp")
+        console.print("2. Customize the cards by editing the markdown files")
+        console.print("3. Add more agent cards to agent-cards/ or tool cards to tool-cards/")
+    else:
+        console.print("\n[yellow]No files were created.[/yellow]")
+
+
+@app.callback(invoke_without_command=True)
+def main(ctx: typer.Context) -> None:
+    """Quickstart applications for fast-agent."""
+    if ctx.invoked_subcommand is None:
+        show_overview()

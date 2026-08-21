@@ -1,0 +1,30 @@
+# Please edit this configuration file to match your environment (on Windows).
+# Examples in comments below - check/change the paths.
+#
+#
+
+logger:
+  type: file
+  level: error
+  truncate_tools: true
+
+mcp:
+  servers:
+    filesystem:
+      # On windows update the target to use `node` and the absolute path to the server.
+      # Use `npm i -g @modelcontextprotocol/server-filesystem` to install the server globally.
+      # Use `npm -g root` to find the global node_modules path.`
+      # target: "node c:/Program Files/nodejs/node_modules/@modelcontextprotocol/server-filesystem/dist/index.js ."
+      target: "npx -y @modelcontextprotocol/server-filesystem ."
+    fetch:
+      target: "uvx mcp-server-fetch"
+      env:
+        # mcp-server-fetch uses readabilipy which may call `npm install` on first run.
+        # npm output on stdout will break MCP stdio JSON-RPC parsing, so silence it.
+        npm_config_loglevel: "silent"
+        npm_config_progress: "false"
+        npm_config_fund: "false"
+        npm_config_audit: "false"
+        npm_config_update_notifier: "false"
+    time:
+      target: "uvx mcp-server-time"

@@ -1,0 +1,1498 @@
+"""Tests for ACP slash commands functionality."""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import tempfile
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, cast
+
+import pytest
+from mcp_types import CallToolRequest, CallToolRequestParams, CallToolResult, TextContent
+
+from fast_agent.acp import ACPCommand
+from fast_agent.acp.slash_commands import SlashCommandHandler
+from fast_agent.agents.agent_types import AgentConfig, AgentType
+from fast_agent.command_actions import PluginCommandActionSpec
+from fast_agent.commands.context import StaticAgentProvider
+from fast_agent.config import get_settings, update_global_settings
+from fast_agent.constants import (
+    ANTHROPIC_ASSISTANT_RAW_CONTENT,
+    ANTHROPIC_CITATIONS_CHANNEL,
+    ANTHROPIC_SERVER_TOOLS_CHANNEL,
+    FAST_AGENT_ERROR_CHANNEL,
+    FAST_AGENT_TIMING,
+    FAST_AGENT_TOOL_TIMING,
+    FAST_AGENT_USAGE,
+)
+from fast_agent.core.agent_app import AgentCardLoadResult
+from fast_agent.llm.provider_types import Provider
+from fast_agent.mcp.prompt_message_extended import PromptMessageExtended
+from fast_agent.mcp.prompt_serialization import save_json
+from fast_agent.session import (
+    SessionAgentSnapshot,
+    SessionContinuationSnapshot,
+    SessionManager,
+    SessionRequestSettingsSnapshot,
+    SessionSnapshot,
+    reset_session_manager,
+    set_session_manager,
+)
+from fast_agent.session import session_manager as session_manager_module
+from fast_agent.utils.markdown import escape_markdown_text
+
+if TYPE_CHECKING:
+    from acp.schema import StopReason
+
+    from fast_agent.core.fastagent import AgentInstance
+    from fast_agent.interfaces import AgentProtocol
+else:
+
+    class AgentProtocol:  # pragma: no cover
+        pass
+
+
+TEST_DIR = Path(__file__).parent
+if str(TEST_DIR) not in sys.path:
+    sys.path.append(str(TEST_DIR))
+
+
+CONFIG_PATH = TEST_DIR / "fastagent.config.yaml"
+END_TURN: StopReason = "end_turn"
+
+
+@dataclass
+class StubAgent:
+    message_history: list[Any] = field(default_factory=list)
+    llm: Any = None
+    cleared: bool = False
+    popped: bool = False
+    agent_type: AgentType = AgentType.BASIC
+    name: str = "test-agent"
+    instruction: str | None = None
+    context: Any = None
+    usage_accumulator: Any = None
+    config: Any = field(default_factory=lambda: AgentConfig("test-agent"))
+
+    def __post_init__(self) -> None:
+        if self.instruction is None:
+            self.instruction = f"{self.name} agent."
+        if isinstance(self.config, AgentConfig):
+            self.config.name = self.name
+            self.config.instruction = self.instruction
+
+    def clear(self, clear_prompts: bool = False) -> None:
+        self.cleared = True
+        self.message_history.clear()
+
+    def pop_last_message(self):
+        self.popped = True
+        if not self.message_history:
+            return None
+        return self.message_history.pop()
+
+    def load_message_history(self, messages: list[Any]) -> None:
+        self.message_history = list(messages)
+
+
+class ACPAwareStubAgent(StubAgent):
+    @property
+    def acp(self) -> None:
+        return None
+
+    @property
+    def is_acp_mode(self) -> bool:
+        return True
+
+    @property
+    def acp_commands(self) -> dict[str, ACPCommand]:
+        async def handle(_arguments: str) -> str:
+            return "custom status"
+
+        return {
+            "status": ACPCommand(
+                description="Custom status command",
+                handler=handle,
+            ),
+            "inspect": ACPCommand(
+                description="Custom inspect command",
+                handler=handle,
+            ),
+        }
+
+    def acp_mode_info(self) -> None:
+        return None
+
+
+class CaseSensitiveACPAwareStubAgent(ACPAwareStubAgent):
+    @property
+    def acp_commands(self) -> dict[str, ACPCommand]:
+        async def handle(_arguments: str) -> str:
+            return "custom uppercase status"
+
+        commands = super().acp_commands
+        commands["Status"] = ACPCommand(
+            description="Custom uppercase status command",
+            handler=handle,
+        )
+        return commands
+
+
+class _StubAppProvider(StaticAgentProvider):
+    def __init__(self, agents: dict[str, object]) -> None:
+        super().__init__(agents)
+        self.card_collision_warnings: list[str] = []
+        self.user_turn_usage: tuple[object, ...] = ()
+
+
+@dataclass
+class StubAgentInstance:
+    agents: dict[str, Any] = field(default_factory=dict)
+    app: Any = None
+
+    def __post_init__(self) -> None:
+        if self.app is None:
+            self.app = _StubAppProvider(self.agents)
+
+
+def _handler(
+    instance: StubAgentInstance,
+    agent_name: str = "test-agent",
+    **kwargs,
+) -> SlashCommandHandler:
+    return SlashCommandHandler(
+        "test-session",
+        cast("AgentInstance", instance),
+        agent_name,
+        **kwargs,
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_slash_command_parsing() -> None:
+    """Test that slash commands are correctly parsed."""
+    handler = _handler(StubAgentInstance())
+
+    # Test valid slash command
+    assert handler.is_slash_command("/status")
+    assert handler.is_slash_command("/status arg1 arg2")
+    assert handler.is_slash_command("  /status  ")
+
+    # Test non-slash command
+    assert not handler.is_slash_command("status")
+    assert not handler.is_slash_command("just a regular prompt")
+
+    # Test parsing
+    cmd, args = handler.parse_command("/status")
+    assert cmd == "status"
+    assert args == ""
+
+    cmd, args = handler.parse_command("/Status arg1")
+    assert cmd == "Status"
+    assert args == "arg1"
+
+    cmd, args = handler.parse_command("/status arg1 arg2")
+    assert cmd == "status"
+    assert args == "arg1 arg2"
+
+    cmd, args = handler.parse_command("  /status  ")
+    assert cmd == "status"
+    assert args == ""
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_slash_command_execution_normalizes_command_name() -> None:
+    handler = _handler(StubAgentInstance())
+
+    response = await handler.execute_command("Status", "")
+
+    assert "# fast-agent ACP status" in response
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_slash_command_exact_case_agent_command_wins_before_lowercase_builtin() -> None:
+    stub_agent = CaseSensitiveACPAwareStubAgent()
+    handler = _handler(StubAgentInstance(agents={"test-agent": stub_agent}))
+
+    response = await handler.execute_command("Status", "")
+
+    assert response == "custom uppercase status"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_slash_command_available_commands() -> None:
+    """Test that available commands are returned correctly."""
+    handler = _handler(StubAgentInstance())
+
+    # Get available commands
+    commands = handler.get_available_commands()
+
+    # Should include primary commands
+    command_names = {cmd.name for cmd in commands}
+    assert "status" in command_names
+    assert "clear" in command_names
+    assert "history" in command_names
+    assert "session" in command_names
+    assert "subagents" in command_names
+    assert "tool" in command_names
+
+    # Check status command structure
+    status_cmd = next(cmd for cmd in commands if cmd.name == "status")
+    assert status_cmd.description  # Should have a non-empty description
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_tool_command_requires_a_tool_name() -> None:
+    handler = _handler(StubAgentInstance())
+
+    response = await handler.execute_command("tool", "")
+
+    assert response == "Tool name required: /tool <tool-name>"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_slash_command_available_commands_hide_shadowed_agent_acp_commands() -> None:
+    stub_agent = ACPAwareStubAgent()
+    instance = StubAgentInstance(agents={"test-agent": stub_agent})
+    handler = _handler(instance)
+
+    commands = handler.get_available_commands()
+
+    assert [command.name for command in commands].count("status") == 1
+    assert "inspect" in {command.name for command in commands}
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_slash_command_available_commands_model_hint_is_dynamic() -> None:
+    class _LlmStub:
+        model_name = "gpt-5"
+        provider = Provider.RESPONSES
+        resolved_model = None
+        default_request_params = None
+        service_tier_supported = False
+        available_service_tiers: tuple[str, ...] = ()
+        text_verbosity_spec = None
+        text_verbosity = None
+        web_search_supported = True
+        web_fetch_supported = False
+        web_search_enabled = False
+        web_fetch_enabled = False
+
+    stub_agent = StubAgent(message_history=[], llm=_LlmStub())
+    instance = StubAgentInstance(agents={"test-agent": stub_agent})
+    handler = _handler(instance)
+
+    commands = handler.get_available_commands()
+    model_cmd = next(cmd for cmd in commands if cmd.name == "model")
+
+    assert model_cmd.input is not None
+    hint = model_cmd.input.root.hint
+    assert hint is not None
+    assert "reasoning <value>" in hint
+    assert "web_search <on|off|default>" in hint
+    assert "web_fetch <on|off|default>" not in hint
+    assert "verbosity <value>" not in hint
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_slash_command_unknown_command() -> None:
+    """Test that unknown commands are handled gracefully."""
+    handler = _handler(StubAgentInstance())
+
+    # Execute unknown command
+    response = await handler.execute_command("unknown_cmd", "")
+
+    # Should get an error message
+    assert "Unknown command" in response or "not yet implemented" in response.lower()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_slash_command_session_reports_invalid_quoting() -> None:
+    handler = _handler(StubAgentInstance())
+
+    response = await handler.execute_command("session", 'title "unterminated')
+
+    assert "Invalid /session arguments" in response
+    assert "No closing quotation" in response
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_slash_command_does_not_mask_handler_keyerror(monkeypatch) -> None:
+    async def _raise_handler_keyerror(*_args, **_kwargs) -> str:
+        raise KeyError("stale-agent")
+
+    monkeypatch.setattr(
+        "fast_agent.acp.slash.handlers.status.handle_status",
+        _raise_handler_keyerror,
+    )
+    handler = _handler(StubAgentInstance())
+
+    with pytest.raises(KeyError, match="stale-agent"):
+        await handler.execute_command("status", "")
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_slash_command_status() -> None:
+    """Test the /status command execution."""
+    stub_agent = StubAgent(message_history=[], llm=None)
+    instance = StubAgentInstance(agents={"test-agent": stub_agent})
+
+    handler = _handler(instance)
+
+    # Execute status command
+    response = await handler.execute_command("status", "")
+
+    # Should contain expected sections
+    assert "fast-agent Status" in response or "fast-agent" in response.lower()
+    assert "Version" in response or "version" in response.lower()
+    assert "Model" in response or "model" in response.lower()
+    # Context stats should be present even if values are minimal
+    assert "Turns" in response or "turns" in response.lower()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_slash_command_status_reports_error_channel_entries() -> None:
+    """Test that /status surfaces error channel diagnostics when available."""
+    error_text = "Removed unsupported vision tool result before sending to model"
+    mock_message = PromptMessageExtended(
+        role="assistant",
+        content=[TextContent(type="text", text="response")],
+        channels={FAST_AGENT_ERROR_CHANNEL: [TextContent(type="text", text=error_text)]},
+    )
+
+    stub_agent = StubAgent(message_history=[mock_message], llm=None)
+    instance = StubAgentInstance(agents={"test-agent": stub_agent})
+
+    handler = _handler(instance)
+
+    response = await handler.execute_command("status", "")
+
+    assert FAST_AGENT_ERROR_CHANNEL in response
+    assert error_text in response
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_slash_command_status_system() -> None:
+    """Test the /status system command to show system prompt."""
+
+    @dataclass
+    class AgentWithInstruction(StubAgent):
+        name: str = "test-agent"
+        instruction: str = "You are a helpful assistant that provides excellent support."
+
+    stub_agent = AgentWithInstruction(message_history=[], llm=None)
+    instance = StubAgentInstance(agents={"test-agent": stub_agent})
+
+    handler = _handler(instance)
+
+    # Execute status system command
+    response = await handler.execute_command("status", "system")
+
+    # Should contain system prompt heading
+    assert "system prompt" in response.lower()
+    # Should contain the agent name
+    assert "test-agent" in response.lower()
+    # Should contain the instruction/system prompt
+    assert stub_agent.instruction in response
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_slash_command_model_web_search() -> None:
+    class _LlmStub:
+        def __init__(self) -> None:
+            self.model_name = "gpt-5"
+            self.provider = Provider.RESPONSES
+            self.resolved_model = None
+            self.reasoning_effort_spec = None
+            self.reasoning_effort = None
+            self.text_verbosity_spec = None
+            self.text_verbosity = None
+            self.default_request_params = None
+            self.service_tier_supported = False
+            self.available_service_tiers: tuple[str, ...] = ()
+            self.configured_transport = "sse"
+            self.active_transport = None
+            self.web_search_supported = True
+            self.web_fetch_supported = False
+            self._web_search_override: bool | None = None
+
+        @property
+        def web_search_enabled(self) -> bool:
+            return bool(self._web_search_override)
+
+        @property
+        def web_fetch_enabled(self) -> bool:
+            return False
+
+        def set_web_search_enabled(self, value: bool | None) -> None:
+            self._web_search_override = value
+
+        def set_web_fetch_enabled(self, value: bool | None) -> None:
+            if value is not None:
+                raise ValueError("Current model does not support web fetch configuration.")
+
+    stub_agent = StubAgent(message_history=[], llm=_LlmStub())
+    instance = StubAgentInstance(agents={"test-agent": stub_agent})
+    handler = _handler(instance)
+
+    response = await handler.execute_command("model", "web_search on")
+
+    assert "Web search: set to enabled." in response
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_slash_command_model_web_fetch_unsupported() -> None:
+    class _LlmStub:
+        def __init__(self) -> None:
+            self.model_name = "gpt-5"
+            self.provider = Provider.RESPONSES
+            self.resolved_model = None
+            self.reasoning_effort_spec = None
+            self.reasoning_effort = None
+            self.text_verbosity_spec = None
+            self.text_verbosity = None
+            self.default_request_params = None
+            self.service_tier_supported = False
+            self.available_service_tiers: tuple[str, ...] = ()
+            self.web_search_supported = True
+            self.web_fetch_supported = False
+
+        @property
+        def web_search_enabled(self) -> bool:
+            return False
+
+        @property
+        def web_fetch_enabled(self) -> bool:
+            return False
+
+        def set_web_search_enabled(self, value: bool | None) -> None:
+            return None
+
+        def set_web_fetch_enabled(self, value: bool | None) -> None:
+            if value is not None:
+                raise ValueError("Current model does not support web fetch configuration.")
+
+    stub_agent = StubAgent(message_history=[], llm=_LlmStub())
+    instance = StubAgentInstance(agents={"test-agent": stub_agent})
+    handler = _handler(instance)
+
+    response = await handler.execute_command("model", "web_fetch on")
+
+    assert (
+        escape_markdown_text("Current model does not support web_fetch configuration.") in response
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_slash_command_session_resume_switches_current_mode(tmp_path: Path) -> None:
+    """Test /session resume switches current mode when a single agent has history."""
+    original_cwd = Path.cwd()
+    os.chdir(tmp_path)
+    session_manager_module._session_manager = None
+    try:
+        manager = SessionManager(cwd=tmp_path, home_override=tmp_path / ".fast-agent")
+        session = manager.create_session()
+
+        user_message = PromptMessageExtended(
+            role="user",
+            content=[TextContent(type="text", text="resume me")],
+        )
+        assistant_message = PromptMessageExtended(
+            role="assistant",
+            content=[TextContent(type="text", text="welcome back")],
+        )
+        alpha_agent = StubAgent(
+            name="alpha",
+            message_history=[user_message, assistant_message],
+        )
+        await session.save_history(cast("AgentProtocol", alpha_agent))
+
+        beta_agent = StubAgent(name="beta")
+        alpha_agent.context = SimpleNamespace(session_manager=manager)
+        beta_agent.context = SimpleNamespace(session_manager=manager)
+        instance = StubAgentInstance(agents={"alpha": alpha_agent, "beta": beta_agent})
+        switched: list[str] = []
+
+        def _set_current_mode(agent_name: str) -> None:
+            switched.append(agent_name)
+
+        handler = _handler(
+            instance,
+            agent_name="beta",
+            set_current_mode_callback=_set_current_mode,
+        )
+        response = await handler.execute_command(
+            "session",
+            f"resume {session.info.name}",
+        )
+
+        assert "Switched to agent: alpha" in response
+        assert "Last assistant message" in response
+        assert "welcome back" in response
+        assert handler.current_agent_name == "alpha"
+        assert switched == ["alpha"]
+    finally:
+        session_manager_module._session_manager = None
+        os.chdir(original_cwd)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_slash_command_status_system_prefers_session_instruction() -> None:
+    """Test /status system prefers session-resolved instructions when available."""
+
+    @dataclass
+    class AgentWithInstruction(StubAgent):
+        name: str = "test-agent"
+        instruction: str = "Template instruction with {{env}}."
+
+    stub_agent = AgentWithInstruction(message_history=[], llm=None)
+    instance = StubAgentInstance(agents={"test-agent": stub_agent})
+
+    resolved_instruction = "Resolved instruction with env."
+    handler = _handler(instance, session_instructions={"test-agent": resolved_instruction})
+
+    response = await handler.execute_command("status", "system")
+
+    assert resolved_instruction in response
+    assert stub_agent.instruction not in response
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_slash_command_status_system_without_instruction() -> None:
+    """Test /status system when agent has no configured instruction."""
+    stub_agent = StubAgent(message_history=[], llm=None, instruction="")
+    instance = StubAgentInstance(agents={"test-agent": stub_agent})
+
+    handler = _handler(instance)
+
+    # Execute status system command
+    response = await handler.execute_command("status", "system")
+
+    # Should contain system prompt heading
+    assert "system prompt" in response.lower()
+    # Should indicate no system prompt is available
+    assert "no system prompt" in response.lower()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_slash_command_history_save_conversation() -> None:
+    """Test that /history save saves history and reports the filename."""
+
+    class RecordingHistoryExporter:
+        def __init__(self, default_name: str = "24_01_01_12_00-conversation.json") -> None:
+            self.default_name = default_name
+            self.calls: list[tuple[Any, str | None]] = []
+
+        async def save(self, agent, filename: str | None = None) -> str:
+            self.calls.append((agent, filename))
+            return filename or self.default_name
+
+    stub_agent = StubAgent(message_history=[])
+    instance = StubAgentInstance(agents={"test-agent": stub_agent})
+    exporter = RecordingHistoryExporter()
+
+    handler = _handler(instance, history_exporter=exporter)
+
+    response = await handler.execute_command("history", "save")
+
+    assert "save conversation" in response.lower()
+    assert "History saved to" in response
+    assert escape_markdown_text("24_01_01_12_00-conversation.json") in response
+    assert exporter.calls == [(stub_agent, None)]
+
+    response_with_filename = await handler.execute_command("history", "save custom.md")
+    assert "History saved to" in response_with_filename
+    assert "custom.md" in response_with_filename
+    assert exporter.calls[-1] == (stub_agent, "custom.md")
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_slash_command_history_save_without_agent() -> None:
+    """Test /history save error handling when the agent is missing."""
+    handler = _handler(StubAgentInstance(), agent_name="missing-agent")
+
+    response = await handler.execute_command("history", "save")
+
+    assert "save conversation" in response.lower()
+    assert "Unable to locate agent" in response
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_slash_command_clear_history() -> None:
+    """Test clearing the entire history."""
+    messages = [
+        PromptMessageExtended(role="user", content=[TextContent(type="text", text="hi")]),
+        PromptMessageExtended(role="assistant", content=[TextContent(type="text", text="hello")]),
+    ]
+    stub_agent = StubAgent(message_history=messages.copy())
+    instance = StubAgentInstance(agents={"test-agent": stub_agent})
+
+    handler = _handler(instance)
+
+    response = await handler.execute_command("clear", "")
+
+    assert stub_agent.cleared is True
+    assert stub_agent.message_history == []
+    assert "clear conversation" in response.lower()
+    assert "history cleared" in response.lower()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_slash_command_clear_last_entry() -> None:
+    """Test clearing only the last message."""
+    messages = [
+        PromptMessageExtended(role="user", content=[TextContent(type="text", text="hi")]),
+        PromptMessageExtended(role="assistant", content=[TextContent(type="text", text="hello")]),
+    ]
+    stub_agent = StubAgent(message_history=messages.copy())
+    instance = StubAgentInstance(agents={"test-agent": stub_agent})
+
+    handler = _handler(instance)
+
+    response = await handler.execute_command("clear", "last")
+
+    assert stub_agent.popped is True
+    assert len(stub_agent.message_history) == 1
+    assert stub_agent.message_history[0].role == "user"
+    assert "clear last" in response.lower()
+    assert "removed last" in response.lower()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_slash_command_history_clear_last_entry() -> None:
+    messages = [
+        PromptMessageExtended(role="user", content=[TextContent(type="text", text="hi")]),
+        PromptMessageExtended(role="assistant", content=[TextContent(type="text", text="hello")]),
+    ]
+    stub_agent = StubAgent(message_history=messages.copy())
+    instance = StubAgentInstance(agents={"test-agent": stub_agent})
+    handler = _handler(instance)
+
+    response = await handler.execute_command("history", "clear last")
+
+    assert stub_agent.popped is True
+    assert len(stub_agent.message_history) == 1
+    assert "history clear last" in response.lower()
+    assert "removed last" in response.lower()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_slash_command_history_rewind_reports_missing_turn() -> None:
+    handler = _handler(StubAgentInstance(agents={"test-agent": StubAgent()}))
+
+    response = await handler.execute_command("history", "rewind")
+
+    assert "history rewind" in response.lower()
+    assert "turn number required" in response.lower()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_slash_command_clear_last_when_empty() -> None:
+    """Test /clear last when no messages exist."""
+    stub_agent = StubAgent(message_history=[])
+    instance = StubAgentInstance(agents={"test-agent": stub_agent})
+    handler = _handler(instance)
+
+    response = await handler.execute_command("clear", "last")
+
+    assert "clear last" in response.lower()
+    assert "no messages" in response.lower()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_slash_command_clear_unknown_argument_does_not_clear() -> None:
+    messages = [
+        PromptMessageExtended(role="user", content=[TextContent(type="text", text="hi")]),
+    ]
+    stub_agent = StubAgent(message_history=messages.copy())
+    handler = _handler(StubAgentInstance(agents={"test-agent": stub_agent}))
+
+    response = await handler.execute_command("clear", "lats")
+
+    assert response == "Usage: /clear [last]"
+    assert stub_agent.cleared is False
+    assert stub_agent.popped is False
+    assert stub_agent.message_history == messages
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_slash_command_not_detected_for_comments() -> None:
+    """Test that text starting with "//" (like comments) is detected as a slash command."""
+    handler = _handler(StubAgentInstance())
+
+    # Double slash (comment-style) should still be detected as starting with "/"
+    assert handler.is_slash_command("//hello, world!")
+    assert handler.is_slash_command("// This is a comment")
+
+    # However, the integration test test_acp_resource_only_prompt_not_slash_command
+    # verifies that resource content with "//" is NOT treated as a slash command
+    # because the slash command check only applies to pure text content, not resources
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_slash_command_history_load() -> None:
+    """Test that /history load loads history from a file."""
+    stub_agent = StubAgent(message_history=[])
+    instance = StubAgentInstance(agents={"test-agent": stub_agent})
+
+    handler = _handler(instance)
+
+    # Create a temporary history file
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        history_data = {
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "hello"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "hi there"}]},
+            ]
+        }
+        json.dump(history_data, f)
+        temp_path = f.name
+
+    try:
+        response = await handler.execute_command("history", f"load {temp_path}")
+
+        assert "load conversation" in response.lower()
+        assert "loaded 2 messages" in response.lower()
+        assert escape_markdown_text(temp_path) in response
+        assert len(stub_agent.message_history) == 2
+        assert stub_agent.cleared is True  # History should be cleared before loading
+    finally:
+        Path(temp_path).unlink()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_slash_command_history_load_without_filename() -> None:
+    """Test /history load error handling when no filename is provided."""
+    stub_agent = StubAgent(message_history=[])
+    instance = StubAgentInstance(agents={"test-agent": stub_agent})
+
+    handler = _handler(instance)
+
+    response = await handler.execute_command("history", "load")
+
+    assert "load conversation" in response.lower()
+    assert "filename required" in response.lower()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_slash_command_history_load_file_not_found() -> None:
+    """Test /history load error handling when file does not exist."""
+    stub_agent = StubAgent(message_history=[])
+    instance = StubAgentInstance(agents={"test-agent": stub_agent})
+
+    handler = _handler(instance)
+
+    response = await handler.execute_command("history", "load nonexistent_file.json")
+
+    assert "load conversation" in response.lower()
+    assert "file not found" in response.lower()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_slash_command_history_load_without_agent() -> None:
+    """Test /history load error handling when the agent is missing."""
+    handler = _handler(StubAgentInstance(), agent_name="missing-agent")
+
+    response = await handler.execute_command("history", "load somefile.json")
+
+    assert "load conversation" in response.lower()
+    assert "Unable to locate agent" in response
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_slash_command_history_webclear() -> None:
+    """Test that /history webclear strips web metadata channels."""
+
+    class _LlmStub:
+        web_tools_enabled = (True, False)
+        web_search_enabled = True
+        web_fetch_enabled = False
+        web_search_supported = True
+        web_fetch_supported = False
+        service_tier_supported = False
+        available_service_tiers: tuple[str, ...] = ()
+        text_verbosity_spec = None
+
+    messages = [
+        PromptMessageExtended(
+            role="assistant",
+            content=[TextContent(type="text", text="done")],
+            channels={
+                ANTHROPIC_SERVER_TOOLS_CHANNEL: [
+                    TextContent(type="text", text='{"type":"server_tool_use"}')
+                ],
+                ANTHROPIC_ASSISTANT_RAW_CONTENT: [
+                    TextContent(
+                        type="text",
+                        text='{"type":"server_tool_use","name":"web_search","id":"srv_1"}',
+                    )
+                ],
+                ANTHROPIC_CITATIONS_CHANNEL: [
+                    TextContent(
+                        type="text",
+                        text='{"type":"web_search_result_location","url":"https://example.com"}',
+                    )
+                ],
+            },
+        )
+    ]
+    stub_agent = StubAgent(message_history=messages)
+    stub_agent.llm = _LlmStub()
+    instance = StubAgentInstance(agents={"test-agent": stub_agent})
+
+    handler = _handler(instance)
+    response = await handler.execute_command("history", "webclear")
+
+    assert "history webclear" in response.lower()
+    assert "removed 3 web metadata blocks" in response.lower()
+    assert stub_agent.message_history[0].channels is None
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_slash_command_history_webclear_targets_agent() -> None:
+    class _LlmStub:
+        web_tools_enabled = (True, False)
+        web_search_enabled = True
+        web_fetch_enabled = False
+        web_search_supported = True
+        web_fetch_supported = False
+        service_tier_supported = False
+        available_service_tiers: tuple[str, ...] = ()
+        text_verbosity_spec = None
+
+    messages = [
+        PromptMessageExtended(
+            role="assistant",
+            content=[TextContent(type="text", text="done")],
+            channels={
+                ANTHROPIC_SERVER_TOOLS_CHANNEL: [
+                    TextContent(type="text", text='{"type":"server_tool_use"}')
+                ],
+            },
+        )
+    ]
+    main_agent = StubAgent(message_history=[])
+    target_agent = StubAgent(name="analyst", message_history=messages)
+    target_agent.llm = _LlmStub()
+    instance = StubAgentInstance(agents={"test-agent": main_agent, "analyst": target_agent})
+    handler = _handler(instance)
+
+    response = await handler.execute_command("history", "webclear analyst")
+
+    assert "history webclear" in response.lower()
+    assert "removed 1 web metadata block" in response.lower()
+    assert target_agent.message_history[0].channels is None
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_slash_command_history_webclear_hidden_when_disabled() -> None:
+    """webclear should not be available when web tools are disabled."""
+    stub_agent = StubAgent(message_history=[])
+    instance = StubAgentInstance(agents={"test-agent": stub_agent})
+
+    handler = _handler(instance)
+    response = await handler.execute_command("history", "webclear")
+
+    assert "unknown /history action: webclear" in response.lower()
+    assert "clear [last]" in response
+    assert "rewind <turn>" in response
+    assert "fix" in response
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_slash_command_history_available_in_commands() -> None:
+    """Test that /history is in the available commands list."""
+    handler = _handler(StubAgentInstance())
+
+    commands = handler.get_available_commands()
+    command_names = {cmd.name for cmd in commands}
+
+    assert "history" in command_names
+
+    history_cmd = next(cmd for cmd in commands if cmd.name == "history")
+    assert history_cmd.description
+    assert history_cmd.input is not None  # Should have input hint
+    assert history_cmd.input.root.hint == ("[show|detail <turn>|review [turn]|save|load] [args]")
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_slash_command_history_show_turn_summary() -> None:
+    messages = [
+        PromptMessageExtended(
+            role="user",
+            content=[TextContent(type="text", text="first question")],
+        ),
+        PromptMessageExtended(
+            role="assistant",
+            content=[TextContent(type="text", text="looking that up")],
+            tool_calls={
+                "call_1": CallToolRequest(
+                    method="tools/call",
+                    params=CallToolRequestParams(name="lookup", arguments={}),
+                )
+            },
+            channels={
+                FAST_AGENT_TIMING: [
+                    TextContent(
+                        type="text",
+                        text='{"start_time": 10.0, "end_time": 10.4, "duration_ms": 400, "ttft_ms": 120, "time_to_response_ms": 260}',
+                    )
+                ],
+                FAST_AGENT_USAGE: [
+                    TextContent(
+                        type="text",
+                        text='{"schema":"fast-agent.usage/v2","provider_attempts":[{"provider":"openai","usage_schema":"openai-chat","model":"test","prompt":{"total":10},"completion":{"total":8},"raw_usage":{}}]}',
+                    )
+                ],
+            },
+        ),
+        PromptMessageExtended(
+            role="user",
+            tool_results={
+                "call_1": CallToolResult(
+                    content=[TextContent(type="text", text="result")],
+                    is_error=False,
+                )
+            },
+            channels={
+                FAST_AGENT_TOOL_TIMING: [
+                    TextContent(
+                        type="text",
+                        text='{"call_1": {"timing_ms": 250, "transport_channel": "post-sse"}}',
+                    )
+                ]
+            },
+        ),
+        PromptMessageExtended(
+            role="assistant",
+            content=[TextContent(type="text", text="final answer")],
+            channels={
+                FAST_AGENT_TIMING: [
+                    TextContent(
+                        type="text",
+                        text='{"start_time": 10.65, "end_time": 11.15, "duration_ms": 500}',
+                    )
+                ],
+                FAST_AGENT_USAGE: [
+                    TextContent(
+                        type="text",
+                        text='{"schema":"fast-agent.usage/v2","provider_attempts":[{"provider":"openai","usage_schema":"openai-chat","model":"test","prompt":{"total":20},"completion":{"total":12},"raw_usage":{}}]}',
+                    )
+                ],
+            },
+        ),
+    ]
+    stub_agent = StubAgent(message_history=messages.copy())
+    instance = StubAgentInstance(agents={"test-agent": stub_agent})
+
+    handler = _handler(instance)
+
+    response = await handler.execute_command("history", "show")
+
+    assert "history show" in response.lower()
+    assert "| # | turn | time | tool | ttft | resp | tps |" in response.lower()
+    assert "first question" in response
+    assert "final answer" in response
+    assert "1.1s" in response
+    assert "250ms" in response
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_slash_command_history_show_targets_named_agent() -> None:
+    current_agent = StubAgent(
+        message_history=[
+            PromptMessageExtended(
+                role="user",
+                content=[TextContent(type="text", text="current question")],
+            )
+        ],
+        name="current",
+    )
+    analyst_agent = StubAgent(
+        message_history=[
+            PromptMessageExtended(
+                role="user",
+                content=[TextContent(type="text", text="analyst question")],
+            )
+        ],
+        name="analyst",
+    )
+    instance = StubAgentInstance(agents={"current": current_agent, "analyst": analyst_agent})
+    handler = _handler(instance, agent_name="current")
+
+    response = await handler.execute_command("history", "show analyst")
+
+    assert "history show" in response.lower()
+    assert "analyst question" in response
+    assert "current question" not in response
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_slash_command_history_show_reports_missing_named_agent() -> None:
+    handler = _handler(StubAgentInstance(agents={"test-agent": StubAgent()}))
+
+    response = await handler.execute_command("history", "show missing")
+
+    assert "history show" in response.lower()
+    assert "Unable to locate agent 'missing'" in response
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_slash_command_history_detail_turn() -> None:
+    messages = [
+        PromptMessageExtended(
+            role="user", content=[TextContent(type="text", text="first question")]
+        ),
+        PromptMessageExtended(
+            role="assistant",
+            content=[TextContent(type="text", text="first answer")],
+        ),
+        PromptMessageExtended(
+            role="user", content=[TextContent(type="text", text="second question")]
+        ),
+        PromptMessageExtended(
+            role="assistant",
+            content=[TextContent(type="text", text="second answer")],
+        ),
+    ]
+    stub_agent = StubAgent(message_history=messages.copy())
+    instance = StubAgentInstance(agents={"test-agent": stub_agent})
+
+    handler = _handler(instance)
+
+    response = await handler.execute_command("history", "detail 2")
+
+    assert "history detail" in response.lower()
+    assert "turn 2" in response.lower()
+    assert "second question" in response
+    assert "second answer" in response
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_slash_command_session_list_no_sessions(tmp_path, monkeypatch) -> None:
+    """Test /session list output when no sessions exist."""
+    monkeypatch.chdir(tmp_path)
+    old_settings = get_settings()
+    home = tmp_path / "env"
+    monkeypatch.setenv("FAST_AGENT_HOME", str(home))
+    override = old_settings.model_copy(update={"home": str(home)})
+    update_global_settings(override)
+    reset_session_manager()
+
+    try:
+        manager = SessionManager(home_override=home)
+        set_session_manager(manager)
+        handler = _handler(StubAgentInstance())
+        response = await handler.execute_command("session", "list")
+
+        assert "no sessions" in response.lower()
+    finally:
+        update_global_settings(old_settings)
+        reset_session_manager()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_slash_command_session_disabled_in_no_home(tmp_path: Path) -> None:
+    """Test /session in no_home mode avoids session storage side effects."""
+    old_settings = get_settings()
+    home = tmp_path / "env"
+    override = old_settings.model_copy(update={"home": str(home)})
+    update_global_settings(override)
+    reset_session_manager()
+
+    try:
+        handler = _handler(StubAgentInstance(), no_home=True)
+        response = await handler.execute_command("session", "list")
+
+        assert "disabled in --no-home mode" in response.lower()
+        assert not (home / "sessions").exists()
+    finally:
+        update_global_settings(old_settings)
+        reset_session_manager()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_slash_command_session_pin_sets_metadata(tmp_path: Path) -> None:
+    """Test /session pin marks the session as pinned."""
+    old_settings = get_settings()
+    home = tmp_path / "env"
+    override = old_settings.model_copy(update={"home": str(home)})
+    update_global_settings(override)
+    reset_session_manager()
+
+    try:
+        manager = SessionManager(home_override=home)
+        set_session_manager(manager)
+        session = manager.create_session()
+        agent = StubAgent(message_history=[])
+        agent.context = SimpleNamespace(session_manager=manager)
+        handler = _handler(
+            StubAgentInstance(agents={"test-agent": agent}),
+        )
+        response = await handler.execute_command(
+            "session",
+            "pin Research notes",
+        )
+
+        assert "Pinned session" in response
+        assert "Research notes" in response
+
+        metadata = json.loads((manager.base_dir / session.info.name / "session.json").read_text())
+        assert metadata["metadata"].get("pinned") is True
+        assert metadata["metadata"].get("title") == "Research notes"
+
+        list_response = await handler.execute_command("session", "list")
+        assert "pin" in list_response.lower()
+        assert "Research notes" in list_response
+
+        response = await handler.execute_command("session", "unpin")
+        assert "Unpinned session" in response
+        metadata = json.loads((manager.base_dir / session.info.name / "session.json").read_text())
+        assert metadata["metadata"].get("pinned") is not True
+    finally:
+        update_global_settings(old_settings)
+        reset_session_manager()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_slash_command_session_export_writes_trace_for_current_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    old_settings = get_settings()
+    home = tmp_path / "env"
+    monkeypatch.setenv("FAST_AGENT_HOME", str(home))
+    override = old_settings.model_copy(update={"home": str(home)})
+    update_global_settings(override)
+    reset_session_manager()
+
+    try:
+        session_id = "2604201303-x5MNlH"
+        session_dir = home / "sessions" / session_id
+        session_dir.mkdir(parents=True)
+
+        save_json(
+            [
+                PromptMessageExtended(
+                    role="user",
+                    content=[TextContent(type="text", text="hello")],
+                ),
+                PromptMessageExtended(
+                    role="assistant",
+                    content=[TextContent(type="text", text="done")],
+                ),
+            ],
+            str(session_dir / "history_test-agent.json"),
+        )
+        snapshot = SessionSnapshot(
+            session_id=session_id,
+            created_at=datetime(2026, 4, 20, 13, 3, 0),
+            last_activity=datetime(2026, 4, 20, 13, 8, 0),
+            continuation=SessionContinuationSnapshot(
+                active_agent="test-agent",
+                agents={
+                    "test-agent": SessionAgentSnapshot(
+                        history_file="history_test-agent.json",
+                        resolved_prompt="You are test-agent.",
+                        model="gpt-5.4",
+                        provider="codexresponses",
+                        request_settings=SessionRequestSettingsSnapshot(use_history=True),
+                    )
+                },
+            ),
+        )
+        (session_dir / "session.json").write_text(
+            json.dumps(snapshot.model_dump(mode="json"), indent=2),
+            encoding="utf-8",
+        )
+
+        output_path = tmp_path / "slash-trace.jsonl"
+        manager = SessionManager(home_override=home)
+        set_session_manager(manager)
+        stub_agent = StubAgent(message_history=[])
+        stub_agent.context = SimpleNamespace(session_manager=manager)
+        instance = StubAgentInstance(agents={"test-agent": stub_agent})
+        handler = SlashCommandHandler(
+            session_id,
+            cast("AgentInstance", instance),
+            "test-agent",
+        )
+
+        response = await handler.execute_command(
+            "session",
+            f'export --output "{output_path}"',
+        )
+
+        assert "Exported codex trace" in response
+        assert output_path.is_file()
+        records = [
+            json.loads(line)
+            for line in output_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        assert records[0]["type"] == "session_meta"
+        assert records[0]["payload"]["id"] == session_id
+    finally:
+        update_global_settings(old_settings)
+        reset_session_manager()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_slash_command_card_loads_and_attaches() -> None:
+    """Test /card loads AgentCards and attaches tools when requested."""
+    stub_agent = StubAgent(message_history=[])
+    instance = StubAgentInstance(agents={"test-agent": stub_agent})
+
+    async def _card_loader(filename: str, parent_agent: str | None = None):
+        new_instance = StubAgentInstance(
+            agents={"test-agent": stub_agent, "alpha": StubAgent(name="alpha")}
+        )
+        return new_instance, AgentCardLoadResult(
+            loaded_names=["alpha"],
+            attached_names=["alpha"],
+        )
+
+    async def _attach_agent(parent_agent: str, child_agents: list[str]):
+        del parent_agent
+        return instance, child_agents
+
+    handler = _handler(
+        instance,
+        card_loader=_card_loader,
+        attach_agent_callback=_attach_agent,
+    )
+    response = await handler.execute_command("card", "load card.yml --as-tool")
+
+    assert "Loaded AgentCard: alpha" in response
+    assert "Attached agent tool: alpha" in response
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_slash_command_card_rejects_unexpected_arguments() -> None:
+    handler = _handler(StubAgentInstance(agents={"test-agent": StubAgent()}))
+
+    response = await handler.execute_command("card", "load card.yml extra")
+
+    assert response == "Usage: /card [show [agent]|load <path-or-url> [--as-tool]]"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_slash_command_card_show_named_agent() -> None:
+    stub_agent = StubAgent(message_history=[])
+    instance = StubAgentInstance(agents={"test-agent": stub_agent})
+
+    async def _dump_agent(agent_name: str) -> str:
+        assert agent_name == "alpha"
+        return "agent-card: alpha"
+
+    handler = _handler(
+        instance,
+        dump_agent_callback=_dump_agent,
+    )
+
+    response = await handler.execute_command("card", "show alpha")
+
+    assert "agent-card: alpha" in response
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_slash_command_agent_attach_and_detach() -> None:
+    """Test structured agent tool attach and remove flows."""
+    stub_agent = StubAgent(message_history=[])
+    alpha_agent = StubAgent(message_history=[], name="alpha")
+    instance = StubAgentInstance(agents={"test-agent": stub_agent, "alpha": alpha_agent})
+
+    async def _attach_agent(parent_agent: str, child_agents: list[str]):
+        return instance, child_agents
+
+    async def _detach_agent(parent_agent: str, child_agents: list[str]):
+        return instance, child_agents
+
+    handler = _handler(
+        instance,
+        attach_agent_callback=_attach_agent,
+        detach_agent_callback=_detach_agent,
+    )
+
+    response = await handler.execute_command("agent", "tool add alpha")
+    assert "Attached agent tool: alpha" in response
+
+    response = await handler.execute_command("agent", "tool remove alpha")
+    assert "Detached agent tool: alpha" in response
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_slash_command_agent_status_list_and_use() -> None:
+    switched: list[str] = []
+
+    async def _set_current_mode(agent_name: str) -> None:
+        switched.append(agent_name)
+
+    instance = StubAgentInstance(
+        agents={
+            "test-agent": StubAgent(name="test-agent"),
+            "alpha": StubAgent(name="alpha"),
+        }
+    )
+    handler = _handler(instance, set_current_mode_callback=_set_current_mode)
+
+    status = await handler.execute_command("agent", "")
+    listing = await handler.execute_command("agent", "list")
+    selected = await handler.execute_command("agent", "use alpha")
+
+    assert "Current agent: test-agent" in status
+    assert "test-agent (current)" in listing
+    assert "alpha" in listing
+    assert "Switched to agent: alpha" in selected
+    assert handler.current_agent_name == "alpha"
+    assert switched == ["alpha"]
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_slash_command_card_show_defaults_to_current_agent() -> None:
+    """Test /card show returns current agent card output."""
+    stub_agent = StubAgent(message_history=[])
+    instance = StubAgentInstance(agents={"test-agent": stub_agent})
+
+    async def _dump_agent(agent_name: str) -> str:
+        return "agent-card: test-agent"
+
+    handler = _handler(instance, dump_agent_callback=_dump_agent)
+    response = await handler.execute_command("card", "show")
+
+    assert "agent-card: test-agent" in response
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_slash_command_reload_agent_cards() -> None:
+    """Test /reload reports changes and no-changes states."""
+    stub_agent = StubAgent(message_history=[])
+    instance = StubAgentInstance(agents={"test-agent": stub_agent})
+
+    async def _reload_changed() -> bool:
+        return True
+
+    handler = _handler(instance, reload_callback=_reload_changed)
+    response = await handler.execute_command("reload", "")
+    assert "AgentCards reloaded" in response
+
+    async def _reload_no_change() -> bool:
+        return False
+
+    handler = _handler(instance, reload_callback=_reload_no_change)
+    response = await handler.execute_command("reload", "")
+    assert "No AgentCard changes detected" in response
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_plugin_command_applies_acp_switch_and_refresh_side_effects(tmp_path: Path) -> None:
+    command_file = tmp_path / "commands.py"
+    command_file.write_text(
+        "\n".join(
+            [
+                "from fast_agent.command_actions import PluginCommandActionResult",
+                "",
+                "async def run(ctx):",
+                "    return PluginCommandActionResult(",
+                "        message='switched',",
+                "        switch_agent='other-agent',",
+                "        refresh_agents=True,",
+                "    )",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    agent = StubAgent(name="test-agent")
+    agent.config.commands = {
+        "JumpNow": PluginCommandActionSpec(
+            name="JumpNow",
+            description="Jump to another agent",
+            handler=f"{command_file}:run",
+        )
+    }
+    other_agent = StubAgent(name="other-agent")
+    switched: list[str] = []
+
+    class _AcpContext:
+        def __init__(self) -> None:
+            self.refresh_count = 0
+            self.session_cwd = None
+            self.session_store_scope = "workspace"
+            self.session_store_cwd = None
+
+        async def send_available_commands_update(self) -> None:
+            self.refresh_count += 1
+
+    acp_context = _AcpContext()
+    handler = _handler(
+        StubAgentInstance(agents={"test-agent": agent, "other-agent": other_agent}),
+        set_current_mode_callback=switched.append,
+    )
+    handler.set_acp_context(cast("Any", acp_context))
+
+    commands_response = await handler.execute_command("commands", "JumpNow")
+    assert "No discovery metadata for `JumpNow` yet." in commands_response
+    assert "Unknown command family" not in commands_response
+
+    response = await handler.execute_command("JumpNow", "")
+
+    assert "switched" in response
+    assert handler.current_agent_name == "other-agent"
+    assert switched == ["other-agent"]
+    assert acp_context.refresh_count == 1

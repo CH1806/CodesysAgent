@@ -1,0 +1,387 @@
+from __future__ import annotations
+
+import asyncio
+import sys
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import TYPE_CHECKING, AsyncIterator
+
+import pytest_asyncio
+from acp.schema import (
+    ClientCapabilities,
+    FileSystemCapabilities,
+    Implementation,
+    InitializeResponse,
+)
+from acp.stdio import spawn_agent_process
+
+TEST_DIR = Path(__file__).parent
+if str(TEST_DIR) not in sys.path:
+    sys.path.append(str(TEST_DIR))
+
+from test_client import TestClient  # noqa: E402
+
+if TYPE_CHECKING:
+    from acp.client.connection import ClientSideConnection
+
+CONFIG_PATH = TEST_DIR / "fastagent.config.yaml"
+
+
+def _fast_agent_cmd(
+    name: str,
+    *,
+    servers: tuple[str, ...] = (),
+    no_permissions: bool = False,
+    shell: bool = False,
+) -> tuple[str, ...]:
+    cmd = [
+        sys.executable,
+        "-m",
+        "fast_agent.cli",
+        "serve",
+        "--config-path",
+        str(CONFIG_PATH),
+        "--transport",
+        "acp",
+        "--model",
+        "passthrough",
+        "--name",
+        name,
+        "--home",
+        str(TEST_DIR / ".fast-agent"),
+    ]
+    if servers:
+        cmd.extend(["--servers", *servers])
+    if no_permissions:
+        cmd.append("--no-permissions")
+    if shell:
+        cmd.append("--shell")
+    return tuple(cmd)
+
+
+@asynccontextmanager
+async def _spawn_initialized_agent(
+    cmd: tuple[str, ...],
+    *,
+    terminal: bool,
+    fs_read: bool = True,
+    fs_write: bool = True,
+    client_name: str = "pytest-client",
+    client_version: str = "0.0.1",
+) -> AsyncIterator[tuple[ClientSideConnection, TestClient, InitializeResponse]]:
+    client = TestClient()
+    async with spawn_agent_process(lambda _: client, *cmd) as (connection, _process):
+        init_response = await _initialize_agent(
+            connection,
+            _process,
+            protocol_version=1,
+            client_capabilities=ClientCapabilities(
+                fs=FileSystemCapabilities(read_text_file=fs_read, write_text_file=fs_write),
+                terminal=terminal,
+            ),
+            client_info=Implementation(name=client_name, version=client_version),
+        )
+        yield connection, client, init_response
+
+
+async def _read_stream(stream: asyncio.StreamReader | None, *, limit: int = 2000) -> str:
+    if stream is None:
+        return ""
+    try:
+        data = await asyncio.wait_for(stream.read(), timeout=0.2)
+    except Exception:
+        return ""
+    return data.decode("utf-8", errors="replace")[:limit]
+
+
+async def _initialize_agent(
+    connection: ClientSideConnection,
+    process: asyncio.subprocess.Process,
+    *,
+    protocol_version: int,
+    client_capabilities: ClientCapabilities,
+    client_info: Implementation,
+    timeout: float = 10.0,
+) -> InitializeResponse:
+    try:
+        return await asyncio.wait_for(
+            connection.initialize(
+                protocol_version=protocol_version,
+                client_capabilities=client_capabilities,
+                client_info=client_info,
+            ),
+            timeout=timeout,
+        )
+    except Exception as exc:
+        process_exited = process.returncode is not None
+        if not process_exited:
+            try:
+                await asyncio.wait_for(process.wait(), timeout=0.1)
+            except asyncio.TimeoutError:
+                process_exited = False
+            else:
+                process_exited = True
+
+        stdout = await _read_stream(process.stdout)
+        stderr = await _read_stream(process.stderr)
+        if process_exited:
+            raise AssertionError(
+                "ACP agent process exited before initialization completed. "
+                f"returncode={process.returncode} stdout={stdout!r} stderr={stderr!r}"
+            ) from exc
+        raise AssertionError(
+            f"Timed out waiting for ACP agent initialization. stdout={stdout!r} stderr={stderr!r}"
+        ) from exc
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def acp_basic_process() -> AsyncIterator[
+    tuple[ClientSideConnection, TestClient, InitializeResponse]
+]:
+    cmd = _fast_agent_cmd("fast-agent-acp-test")
+    async with _spawn_initialized_agent(cmd, terminal=False) as harness:
+        yield harness
+
+
+@pytest_asyncio.fixture
+async def acp_basic(
+    acp_basic_process: tuple[ClientSideConnection, TestClient, InitializeResponse],
+) -> AsyncIterator[tuple[ClientSideConnection, TestClient, InitializeResponse]]:
+    connection, client, init_response = acp_basic_process
+    client.reset()
+    yield connection, client, init_response
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def acp_content_process() -> AsyncIterator[
+    tuple[ClientSideConnection, TestClient, InitializeResponse]
+]:
+    cmd = _fast_agent_cmd("fast-agent-acp-content-test")
+    async with _spawn_initialized_agent(cmd, terminal=False) as harness:
+        yield harness
+
+
+@pytest_asyncio.fixture
+async def acp_content(
+    acp_content_process: tuple[ClientSideConnection, TestClient, InitializeResponse],
+) -> AsyncIterator[tuple[ClientSideConnection, TestClient, InitializeResponse]]:
+    connection, client, init_response = acp_content_process
+    client.reset()
+    yield connection, client, init_response
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def acp_filesystem_toolcall_process() -> AsyncIterator[
+    tuple[ClientSideConnection, TestClient, InitializeResponse]
+]:
+    cmd = _fast_agent_cmd(
+        "fast-agent-acp-filesystem-toolcall-test",
+        no_permissions=True,
+    )
+    async with _spawn_initialized_agent(
+        cmd,
+        terminal=False,
+        client_name="pytest-filesystem-client",
+    ) as harness:
+        yield harness
+
+
+@pytest_asyncio.fixture
+async def acp_filesystem_toolcall(
+    acp_filesystem_toolcall_process: tuple[ClientSideConnection, TestClient, InitializeResponse],
+) -> AsyncIterator[tuple[ClientSideConnection, TestClient, InitializeResponse]]:
+    connection, client, init_response = acp_filesystem_toolcall_process
+    client.reset()
+    yield connection, client, init_response
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def acp_permissions_process() -> AsyncIterator[
+    tuple[ClientSideConnection, TestClient, InitializeResponse]
+]:
+    cmd = _fast_agent_cmd(
+        "fast-agent-acp-test",
+        servers=("progress_test",),
+    )
+    async with _spawn_initialized_agent(cmd, terminal=False) as harness:
+        yield harness
+
+
+@pytest_asyncio.fixture
+async def acp_permissions(
+    acp_permissions_process: tuple[ClientSideConnection, TestClient, InitializeResponse],
+) -> AsyncIterator[tuple[ClientSideConnection, TestClient, InitializeResponse]]:
+    connection, client, init_response = acp_permissions_process
+    client.reset()
+    yield connection, client, init_response
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def acp_permissions_no_perms_process() -> AsyncIterator[
+    tuple[ClientSideConnection, TestClient, InitializeResponse]
+]:
+    cmd = _fast_agent_cmd(
+        "fast-agent-acp-test",
+        servers=("progress_test",),
+        no_permissions=True,
+    )
+    async with _spawn_initialized_agent(cmd, terminal=False) as harness:
+        yield harness
+
+
+@pytest_asyncio.fixture
+async def acp_permissions_no_perms(
+    acp_permissions_no_perms_process: tuple[ClientSideConnection, TestClient, InitializeResponse],
+) -> AsyncIterator[tuple[ClientSideConnection, TestClient, InitializeResponse]]:
+    connection, client, init_response = acp_permissions_no_perms_process
+    client.reset()
+    yield connection, client, init_response
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def acp_runtime_telemetry_shell_process() -> AsyncIterator[
+    tuple[ClientSideConnection, TestClient, InitializeResponse]
+]:
+    cmd = _fast_agent_cmd(
+        "fast-agent-acp-runtime-telemetry-test",
+        no_permissions=True,
+        shell=True,
+    )
+    async with _spawn_initialized_agent(
+        cmd,
+        terminal=True,
+        client_name="pytest-telemetry-client",
+    ) as harness:
+        yield harness
+
+
+@pytest_asyncio.fixture
+async def acp_runtime_telemetry_shell(
+    acp_runtime_telemetry_shell_process: tuple[
+        ClientSideConnection, TestClient, InitializeResponse
+    ],
+) -> AsyncIterator[tuple[ClientSideConnection, TestClient, InitializeResponse]]:
+    connection, client, init_response = acp_runtime_telemetry_shell_process
+    client.reset()
+    yield connection, client, init_response
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def acp_runtime_telemetry_process() -> AsyncIterator[
+    tuple[ClientSideConnection, TestClient, InitializeResponse]
+]:
+    cmd = _fast_agent_cmd(
+        "fast-agent-acp-runtime-telemetry-test",
+        no_permissions=True,
+    )
+    async with _spawn_initialized_agent(
+        cmd,
+        terminal=False,
+        client_name="pytest-telemetry-client",
+    ) as harness:
+        yield harness
+
+
+@pytest_asyncio.fixture
+async def acp_runtime_telemetry(
+    acp_runtime_telemetry_process: tuple[ClientSideConnection, TestClient, InitializeResponse],
+) -> AsyncIterator[tuple[ClientSideConnection, TestClient, InitializeResponse]]:
+    connection, client, init_response = acp_runtime_telemetry_process
+    client.reset()
+    yield connection, client, init_response
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def acp_tool_notifications_process() -> AsyncIterator[
+    tuple[ClientSideConnection, TestClient, InitializeResponse]
+]:
+    cmd = _fast_agent_cmd(
+        "fast-agent-acp-test",
+        servers=("progress_test",),
+        no_permissions=True,
+    )
+    async with _spawn_initialized_agent(cmd, terminal=False) as harness:
+        yield harness
+
+
+@pytest_asyncio.fixture
+async def acp_tool_notifications(
+    acp_tool_notifications_process: tuple[ClientSideConnection, TestClient, InitializeResponse],
+) -> AsyncIterator[tuple[ClientSideConnection, TestClient, InitializeResponse]]:
+    connection, client, init_response = acp_tool_notifications_process
+    client.reset()
+    yield connection, client, init_response
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def acp_terminal_shell_process() -> AsyncIterator[
+    tuple[ClientSideConnection, TestClient, InitializeResponse]
+]:
+    cmd = _fast_agent_cmd(
+        "fast-agent-acp-terminal-test",
+        shell=True,
+    )
+    async with _spawn_initialized_agent(
+        cmd,
+        terminal=True,
+        client_name="pytest-terminal-client",
+    ) as harness:
+        yield harness
+
+
+@pytest_asyncio.fixture
+async def acp_terminal_shell(
+    acp_terminal_shell_process: tuple[ClientSideConnection, TestClient, InitializeResponse],
+) -> AsyncIterator[tuple[ClientSideConnection, TestClient, InitializeResponse]]:
+    connection, client, init_response = acp_terminal_shell_process
+    client.reset()
+    yield connection, client, init_response
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def acp_terminal_no_shell_process() -> AsyncIterator[
+    tuple[ClientSideConnection, TestClient, InitializeResponse]
+]:
+    cmd = _fast_agent_cmd("fast-agent-acp-terminal-test")
+    async with _spawn_initialized_agent(
+        cmd,
+        terminal=True,
+        client_name="pytest-terminal-client",
+    ) as harness:
+        yield harness
+
+
+@pytest_asyncio.fixture
+async def acp_terminal_no_shell(
+    acp_terminal_no_shell_process: tuple[ClientSideConnection, TestClient, InitializeResponse],
+) -> AsyncIterator[tuple[ClientSideConnection, TestClient, InitializeResponse]]:
+    connection, client, init_response = acp_terminal_no_shell_process
+    client.reset()
+    yield connection, client, init_response
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def acp_terminal_client_unsupported_process() -> AsyncIterator[
+    tuple[ClientSideConnection, TestClient, InitializeResponse]
+]:
+    cmd = _fast_agent_cmd(
+        "fast-agent-acp-terminal-test",
+        shell=True,
+    )
+    async with _spawn_initialized_agent(
+        cmd,
+        terminal=False,
+        client_name="pytest-terminal-client",
+    ) as harness:
+        yield harness
+
+
+@pytest_asyncio.fixture
+async def acp_terminal_client_unsupported(
+    acp_terminal_client_unsupported_process: tuple[
+        ClientSideConnection, TestClient, InitializeResponse
+    ],
+) -> AsyncIterator[tuple[ClientSideConnection, TestClient, InitializeResponse]]:
+    connection, client, init_response = acp_terminal_client_unsupported_process
+    client.reset()
+    yield connection, client, init_response

@@ -1,0 +1,274 @@
+## <ModelOverlays>
+
+# Model Overlays
+
+## Purpose
+
+Model overlays are environment-local named model entries. They let you bind a short token such as
+`qwen-local` to:
+
+- a provider
+- a wire model name
+- a custom `base_url`
+- auth settings
+- request defaults
+- local model metadata
+
+Use overlays when you need stable local model names for self-hosted endpoints, alternate gateways,
+or llama.cpp imports.
+
+---
+
+## Location
+
+Overlays are loaded from the active environment directory:
+
+- `model-overlays/*.yaml`
+- `model-overlays.secrets.yaml`
+
+With the default environment directory, that is usually:
+
+- `.fast-agent/model-overlays/`
+- `.fast-agent/model-overlays.secrets.yaml`
+
+---
+
+## Minimal manifest
+
+```yaml
+name: qwen-local
+provider: openresponses
+model: unsloth/Qwen3.5-9B-GGUF
+connection:
+  base_url: http://localhost:8080/v1
+  auth: none
+defaults:
+  temperature: 0.8
+  top_p: 0.95
+  max_tokens: 2048
+  streaming_timeout: 300
+metadata:
+  context_window: 75264
+  max_output_tokens: 2048
+  model_specific: |
+    Use terse responses for this local model.
+  json_mode: object
+  structured_tool_policy: defer
+  managed_process_poll_folding: true
+  process_poll_default_wait_seconds: 30
+picker:
+  label: Qwen local
+  description: Imported from llama.cpp
+  current: true
+```
+
+---
+
+## Top-level fields
+
+- `name` — overlay token used in `--model`, `default_model`, agent cards, or model references.
+- `provider` — fast-agent provider used to dispatch requests.
+- `model` — wire model name sent to the backend.
+- `connection` — endpoint and auth settings.
+- `defaults` — request defaults applied unless explicitly overridden.
+- `metadata` — local model metadata for picker/runtime display.
+- `picker` — label/description/current/featured flags for selection UIs.
+
+---
+
+## Connection
+
+`connection` supports:
+
+- `base_url`
+- `auth`: `none` | `env` | `secret_ref`
+- `api_key_env`
+- `secret_ref`
+- `default_headers`
+- `reasoning_field`: for `provider: generic` overlays, the top-level OpenAI
+  Chat Completions request field that receives the final `reasoning` value.
+  The OpenAI SDK carries the field through `extra_body`, so it is serialized at
+  the request-body top level. It must be an identifier and cannot be supplied
+  as a model-string query parameter.
+
+### Auth modes
+
+No auth:
+
+```yaml
+connection:
+  base_url: http://localhost:8080/v1
+  auth: none
+```
+
+Environment variable auth:
+
+```yaml
+connection:
+  base_url: https://gateway.example/v1
+  auth: env
+  api_key_env: LAB_MODEL_TOKEN
+```
+
+Secret reference auth:
+
+```yaml
+connection:
+  base_url: https://gateway.example/v1
+  auth: secret_ref
+  secret_ref: lab-qwen
+```
+
+Companion secrets file entry:
+
+```yaml
+lab-qwen:
+  api_key: your-secret-token
+```
+
+---
+
+## Defaults
+
+`defaults` maps to model-string-style runtime settings.
+
+Common fields:
+
+- `reasoning`
+- `temperature`
+- `top_p`
+- `top_k`
+- `min_p`
+- `max_tokens`
+- `streaming_timeout`: positive seconds between provider stream events, or `none` to disable
+- `transport`
+- `service_tier`
+- `web_search`
+- `web_fetch`
+
+These are compiled into the resolved model selection and applied unless a run supplies an explicit override.
+
+---
+
+## Metadata
+
+`metadata` is used for local model understanding and display.
+
+Common fields:
+
+- `context_window`
+- `max_output_tokens`
+- `tokenizes`
+- `json_mode`: `schema`, `object`, `none`, or `null`
+- `structured_tool_policy`: `auto`, `always`, `defer`, or `no_tools`
+- `managed_process_poll_folding`: whether automatic managed-process poll folding
+  has been validated for this model
+- `process_poll_default_wait_seconds`: default `poll_process` wait when omitted;
+  `0` keeps polls non-blocking, and `shell_execution.process_poll_max_wait_seconds`
+  caps the effective value. An explicit model-string `poll_period` takes
+  precedence and is rejected if it exceeds the configured maximum
+- `shell_tool_name`: optional model-facing name for the minimal-process shell tool
+- `shell_tool_requires_description`: require a short operator-facing `description`
+  argument on the minimal-process shell tool
+- `shell_edit_tool`: model default for local file editing: `write_text_file`,
+  `edit_file`, `apply_patch`, or `off`
+- `model_specific`: text made available to system prompts as `{{model_specific}}`
+- `fast`
+
+Use this for models that are not part of the built-in catalog or when local runtime limits differ from known defaults.
+
+`json_mode` describes how fast-agent should request structured output:
+
+- `schema` — provider-native JSON Schema constraints
+- `object` — provider JSON-object mode plus prompt instructions/local validation
+- `none`/`null` — prompt-only structured guidance plus local validation
+
+`structured_tool_policy: no_tools` suppresses regular tools and produces one structured response. `defer` uses tools first, then produces the final schema-constrained answer without tools. Use `defer` when a model should use tools to gather data before returning structured JSON.
+
+---
+
+## Picker
+
+`picker` controls model-picker presentation.
+
+Common fields:
+
+- `label`
+- `description`
+- `current`
+- `featured`
+
+---
+
+## Usage
+
+Once present, an overlay name can be used anywhere a model string is accepted:
+
+- `fast-agent go --model qwen-local`
+- `default_model: "qwen-local"`
+- agent card `model: qwen-local`
+- model reference target such as `$system.fast`
+
+Example:
+
+```yaml
+model_references:
+  system:
+    fast: "qwen-local"
+```
+
+---
+
+## llama.cpp import
+
+`fast-agent model llamacpp` provides an interactive import flow, plus `list`, `preview`,
+and `import` subcommands for llama.cpp-compatible servers.
+
+Default runtime base URL:
+
+- `http://localhost:8080/v1`
+
+Shared options:
+
+- `--home` to target a specific fast-agent home
+- `--url` or `--base-url` to point at the llama.cpp server
+- `--auth`, `--api-key-env`, and `--secret-ref` to control persisted overlay auth and discovery auth
+- `--name` to choose the overlay token explicitly
+
+These shared options can be used on the interactive command or placed before a subcommand.
+
+Endpoint behavior:
+
+- root URLs are normalized to `/v1`
+- model discovery uses `/v1/models`
+- runtime metadata is read from `/props`
+
+Subcommands:
+
+- `fast-agent model llamacpp` opens the interactive picker and writes the selected overlay
+- `fast-agent model llamacpp list` prints discovered models; add `--json` for machine-readable output
+- `fast-agent model llamacpp preview <model-id>` prints the generated overlay YAML without writing files
+- `fast-agent model llamacpp import <model-id>` writes the overlay; add `--json` for machine-readable output
+- `--include-sampling-defaults` persists the server's current sampling defaults into the overlay or preview output
+- `fast-agent model llamacpp import <model-id> --start-now` writes the overlay and immediately launches `fast-agent go --model <overlay>`
+- `fast-agent model llamacpp import <model-id> --start-now --with-shell` launches `fast-agent go -x --model <overlay>`
+
+The generated overlay:
+
+- uses `openresponses` as the provider
+- stores the normalized `/v1` `base_url`
+- records the selected auth mode
+- records discovered runtime limits such as `max_tokens`
+- records discovered metadata such as `context_window`, `max_output_tokens`, and `tokenizes`
+
+By default, the import flow does not persist the server's current sampling defaults. Use
+`--include-sampling-defaults` if you want to freeze the current llama.cpp sampling policy into the
+generated `defaults` block.
+
+Repeated unnamed imports of the same llama.cpp model on the same normalized base URL reuse the
+existing generated `llamacpp-*` overlay instead of creating another suffixed file. Explicitly named
+overlays are left alone.
+
+---
+
+</ModelOverlays>

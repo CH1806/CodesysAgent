@@ -1,0 +1,232 @@
+"""Shared CLI option definitions for fast-agent commands to reduce duplication."""
+
+from enum import StrEnum
+
+import typer
+
+
+class McpProtocolOption(StrEnum):
+    AUTO = "auto"
+    MODERN = "modern"
+    LEGACY = "legacy"
+
+
+class CommonAgentOptions:
+    """Shared options for agent commands to reduce duplication."""
+
+    @staticmethod
+    def config_path():
+        return typer.Option(
+            None,
+            "--config-path",
+            "-c",
+            metavar="<path-or-uri>",
+            help="Path, HTTP(S) URL, file:// URI, or hf:// URI to config file",
+        )
+
+    @staticmethod
+    def instruction():
+        return typer.Option(
+            None,
+            "--instruction",
+            "-i",
+            metavar="<path-or-uri>",
+            help="Path, HTTP(S) URL, file:// URI, or hf:// URI containing instruction for the agent",
+        )
+
+    @staticmethod
+    def servers():
+        return typer.Option(
+            None, "--servers", help="Comma-separated list of server names to enable from config"
+        )
+
+    @staticmethod
+    def agent_cards():
+        return typer.Option(
+            None,
+            "--agent-cards",
+            "--card",
+            metavar="<path-or-uri>",
+            help="Path, HTTP(S) URL, file:// URI, or hf:// URI to an AgentCard file or directory (repeatable)",
+        )
+
+    @staticmethod
+    def card_tools():
+        return typer.Option(
+            None,
+            "--card-tool",
+            metavar="<path-or-uri>",
+            help="Path, HTTP(S) URL, file:// URI, or hf:// URI to an AgentCard file or directory to load as tools (repeatable)",
+        )
+
+    @staticmethod
+    def urls():
+        return typer.Option(
+            None,
+            "--url",
+            metavar="<url>",
+            help=(
+                "HTTP/SSE MCP URL to connect to (repeatable; comma-separated values "
+                "remain supported temporarily)"
+            ),
+        )
+
+    @staticmethod
+    def auth():
+        return typer.Option(
+            None,
+            "--auth",
+            help=(
+                "Authorization token value for remote MCP URL servers and A2A endpoints "
+                "(applies to every startup --url; pass token only; optional 'Bearer ' "
+                "prefix is accepted)"
+            ),
+        )
+
+    @staticmethod
+    def mcp_protocol():
+        return typer.Option(
+            None,
+            "--mcp-protocol",
+            help="MCP protocol mode for every startup --url/--npx/--uvx/--stdio target",
+        )
+
+    @staticmethod
+    def client_metadata_url():
+        return typer.Option(
+            None,
+            "--client-metadata-url",
+            help=(
+                "OAuth Client ID Metadata Document URL for URL-based servers "
+                "(used when server does not support dynamic client registration)"
+            ),
+        )
+
+    @staticmethod
+    def model():
+        return typer.Option(
+            None,
+            "--model",
+            "--models",
+            help="Select a model for this run (e.g., haiku, sonnet, gpt-4)",
+        )
+
+    @staticmethod
+    def agent():
+        return typer.Option(
+            None,
+            "--agent",
+            help="Target a specific agent by name for --message, --prompt-file, and initial interactive mode",
+        )
+
+    @staticmethod
+    def json_schema():
+        return typer.Option(
+            None,
+            "--json-schema",
+            metavar="<path-or-uri>",
+            help="Path, HTTP(S) URL, file:// URI, or hf:// URI to a JSON Schema file used for one-shot structured output",
+        )
+
+    @staticmethod
+    def schema_model():
+        return typer.Option(
+            None,
+            "--schema-model",
+            help="Pydantic BaseModel import path used for one-shot structured output (module.path:ClassName)",
+        )
+
+    @staticmethod
+    def structured_tool_policy():
+        return typer.Option(
+            None,
+            "--structured-tool-policy",
+            help="Structured schema tool policy: auto, always, defer, or no_tools",
+        )
+
+    @staticmethod
+    def home():
+        return typer.Option(
+            None,
+            "--home",
+            help="Use PATH as the fast-agent home itself (contains agent-cards/, sessions/, etc.)",
+        )
+
+    @staticmethod
+    def workspace():
+        return typer.Option(
+            None,
+            "--workspace",
+            help="Override the workspace root; default home resolves under this directory",
+        )
+
+    @staticmethod
+    def no_home():
+        return typer.Option(
+            False,
+            "--no-home",
+            help="Run without implicit fast-agent home side effects",
+        )
+
+    @staticmethod
+    def skills_dir():
+        return typer.Option(
+            None, "--skills-dir", "--skills", help="Override the default skills directory"
+        )
+
+    @staticmethod
+    def npx():
+        return typer.Option(
+            None, "--npx", help="NPX package and args to run as MCP server (quoted)"
+        )
+
+    @staticmethod
+    def uvx():
+        return typer.Option(
+            None, "--uvx", help="UVX package and args to run as MCP server (quoted)"
+        )
+
+    @staticmethod
+    def stdio():
+        return typer.Option(None, "--stdio", help="Command to run as STDIO MCP server (quoted)")
+
+    @staticmethod
+    def shell():
+        return typer.Option(
+            False,
+            "--shell",
+            "-x",
+            help="Enable a local shell runtime and expose the execute tool (bash or pwsh).",
+        )
+
+    @staticmethod
+    def no_shell():
+        return typer.Option(
+            False,
+            "--no-shell",
+            help="Disable local shell/filesystem tools, even when skills or agent config request them.",
+        )
+
+    @staticmethod
+    def subagents():
+        return typer.Option(
+            None,
+            "--subagents/--no-subagents",
+            help="Enable or disable the built-in one-shot subagent tool.",
+        )
+
+    @staticmethod
+    def subagent_model():
+        return typer.Option(
+            None,
+            "--subagent-model",
+            help="Use a fixed model for built-in subagent runs (also enables subagents).",
+        )
+
+    @staticmethod
+    def reload():
+        return typer.Option(False, "--reload", help="Enable manual AgentCard reloads")
+
+    @staticmethod
+    def watch():
+        return typer.Option(False, "--watch", help="Watch AgentCard paths and reload automatically")

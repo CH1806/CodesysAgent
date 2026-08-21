@@ -1,0 +1,79 @@
+default_model: passthrough
+
+# Logging and Console Configuration:
+logger:
+  level: "error"
+  type: "file"
+  # path: "/path/to/logfile.jsonl"
+
+  # Switch the progress display on or off
+  progress_display: true
+
+  # Show chat User/Assistant messages on the console
+  show_chat: true
+  # Show tool calls on the console
+  show_tools: true
+  # Truncate long tool responses on the console
+  truncate_tools: true
+
+mcp:
+  servers:
+    # Elicitation test servers for different modes
+    elicitation_forms_mode:
+      command: "uv"
+      args: ["run", "elicitation_test_server_advanced.py"]
+      transport: "stdio"
+      protocol_mode: modern
+      cwd: "."
+      elicitation:
+        mode: "forms"
+
+    elicitation_auto_cancel_mode:
+      command: "uv"
+      args: ["run", "elicitation_test_server_advanced.py"]
+      transport: "stdio"
+      protocol_mode: modern
+      cwd: "."
+      elicitation:
+        mode: "auto-cancel"
+
+    elicitation_none_mode:
+      command: "uv"
+      args: ["run", "elicitation_test_server_advanced.py"]
+      transport: "stdio"
+      protocol_mode: modern
+      cwd: "."
+      elicitation:
+        mode: "none"
+
+    elicitation_custom_handler:
+      command: "uv"
+      args: ["run", "elicitation_test_server_advanced.py"]
+      transport: "stdio"
+      protocol_mode: modern
+      cwd: "."
+      elicitation:
+        mode: "forms" # Will be overridden by custom handler
+
+    # Legacy servers for backward compatibility
+    elicitation_test:
+      command: "uv"
+      args: ["run", "elicitation_test_server.py"]
+      protocol_mode: legacy
+      elicitation:
+        mode: "auto-cancel"
+
+    resource_forms:
+      command: "uv"
+      args: ["run", "elicitation_test_server_advanced.py"]
+      protocol_mode: modern
+      elicitation:
+        mode: "auto-cancel"
+
+    url_elicitation_required:
+      command: "uv"
+      args: ["run", "url_elicitation_required_server.py"]
+      transport: "stdio"
+      cwd: "."
+      elicitation:
+        mode: "forms"

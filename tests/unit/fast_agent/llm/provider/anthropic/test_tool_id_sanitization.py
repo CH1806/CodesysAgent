@@ -1,0 +1,41 @@
+from typing import cast
+
+from mcp_types import CallToolRequest, CallToolRequestParams, CallToolResult, TextContent
+
+from fast_agent.llm.provider.anthropic.multipart_converter_anthropic import AnthropicConverter
+from fast_agent.types import PromptMessageExtended
+
+
+def test_sanitizes_tool_use_ids_for_assistant_calls():
+    dirty_id = "functions.fetch_magic_string:0"
+    expected = "functions_fetch_magic_string_0"
+    params = CallToolRequestParams(name="fetch_magic_string", arguments={})
+    req = CallToolRequest(params=params)
+
+    msg = PromptMessageExtended(role="assistant", content=[], tool_calls={dirty_id: req})
+
+    converted = AnthropicConverter.convert_to_anthropic(msg)
+
+    assert isinstance(converted, dict)
+    assert converted["role"] == "assistant"
+    content_blocks = list(converted["content"])
+    assert isinstance(content_blocks[0], dict)
+    tool_use_block = cast("dict[str, object]", content_blocks[0])
+    assert tool_use_block["id"] == expected
+
+
+def test_sanitizes_tool_use_ids_for_tool_results():
+    dirty_id = "functions.fetch_magic_string:0"
+    expected = "functions_fetch_magic_string_0"
+    result = CallToolResult(content=[TextContent(type="text", text="done")], is_error=False)
+
+    msg = PromptMessageExtended(role="user", content=[], tool_results={dirty_id: result})
+
+    converted = AnthropicConverter.convert_to_anthropic(msg)
+
+    assert isinstance(converted, dict)
+    assert converted["role"] == "user"
+    content_blocks = list(converted["content"])
+    assert isinstance(content_blocks[0], dict)
+    tool_result_block = cast("dict[str, object]", content_blocks[0])
+    assert tool_result_block["tool_use_id"] == expected

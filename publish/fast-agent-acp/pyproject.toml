@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fast-agent-acp"
+version = "0.6.10"
+description = "Convenience launcher that pulls in fast-agent-mcp and exposes the ACP CLI entrypoint."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "Fast Agent Maintainers", email = "fastagent@llmindset.co.uk" },
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+]
+requires-python = ">=3.12,<3.15"
+dependencies = [
+    "fast-agent-mcp==0.6.10",
+]
+
+[project.urls]
+Homepage = "https://github.com/evalstate/fast-agent"
+Repository = "https://github.com/evalstate/fast-agent"
+Issues = "https://github.com/evalstate/fast-agent/issues"
+
+[project.scripts]
+fast-agent-acp = "fast_agent_acp.cli:main"
+
+[tool.hatch.build]
+packages = ["src/fast_agent_acp"]

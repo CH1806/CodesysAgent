@@ -1,0 +1,377 @@
+from typing import Any, cast
+
+import pytest
+from mcp_types import GetPromptResult, PromptMessage, TextContent
+from pydantic import BaseModel
+
+from fast_agent.llm.fastagent_llm import FastAgentLLM, _mcp_metadata_var
+from fast_agent.llm.provider.anthropic.llm_anthropic import AnthropicLLM
+from fast_agent.llm.provider.openai.llm_openai import OpenAILLM
+from fast_agent.llm.provider.openai.responses import ResponsesLLM
+from fast_agent.llm.provider_types import Provider
+from fast_agent.llm.request_params import BatchRequestContext, RequestParams
+from fast_agent.mcp.prompt import Prompt
+from fast_agent.mcp.prompt_message_extended import PromptMessageExtended
+from fast_agent.mcp.prompt_metadata import with_prompt_metadata
+
+
+class StubLLM(FastAgentLLM):
+    """Minimal implementation of FastAgentLLM for testing purposes"""
+
+    def __init__(self, **kwargs: Any) -> None:
+        kwargs.pop("provider", None)
+        super().__init__(provider=Provider.FAST_AGENT, **kwargs)
+
+    async def _apply_prompt_provider_specific(
+        self,
+        multipart_messages: list["PromptMessageExtended"],
+        request_params: RequestParams | None = None,
+        tools=None,
+        is_template: bool = False,
+    ) -> PromptMessageExtended:
+        """Implement the abstract method with minimal functionality"""
+        return multipart_messages[-1]
+
+    def _convert_extended_messages_to_provider(
+        self, messages: list[PromptMessageExtended]
+    ) -> list[Any]:
+        """Convert messages to provider format - stub returns empty list"""
+        return []
+
+
+class MetadataRecordingLLM(StubLLM):
+    def __init__(self) -> None:
+        super().__init__()
+        self.seen_metadata: list[dict[str, Any] | None] = []
+
+    async def _apply_prompt_provider_specific(
+        self,
+        multipart_messages: list["PromptMessageExtended"],
+        request_params: RequestParams | None = None,
+        tools=None,
+        is_template: bool = False,
+    ) -> PromptMessageExtended:
+        self.seen_metadata.append(_mcp_metadata_var.get())
+        return Prompt.assistant("ok")
+
+
+class _PromptLoadedDisplay:
+    def __init__(self) -> None:
+        self.loaded: dict[str, Any] | None = None
+
+    async def show_prompt_loaded(self, **kwargs: Any) -> None:
+        self.loaded = dict(kwargs)
+
+
+class _StructuredResult(BaseModel):
+    value: str
+
+
+@pytest.mark.asyncio
+async def test_apply_prompt_template_reads_arguments_from_prompt_metadata() -> None:
+    llm = StubLLM()
+    display = _PromptLoadedDisplay()
+    llm.display = cast("Any", display)
+    prompt = GetPromptResult(
+        description="Demo prompt",
+        messages=[
+            PromptMessage(
+                role="assistant",
+                content=TextContent(type="text", text="hello"),
+            )
+        ],
+    )
+    prompt = with_prompt_metadata(
+        prompt,
+        namespaced_name="server/demo",
+        arguments={"topic": "release notes"},
+    )
+
+    result = await llm.apply_prompt_template(prompt, "server/demo")
+
+    assert result == "hello"
+    assert display.loaded is not None
+    assert display.loaded["arguments"] == {"topic": "release notes"}
+
+
+@pytest.mark.asyncio
+async def test_generate_requires_messages() -> None:
+    llm = StubLLM()
+
+    with pytest.raises(ValueError, match="at least one message"):
+        await llm.generate([])
+
+
+@pytest.mark.asyncio
+async def test_generate_resets_mcp_metadata_context_between_calls() -> None:
+    llm = MetadataRecordingLLM()
+
+    token = _mcp_metadata_var.set(None)
+    try:
+        await llm.generate(
+            [Prompt.user("one")],
+            RequestParams(mcp_metadata={"server": {"tool": {"id": "first"}}}),
+        )
+        assert _mcp_metadata_var.get() is None
+
+        await llm.generate([Prompt.user("two")])
+    finally:
+        _mcp_metadata_var.reset(token)
+
+    assert llm.seen_metadata == [{"server": {"tool": {"id": "first"}}}, None]
+
+
+def test_structured_from_multipart_handles_empty_content() -> None:
+    llm = StubLLM()
+    message = PromptMessageExtended(role="assistant", content=[])
+
+    result, returned_message = llm._structured_from_multipart(message, _StructuredResult)
+
+    assert result is None
+    assert returned_message is message
+
+
+class TestRequestParamsInLLM:
+    """Test suite for RequestParams handling in LLM classes"""
+
+    def test_base_prepare_provider_arguments(self):
+        """Test the base prepare_provider_arguments method"""
+        # Create a testable LLM instance
+        llm = StubLLM()
+
+        # Test with minimal base arguments
+        base_args = {"model": "test-model"}
+        params = RequestParams(temperature=0.7)
+
+        # Prepare arguments
+        result = llm.prepare_provider_arguments(base_args, params)
+
+        # Verify results
+        assert result["model"] == "test-model"
+        assert result["temperature"] == 0.7
+
+    def test_prepare_arguments_with_exclusions(self):
+        """Test prepare_provider_arguments with field exclusions"""
+        llm = StubLLM()
+
+        # Test with exclusions
+        base_args = {"model": "test-model"}
+        params = RequestParams(model="different-model", temperature=0.7, max_tokens=1000)
+
+        # Exclude model and maxTokens fields
+        exclude_fields = {FastAgentLLM.PARAM_MODEL, FastAgentLLM.PARAM_MAX_TOKENS}
+        result = llm.prepare_provider_arguments(base_args, params, exclude_fields)
+
+        # Verify results - model should remain from base_args, maxTokens should be excluded,
+        # but temperature should be included
+        assert result["model"] == "test-model"  # From base_args, not overridden
+        assert "maxTokens" not in result  # Excluded
+        assert result["temperature"] == 0.7  # Included from params
+
+    def test_prepare_arguments_with_metadata(self):
+        """Test prepare_provider_arguments with metadata override"""
+        llm = StubLLM()
+
+        # Test with metadata
+        base_args = {"model": "test-model", "temperature": 0.2}
+        params = RequestParams(temperature=0.7, metadata={"temperature": 0.9, "top_p": 0.95})
+
+        result = llm.prepare_provider_arguments(base_args, params)
+
+        # Verify results - metadata should override both base_args and params fields
+        assert result["model"] == "test-model"  # From base_args
+        assert result["temperature"] == 0.9  # From metadata, overriding both base_args and params
+        assert result["top_p"] == 0.95  # From metadata
+
+    def test_response_format_handling(self):
+        """Test handling of response_format parameter"""
+        llm = StubLLM()
+
+        json_format = {
+            "type": "json_schema",
+            "schema": {"type": "object", "properties": {"message": {"type": "string"}}},
+        }
+
+        # Test with response_format in params
+        base_args = {"model": "test-model"}
+        params = RequestParams(response_format=json_format)
+
+        result = llm.prepare_provider_arguments(base_args, params)
+
+        # Verify response_format is included
+        assert result["model"] == "test-model"
+        assert result["response_format"] == json_format
+
+    def test_structured_schema_is_not_passed_through_to_provider_arguments(self):
+        llm = StubLLM()
+
+        result = llm.prepare_provider_arguments(
+            {"model": "test-model"},
+            RequestParams(structured_schema={"type": "object"}),
+        )
+
+        assert result["model"] == "test-model"
+        assert "structured_schema" not in result
+
+    def test_batch_context_is_not_passed_through_to_provider_arguments(self):
+        llm = StubLLM()
+
+        result = llm.prepare_provider_arguments(
+            {"model": "test-model"},
+            RequestParams(batch_context=BatchRequestContext(row_number=3, identity="abc")),
+        )
+
+        assert result["model"] == "test-model"
+        assert "batch_context" not in result
+
+    def test_service_tier_excluded_from_non_responses_provider_arguments(self):
+        """Test that service_tier is kept off generic provider argument passthrough."""
+        llm = StubLLM()
+
+        result = llm.prepare_provider_arguments(
+            {"model": "test-model"},
+            RequestParams(service_tier="fast"),
+        )
+
+        assert result["model"] == "test-model"
+        assert "service_tier" not in result
+
+    def test_service_tier_setter_rejects_unsupported_providers(self):
+        llm = StubLLM()
+
+        with pytest.raises(ValueError, match="service tier"):
+            llm.set_service_tier("fast")
+
+    def test_openai_provider_arguments(self):
+        """Test prepare_provider_arguments with OpenAI provider"""
+        # Create an OpenAI LLM instance without initializing provider connections
+        llm = OpenAILLM()
+
+        # Basic setup
+        base_args = {"model": "gpt-4.1", "messages": [], "max_tokens": 1000}
+
+        # Create params with regular fields, metadata, and response_format
+        params = RequestParams(
+            model="gpt-4.1",
+            temperature=0.7,
+            max_tokens=2000,  # This should be excluded and not conflict with max_tokens
+            system_prompt="You are a helpful assistant",  # This should be excluded
+            response_format={"type": "json_object"},
+            use_history=True,  # This should be excluded
+            max_iterations=5,  # This should be excluded
+            parallel_tool_calls=True,  # This should be excluded
+            metadata={"seed": 42},
+        )
+
+        # Prepare arguments with OpenAI-specific exclusions
+        result = llm.prepare_provider_arguments(base_args, params, llm.OPENAI_EXCLUDE_FIELDS)
+
+        # Verify results
+        assert result["model"] == "gpt-4.1"  # From base_args
+        assert result["max_tokens"] == 1000  # From base_args
+        assert result["temperature"] == 0.7  # From params
+        assert result["response_format"] == {"type": "json_object"}  # From params
+        assert result["seed"] == 42  # From metadata
+        assert "maxTokens" not in result  # Should be excluded
+        assert "systemPrompt" not in result  # Should be excluded
+        assert "use_history" not in result  # Should be excluded
+        assert "max_iterations" not in result  # Should be excluded
+        assert "parallel_tool_calls" not in result  # Should be excluded
+
+    def test_openai_request_omits_unset_max_tokens(self):
+        llm = OpenAILLM(model="unknown-model")
+
+        result = llm._prepare_api_request(
+            [{"role": "user", "content": "hi"}],
+            None,
+            RequestParams(model="unknown-model"),
+        )
+
+        assert "max_tokens" not in result
+        assert "max_completion_tokens" not in result
+
+    def test_responses_request_omits_unset_max_tokens(self):
+        llm = ResponsesLLM(model="unknown-model")
+
+        result = llm._build_response_args(
+            [{"role": "user", "content": "hi"}],
+            RequestParams(model="unknown-model"),
+            None,
+        )
+
+        assert "max_output_tokens" not in result
+
+    def test_anthropic_provider_arguments(self):
+        """Test prepare_provider_arguments with Anthropic provider"""
+        # Create an Anthropic LLM instance without initializing provider connections
+        llm = AnthropicLLM()
+
+        # Basic setup
+        base_args = {
+            "model": "claude-3-7-sonnet",
+            "messages": [],
+            "max_tokens": 1000,
+            "system": "You are a helpful assistant",
+        }
+
+        # Create params with various fields
+        params = RequestParams(
+            model="claude-3-7-sonnet",
+            temperature=0.7,
+            max_tokens=2000,  # This should be excluded
+            system_prompt="You are a helpful assistant",  # This should be excluded
+            use_history=True,  # This should be excluded
+            max_iterations=5,  # This should be excluded
+            parallel_tool_calls=True,  # This should be excluded
+            metadata={"top_k": 10},
+        )
+
+        # Prepare arguments with Anthropic-specific exclusions
+        result = llm.prepare_provider_arguments(base_args, params, llm.ANTHROPIC_EXCLUDE_FIELDS)
+
+        # Verify results
+        assert result["model"] == "claude-3-7-sonnet"  # From base_args
+        assert result["max_tokens"] == 1000  # From base_args
+        assert result["system"] == "You are a helpful assistant"  # From base_args
+        assert result["temperature"] == 0.7  # From params
+        assert result["top_k"] == 10  # From metadata
+        assert "maxTokens" not in result  # Should be excluded
+        assert "systemPrompt" not in result  # Should be excluded
+        assert "use_history" not in result  # Should be excluded
+        assert "max_iterations" not in result  # Should be excluded
+        assert "parallel_tool_calls" not in result  # Should be excluded
+
+    def test_params_dont_overwrite_base_args(self):
+        """Test that params don't overwrite base_args with the same key"""
+        llm = StubLLM()
+
+        # Set up conflicting keys
+        base_args = {"model": "base-model", "temperature": 0.5}
+        params = RequestParams(model="param-model", temperature=0.7)
+
+        # Exclude nothing
+        result = llm.prepare_provider_arguments(base_args, params, set())
+
+        # base_args should take precedence
+        assert result["model"] == "base-model"
+        assert result["temperature"] == 0.5
+
+    def test_none_values_not_included(self):
+        """Test that None values from params are not included"""
+        llm = StubLLM()
+
+        base_args = {"model": "test-model"}
+        params = RequestParams(temperature=None, metadata={"top_p": 0.9})
+
+        result = llm.prepare_provider_arguments(base_args, params)
+
+        # None values should be excluded
+        assert "temperature" not in result
+        assert result["top_p"] == 0.9
+
+
+class TestRetryCountResolution:
+    def test_retry_count_defaults_to_two_when_context_config_is_unavailable(self) -> None:
+        llm = StubLLM(context=None)
+
+        assert llm._resolve_retry_count() == 2

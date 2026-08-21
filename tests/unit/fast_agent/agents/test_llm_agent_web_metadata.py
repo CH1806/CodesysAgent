@@ -1,0 +1,658 @@
+from __future__ import annotations
+
+from typing import Any
+
+import pytest
+from mcp_types import CallToolRequest, CallToolRequestParams, CallToolResult, TextContent
+from rich.text import Text
+
+from fast_agent.agents.agent_types import AgentConfig
+from fast_agent.agents.llm_agent import LlmAgent
+from fast_agent.agents.llm_decorator import RemovedContentSummary
+from fast_agent.constants import ANTHROPIC_CITATIONS_CHANNEL, ANTHROPIC_SERVER_TOOLS_CHANNEL
+from fast_agent.llm.provider.openai.responses import ResponsesLLM
+from fast_agent.llm.provider_types import Provider
+from fast_agent.llm.usage_tracking import (
+    CompletionTokenUsage,
+    PromptTokenUsage,
+    TurnUsage,
+    UsageSchema,
+)
+from fast_agent.mcp.prompt_message_extended import PromptMessageExtended
+from fast_agent.mcp.url_elicitation_required import URLElicitationRequiredDisplayPayload
+from fast_agent.types.llm_stop_reason import LlmStopReason
+from fast_agent.ui.console_display import ConsoleDisplay
+
+
+def _usage_turn(prompt: int, completion: int) -> TurnUsage:
+    return TurnUsage(
+        provider=Provider.RESPONSES,
+        usage_schema=UsageSchema.OPENAI_RESPONSES,
+        model="gpt-5.3-codex",
+        prompt=PromptTokenUsage(total=prompt),
+        completion=CompletionTokenUsage(total=completion),
+    )
+
+
+class _CaptureDisplay(ConsoleDisplay):
+    def __init__(self) -> None:
+        super().__init__(config=None)
+        self.calls: list[dict[str, Any]] = []
+        self.status_messages: list[Text] = []
+        self.mermaid_messages: list[str | Text | PromptMessageExtended] = []
+        self.tool_calls: list[dict[str, Any]] = []
+        self.tool_results: list[dict[str, Any]] = []
+        self.event_order: list[str] = []
+
+    async def show_assistant_message(
+        self,
+        message_text: str | Text | PromptMessageExtended,
+        bottom_items: list[str] | None = None,
+        highlight_indexes: list[int] | None = None,
+        max_item_length: int | None = None,
+        name: str | None = None,
+        model: str | None = None,
+        additional_message: Text | None = None,
+        pre_content=None,
+        render_markdown: bool | None = None,
+        show_hook_indicator: bool = False,
+        show_reprint_banner: bool = False,
+    ) -> None:
+        payload = {
+            "message_text": message_text,
+            "bottom_items": bottom_items,
+            "highlight_indexes": highlight_indexes,
+            "max_item_length": max_item_length,
+            "name": name,
+            "model": model,
+            "additional_message": additional_message,
+            "pre_content": pre_content,
+            "render_markdown": render_markdown,
+            "show_hook_indicator": show_hook_indicator,
+            "show_reprint_banner": show_reprint_banner,
+        }
+        self.event_order.append("assistant")
+        self.calls.append(payload)
+
+    def show_status_message(self, content: Text) -> None:
+        self.status_messages.append(content)
+
+    def show_mermaid_diagrams_from_message_text(
+        self,
+        message_text: str | Text | PromptMessageExtended,
+    ) -> None:
+        self.mermaid_messages.append(message_text)
+
+    def show_tool_call(
+        self,
+        tool_name: str,
+        tool_args: dict[str, Any] | None,
+        bottom_items: list[str] | None = None,
+        highlight_indexes: list[int] | None = None,
+        max_item_length: int | None = None,
+        name: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        tool_call_id: str | None = None,
+        type_label: str | None = None,
+        source_label: str | None = None,
+        server_name: str | None = None,
+        request_count: int = 1,
+        show_hook_indicator: bool = False,
+    ) -> None:
+        self.event_order.append("tool_call")
+        self.tool_calls.append(
+            {
+                "tool_name": tool_name,
+                "tool_args": tool_args,
+                "bottom_items": bottom_items,
+                "highlight_indexes": highlight_indexes,
+                "max_item_length": max_item_length,
+                "name": name,
+                "metadata": metadata,
+                "tool_call_id": tool_call_id,
+                "type_label": type_label,
+                "source_label": source_label,
+                "server_name": server_name,
+                "request_count": request_count,
+                "show_hook_indicator": show_hook_indicator,
+            }
+        )
+
+    def show_tool_result(
+        self,
+        result: CallToolResult,
+        name: str | None = None,
+        tool_name: str | None = None,
+        app_integration_config: Any = None,
+        timing_ms: float | None = None,
+        tool_call_id: str | None = None,
+        type_label: str | None = None,
+        truncate_content: bool = True,
+        source_label: str | None = None,
+        server_name: str | None = None,
+        show_hook_indicator: bool = False,
+    ) -> None:
+        self.event_order.append("tool_result")
+        self.tool_results.append(
+            {
+                "result": result,
+                "name": name,
+                "tool_name": tool_name,
+                "app_integration_config": app_integration_config,
+                "timing_ms": timing_ms,
+                "tool_call_id": tool_call_id,
+                "type_label": type_label,
+                "truncate_content": truncate_content,
+                "source_label": source_label,
+                "server_name": server_name,
+                "show_hook_indicator": show_hook_indicator,
+            }
+        )
+
+
+class _UrlCaptureAgent(LlmAgent):
+    def __init__(self, name: str) -> None:
+        super().__init__(AgentConfig(name))
+        self.url_display_names: list[str | None] = []
+
+    def _display_url_elicitations_from_history(self, agent_name: str | None) -> None:
+        self.url_display_names.append(agent_name)
+
+
+class _SummaryHarnessAgent(LlmAgent):
+    def __init__(
+        self,
+        response: PromptMessageExtended,
+        summary: RemovedContentSummary | None,
+    ) -> None:
+        super().__init__(AgentConfig("summary-harness"))
+        self._response = response
+        self._summary = summary
+        self.additional_messages: list[Text | None] = []
+
+    def _should_stream(self) -> bool:
+        return False
+
+    async def _generate_with_summary(
+        self,
+        messages: list[PromptMessageExtended],
+        request_params=None,
+        tools=None,
+    ) -> tuple[PromptMessageExtended, RemovedContentSummary | None]:
+        return self._response, self._summary
+
+    async def show_assistant_message(
+        self,
+        message: PromptMessageExtended,
+        bottom_items=None,
+        highlight_items=None,
+        max_item_length=None,
+        name=None,
+        model=None,
+        additional_message: Text | None = None,
+        render_markdown: bool | None = None,
+        show_hook_indicator: bool | None = None,
+        render_message: bool = True,
+        show_reprint_banner: bool = False,
+    ) -> None:
+        del show_reprint_banner
+        self.additional_messages.append(additional_message)
+
+
+def _web_channels() -> dict[str, list[TextContent]]:
+    return {
+        ANTHROPIC_SERVER_TOOLS_CHANNEL: [
+            TextContent(type="text", text='{"type":"server_tool_use","name":"web_search"}')
+        ],
+        ANTHROPIC_CITATIONS_CHANNEL: [
+            TextContent(
+                type="text",
+                text=(
+                    '{"type":"web_search_result_location",'
+                    '"title":"Example",'
+                    '"url":"https://example.com/news"}'
+                ),
+            )
+        ],
+    }
+
+
+@pytest.mark.unit
+def test_url_elicitation_issue_summary_uses_singular_hidden_issue_label(capsys) -> None:
+    agent = LlmAgent(AgentConfig("url-debug"))
+    agent.display = _CaptureDisplay()
+    payload = URLElicitationRequiredDisplayPayload(
+        server_name="docs",
+        request_method="tools/call",
+        elicitations=[],
+        issues=["first", "second", "third", "fourth"],
+    )
+
+    agent._display_single_url_elicitation_payload(payload, agent_name="url-debug")
+
+    output = capsys.readouterr().out
+    assert "... and 1 more issue" in output
+    assert "issue(s)" not in output
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_show_assistant_message_hides_web_metadata_for_tool_use() -> None:
+    agent = LlmAgent(AgentConfig("web-debug"))
+    capture_display = _CaptureDisplay()
+    agent.display = capture_display
+
+    tool_use_message = PromptMessageExtended(
+        role="assistant",
+        content=[TextContent(type="text", text="calling web tool")],
+        stop_reason=LlmStopReason.TOOL_USE,
+        channels=_web_channels(),
+    )
+
+    await agent.show_assistant_message(tool_use_message)
+
+    assert len(capture_display.calls) == 1
+    call = capture_display.calls[0]
+    assert call.get("bottom_items") is None
+    assert call.get("additional_message") is None
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_show_assistant_message_renders_web_metadata_for_final_turn() -> None:
+    agent = LlmAgent(AgentConfig("web-debug"))
+    capture_display = _CaptureDisplay()
+    agent.display = capture_display
+
+    end_turn_message = PromptMessageExtended(
+        role="assistant",
+        content=[TextContent(type="text", text="done")],
+        stop_reason=LlmStopReason.END_TURN,
+        channels=_web_channels(),
+    )
+
+    await agent.show_assistant_message(end_turn_message)
+
+    assert len(capture_display.calls) == 1
+    call = capture_display.calls[0]
+    assert call.get("bottom_items") == ["web_search x1"]
+    assert call.get("pre_content") is None
+
+    additional = call.get("additional_message")
+    assert isinstance(additional, Text)
+    plain = additional.plain
+    assert "Sources" in plain
+    assert "done" not in plain
+    assert "Web activity: web_search x1" in plain
+    assert call.get("highlight_indexes") == [0]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_show_assistant_message_replays_provider_mcp_tools() -> None:
+    agent = LlmAgent(AgentConfig("provider-mcp"))
+    capture_display = _CaptureDisplay()
+    agent.display = capture_display
+
+    message = PromptMessageExtended(
+        role="assistant",
+        content=[TextContent(type="text", text="You're evalstate.")],
+        stop_reason=LlmStopReason.END_TURN,
+        channels={
+            ANTHROPIC_SERVER_TOOLS_CHANNEL: [
+                TextContent(
+                    type="text",
+                    text='{"type":"mcp_tool_use","id":"mcptoolu_1","name":"hf_whoami","server_name":"huggingface_mcp","input":{}}',
+                ),
+                TextContent(
+                    type="text",
+                    text='{"type":"mcp_tool_result","tool_use_id":"mcptoolu_1","is_error":false,"content":[{"type":"text","text":"evalstate"}]}',
+                ),
+            ]
+        },
+    )
+
+    await agent.show_assistant_message(message)
+
+    assert capture_display.event_order == ["tool_call", "tool_result", "assistant"]
+    assert [item["tool_name"] for item in capture_display.tool_calls] == [
+        "huggingface_mcp/hf_whoami"
+    ]
+    assert [item["type_label"] for item in capture_display.tool_calls] == ["remote tool call"]
+    assert [item["tool_name"] for item in capture_display.tool_results] == [
+        "huggingface_mcp/hf_whoami"
+    ]
+    assert [item["type_label"] for item in capture_display.tool_results] == ["remote tool result"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_show_assistant_message_replays_x_search_internal_calls() -> None:
+    agent = LlmAgent(AgentConfig("x-search"))
+    capture_display = _CaptureDisplay()
+    agent.display = capture_display
+
+    message = PromptMessageExtended(
+        role="assistant",
+        content=[TextContent(type="text", text="Answer based on X search.")],
+        stop_reason=LlmStopReason.END_TURN,
+        channels={
+            ANTHROPIC_SERVER_TOOLS_CHANNEL: [
+                TextContent(
+                    type="text",
+                    text=(
+                        '{"type":"server_tool_use",'
+                        '"provider_tool_type":"x_search_call",'
+                        '"name":"x_keyword_search",'
+                        '"id":"xs_1",'
+                        '"arguments":"{\\"query\\":\\"from:rachelnabors harness\\",\\"limit\\":\\"5\\"}",'
+                        '"input":{"query":"from:rachelnabors harness","limit":"5"}}'
+                    ),
+                ),
+                TextContent(
+                    type="text",
+                    text=(
+                        '{"type":"server_tool_use",'
+                        '"provider_tool_type":"x_search_call",'
+                        '"name":"x_thread_fetch",'
+                        '"id":"xs_2",'
+                        '"input":{"post_id":"2050165558214066579"}}'
+                    ),
+                ),
+            ]
+        },
+    )
+
+    await agent.show_assistant_message(message)
+
+    assert capture_display.event_order == ["tool_call", "tool_call", "assistant"]
+    assert [item["tool_name"] for item in capture_display.tool_calls] == [
+        "x_keyword_search",
+        "x_thread_fetch",
+    ]
+    assert [item["type_label"] for item in capture_display.tool_calls] == [
+        "remote tool call",
+        "remote tool call",
+    ]
+    assert capture_display.tool_calls[0]["tool_args"] == {
+        "query": "from:rachelnabors harness",
+        "limit": "5",
+    }
+    assert capture_display.tool_calls[1]["tool_args"] == {"post_id": "2050165558214066579"}
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_show_assistant_message_skips_empty_panel_for_tool_only_remote_turn() -> None:
+    agent = LlmAgent(AgentConfig("provider-mcp-tool-only"))
+    capture_display = _CaptureDisplay()
+    agent.display = capture_display
+
+    message = PromptMessageExtended(
+        role="assistant",
+        content=[],
+        stop_reason=LlmStopReason.END_TURN,
+        channels={
+            ANTHROPIC_SERVER_TOOLS_CHANNEL: [
+                TextContent(
+                    type="text",
+                    text='{"type":"mcp_tool_use","id":"mcptoolu_1","name":"hf_whoami","server_name":"huggingface_mcp","input":{}}',
+                ),
+                TextContent(
+                    type="text",
+                    text='{"type":"mcp_tool_result","tool_use_id":"mcptoolu_1","is_error":false,"content":[{"type":"text","text":"evalstate"}]}',
+                ),
+            ]
+        },
+    )
+
+    await agent.show_assistant_message(message)
+
+    assert capture_display.event_order == ["tool_call", "tool_result"]
+    assert capture_display.calls == []
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_show_assistant_message_suppresses_bottom_metadata_for_shell_tool_use() -> None:
+    agent = LlmAgent(AgentConfig("shell-tool-use"))
+    capture_display = _CaptureDisplay()
+    agent.display = capture_display
+
+    tool_call = CallToolRequest(
+        method="tools/call",
+        params=CallToolRequestParams(name="bash", arguments={"command": "pwd"}),
+    )
+    tool_use_message = PromptMessageExtended(
+        role="assistant",
+        content=[],
+        tool_calls={"call_1": tool_call},
+        stop_reason=LlmStopReason.TOOL_USE,
+    )
+
+    await agent.show_assistant_message(
+        tool_use_message,
+        bottom_items=["shell", "web"],
+        highlight_items="shell",
+    )
+
+    assert len(capture_display.calls) == 1
+    call = capture_display.calls[0]
+    assert call.get("bottom_items") is None
+    assert call.get("highlight_indexes") == []
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_show_assistant_message_skips_empty_process_poll_turn() -> None:
+    agent = LlmAgent(AgentConfig("process-poll"))
+    capture_display = _CaptureDisplay()
+    agent.display = capture_display
+
+    tool_call = CallToolRequest(
+        method="tools/call",
+        params=CallToolRequestParams(
+            name="poll_process",
+            arguments={"process_id": "process-1", "wait_sec": 30},
+        ),
+    )
+    message = PromptMessageExtended(
+        role="assistant",
+        content=[],
+        tool_calls={"call_1": tool_call},
+        stop_reason=LlmStopReason.TOOL_USE,
+    )
+
+    await agent.show_assistant_message(message, bottom_items=["bash", "skill"])
+
+    assert capture_display.calls == []
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_show_assistant_message_keeps_process_poll_turn_text() -> None:
+    agent = LlmAgent(AgentConfig("process-poll-text"))
+    capture_display = _CaptureDisplay()
+    agent.display = capture_display
+
+    tool_call = CallToolRequest(
+        method="tools/call",
+        params=CallToolRequestParams(
+            name="poll_process",
+            arguments={"process_id": "process-1", "wait_sec": 30},
+        ),
+    )
+    message = PromptMessageExtended(
+        role="assistant",
+        content=[TextContent(type="text", text="I’ll check again.")],
+        tool_calls={"call_1": tool_call},
+        stop_reason=LlmStopReason.TOOL_USE,
+    )
+
+    await agent.show_assistant_message(message)
+
+    assert len(capture_display.calls) == 1
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_show_assistant_message_render_message_false_shows_status_and_mermaid() -> None:
+    agent = _UrlCaptureAgent("web-debug")
+    capture_display = _CaptureDisplay()
+    agent.display = capture_display
+
+    end_turn_message = PromptMessageExtended(
+        role="assistant",
+        content=[TextContent(type="text", text="done")],
+        stop_reason=LlmStopReason.END_TURN,
+        channels=_web_channels(),
+    )
+
+    await agent.show_assistant_message(end_turn_message, render_message=False)
+
+    assert capture_display.calls == []
+    assert len(capture_display.status_messages) == 1
+    assert "Sources" in capture_display.status_messages[0].plain
+    assert "Web activity: web_search x1" in capture_display.status_messages[0].plain
+    assert capture_display.mermaid_messages == [end_turn_message]
+    assert agent.url_display_names == ["web-debug"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_show_assistant_message_appends_websocket_indicator_to_model() -> None:
+    agent = LlmAgent(AgentConfig("websocket-indicator"))
+    capture_display = _CaptureDisplay()
+    agent.display = capture_display
+    llm = ResponsesLLM(provider=Provider.RESPONSES, model="gpt-5.3-codex")
+    llm._record_ws_turn_outcome("reused")
+    agent._llm = llm
+
+    message = PromptMessageExtended(
+        role="assistant",
+        content=[TextContent(type="text", text="done")],
+        stop_reason=LlmStopReason.END_TURN,
+    )
+
+    await agent.show_assistant_message(message)
+
+    assert len(capture_display.calls) == 1
+    call = capture_display.calls[0]
+    assert call.get("model") == "gpt-5.3-codex ↔"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_show_assistant_message_places_websocket_indicator_before_context_percentage() -> (
+    None
+):
+    agent = LlmAgent(AgentConfig("websocket-indicator-context"))
+    capture_display = _CaptureDisplay()
+    agent.display = capture_display
+    llm = ResponsesLLM(provider=Provider.RESPONSES, model="gpt-5.3-codex")
+    llm._record_ws_turn_outcome("reused")
+    llm.usage_accumulator.set_context_window_size(1000)
+    llm.usage_accumulator.add_turn(_usage_turn(90, 10))
+    agent._llm = llm
+
+    tool_call = CallToolRequest(
+        method="tools/call",
+        params=CallToolRequestParams(name="demo-tool", arguments={}),
+    )
+    message = PromptMessageExtended(
+        role="assistant",
+        content=[TextContent(type="text", text="need tool")],
+        tool_calls={"call_1": tool_call},
+        stop_reason=LlmStopReason.TOOL_USE,
+    )
+
+    await agent.show_assistant_message(message)
+
+    assert len(capture_display.calls) == 1
+    call = capture_display.calls[0]
+    assert call.get("model") == "gpt-5.3-codex ↔ (10.0%)"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_show_assistant_message_uses_compact_context_format_for_low_usage() -> None:
+    agent = LlmAgent(AgentConfig("websocket-indicator-low-context"))
+    capture_display = _CaptureDisplay()
+    agent.display = capture_display
+    llm = ResponsesLLM(provider=Provider.RESPONSES, model="gpt-5.3-codex")
+    llm._record_ws_turn_outcome("reused")
+    llm.usage_accumulator.set_context_window_size(1000)
+    llm.usage_accumulator.add_turn(_usage_turn(9, 1))
+    agent._llm = llm
+
+    tool_call = CallToolRequest(
+        method="tools/call",
+        params=CallToolRequestParams(name="demo-tool", arguments={}),
+    )
+    message = PromptMessageExtended(
+        role="assistant",
+        content=[TextContent(type="text", text="need tool")],
+        tool_calls={"call_1": tool_call},
+        stop_reason=LlmStopReason.TOOL_USE,
+    )
+
+    await agent.show_assistant_message(message)
+
+    assert len(capture_display.calls) == 1
+    call = capture_display.calls[0]
+    assert call.get("model") == "gpt-5.3-codex ↔ (1.00%)"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_generate_impl_hides_summary_for_tool_use_turn() -> None:
+    summary = RemovedContentSummary(
+        model_name="gpt-test",
+        counts={},
+        category_mimes={},
+        alert_flags=frozenset(),
+        message="history trimmed",
+    )
+    response = PromptMessageExtended(
+        role="assistant",
+        content=[TextContent(type="text", text="need tool")],
+        stop_reason=LlmStopReason.TOOL_USE,
+    )
+    agent = _SummaryHarnessAgent(response, summary)
+
+    seed_message = PromptMessageExtended(
+        role="assistant",
+        content=[TextContent(type="text", text="seed")],
+    )
+    await agent.generate_impl([seed_message])
+
+    assert agent.additional_messages == [None]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_generate_impl_renders_summary_for_final_turn() -> None:
+    summary = RemovedContentSummary(
+        model_name="gpt-test",
+        counts={},
+        category_mimes={},
+        alert_flags=frozenset(),
+        message="history trimmed",
+    )
+    response = PromptMessageExtended(
+        role="assistant",
+        content=[TextContent(type="text", text="done")],
+        stop_reason=LlmStopReason.END_TURN,
+    )
+    agent = _SummaryHarnessAgent(response, summary)
+
+    seed_message = PromptMessageExtended(
+        role="assistant",
+        content=[TextContent(type="text", text="seed")],
+    )
+    await agent.generate_impl([seed_message])
+
+    assert len(agent.additional_messages) == 1
+    additional = agent.additional_messages[0]
+    assert isinstance(additional, Text)
+    assert "history trimmed" in additional.plain

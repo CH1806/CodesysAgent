@@ -1,0 +1,2505 @@
+"""Command to check FastAgent configuration."""
+
+import json
+import os
+import platform
+import sys
+from collections.abc import Iterable, Sequence
+from dataclasses import asdict, dataclass
+from importlib.metadata import version
+from itertools import zip_longest
+from pathlib import Path
+from typing import Any, cast
+
+import typer
+import yaml
+from rich.table import Table
+
+from fast_agent.agents.agent_types import AgentConfig
+from fast_agent.cli.codex_oauth_display import (
+    codex_oauth_expiry_display,
+    codex_oauth_source_display,
+    codex_oauth_source_label,
+)
+from fast_agent.cli.home_helpers import resolve_home_option
+from fast_agent.cli.update_check import check_for_update_notice, should_run_update_check
+from fast_agent.constants import DEFAULT_HOME_DIR
+from fast_agent.core.agent_card_validation import AgentCardScanResult, scan_agent_card_directory
+from fast_agent.core.exceptions import ModelConfigError
+from fast_agent.core.keyring_utils import KeyringStatus, get_keyring_status
+from fast_agent.core.logging.logger import get_logger
+from fast_agent.home import discover_config_files, resolve_fast_agent_home
+from fast_agent.llm.model_factory import ModelFactory
+from fast_agent.llm.model_overlays import ModelOverlayRegistry, load_model_overlay_registry
+from fast_agent.llm.model_selection import ModelSelectionCatalog
+from fast_agent.llm.provider.openai.openresponses import DEFAULT_OPENRESPONSES_BASE_URL
+from fast_agent.llm.provider_key_manager import API_KEY_HINT_TEXT, ProviderKeyManager
+from fast_agent.llm.provider_types import Provider
+from fast_agent.paths import HomePaths, default_skill_paths, resolve_home_paths
+from fast_agent.skills import SkillManifest, SkillRegistry
+from fast_agent.ui.a3_headers import build_a3_section_header
+from fast_agent.ui.console import console
+from fast_agent.utils.async_utils import run_coroutine
+from fast_agent.utils.count_display import plural_label
+from fast_agent.utils.huggingface_hub import is_huggingface_hub_logged_in
+from fast_agent.utils.name_normalization import normalize_provider_key
+from fast_agent.utils.text import strip_str_to_none, strip_to_none
+from fast_agent.utils.transports import uses_mcp_remote_transport
+
+SettingsTableRow = tuple[str, str]
+ProviderStatusRow = tuple[str, dict[str, str]]
+
+app = typer.Typer(
+    help="Check and diagnose FastAgent configuration",
+    no_args_is_help=False,  # Allow showing our custom help instead
+    add_completion=False,
+)
+logger = get_logger(__name__)
+
+
+@dataclass(frozen=True)
+class ProviderCatalogScope:
+    """A CLI provider scope for model catalog inspection."""
+
+    display_name: str
+    providers: tuple[Provider, ...]
+
+
+_PROVIDER_CATALOG_SCOPES_BY_KEY: dict[str, ProviderCatalogScope] = {
+    "openai": ProviderCatalogScope(
+        display_name="OpenAI",
+        providers=(
+            Provider.OPENAI,
+            Provider.RESPONSES,
+            Provider.CODEX_RESPONSES,
+        ),
+    ),
+    "responses": ProviderCatalogScope(
+        display_name="Responses",
+        providers=(Provider.RESPONSES,),
+    ),
+    "codexresponses": ProviderCatalogScope(
+        display_name="Codex Responses",
+        providers=(Provider.CODEX_RESPONSES,),
+    ),
+    "anthropic": ProviderCatalogScope(
+        display_name="Anthropic",
+        providers=(Provider.ANTHROPIC,),
+    ),
+    "anthropic-vertex": ProviderCatalogScope(
+        display_name="Anthropic (Vertex)",
+        providers=(Provider.ANTHROPIC_VERTEX,),
+    ),
+    "google": ProviderCatalogScope(
+        display_name="Google",
+        providers=(Provider.GOOGLE,),
+    ),
+    "deepseek": ProviderCatalogScope(
+        display_name="DeepSeek",
+        providers=(Provider.DEEPSEEK,),
+    ),
+    "zai": ProviderCatalogScope(
+        display_name="Z.ai",
+        providers=(Provider.ZAI,),
+    ),
+    "moonshot": ProviderCatalogScope(
+        display_name="Moonshot",
+        providers=(Provider.MOONSHOT,),
+    ),
+    "aliyun": ProviderCatalogScope(
+        display_name="Aliyun",
+        providers=(Provider.ALIYUN,),
+    ),
+    "huggingface": ProviderCatalogScope(
+        display_name="HuggingFace",
+        providers=(Provider.HUGGINGFACE,),
+    ),
+    "xai": ProviderCatalogScope(
+        display_name="xAI",
+        providers=(Provider.XAI,),
+    ),
+    "metaai": ProviderCatalogScope(
+        display_name="MetaAI",
+        providers=(Provider.META_AI,),
+    ),
+    "openrouter": ProviderCatalogScope(
+        display_name="OpenRouter",
+        providers=(Provider.OPENROUTER,),
+    ),
+}
+
+_PROVIDER_CATALOG_SCOPE_ALIASES: dict[str, str] = {
+    "hf": "huggingface",
+    "codex-responses": "codexresponses",
+    "codex_responses": "codexresponses",
+    "anthropicvertex": "anthropic-vertex",
+}
+
+_PROVIDER_CATALOG_VISIBLE_CHOICES: tuple[str, ...] = (
+    "openai",
+    "anthropic",
+    "anthropic-vertex",
+    "google",
+    "deepseek",
+    "zai",
+    "aliyun",
+    "huggingface",
+    "xai",
+    "metaai",
+    "openrouter",
+    "responses",
+    "codexresponses",
+)
+
+_STEP_INTERVAL_UNITS: tuple[tuple[int, str], ...] = (
+    (86_400, "d"),
+    (3_600, "h"),
+    (60, "m"),
+)
+
+
+def _build_provider_catalog_scope_lookup() -> dict[str, ProviderCatalogScope]:
+    lookup: dict[str, ProviderCatalogScope] = {}
+    for name, scope in _PROVIDER_CATALOG_SCOPES_BY_KEY.items():
+        lookup[normalize_provider_key(name)] = scope
+
+    for alias, canonical_name in _PROVIDER_CATALOG_SCOPE_ALIASES.items():
+        normalized_alias = normalize_provider_key(alias)
+        canonical_scope = _PROVIDER_CATALOG_SCOPES_BY_KEY.get(canonical_name)
+        if canonical_scope is None:
+            continue
+        lookup[normalized_alias] = canonical_scope
+
+    return lookup
+
+
+_PROVIDER_CATALOG_SCOPE_LOOKUP = _build_provider_catalog_scope_lookup()
+
+
+def _resolve_provider_catalog_scope(provider_name: str) -> ProviderCatalogScope:
+    normalized_name = normalize_provider_key(provider_name)
+    scope = _PROVIDER_CATALOG_SCOPE_LOOKUP.get(normalized_name)
+    if scope is not None:
+        return scope
+
+    choices = ", ".join(_PROVIDER_CATALOG_VISIBLE_CHOICES)
+    raise ValueError(f"Unknown provider '{provider_name}'. Choose one of: {choices}")
+
+
+def _print_section_header(title: str, color: str = "blue") -> None:
+    """Render section headers with compact a3 styling."""
+    header = build_a3_section_header(title, color=color, include_dot=False)
+    console.print()
+    console.print(header)
+    console.print()
+
+
+def _get_named_alias_rows(config_payload: dict[str, Any] | None) -> list[tuple[str, str]]:
+    if not isinstance(config_payload, dict):
+        return []
+
+    references_payload = config_payload.get("model_references")
+    if not isinstance(references_payload, dict):
+        return []
+
+    rows: list[tuple[str, str]] = []
+    for namespace, entries in sorted(references_payload.items(), key=lambda item: str(item[0])):
+        if not isinstance(namespace, str) or not isinstance(entries, dict):
+            continue
+        for alias_name, model in sorted(entries.items(), key=lambda item: str(item[0])):
+            if not isinstance(alias_name, str) or not isinstance(model, str):
+                continue
+            alias_token = f"${namespace}.{alias_name}"
+            rows.append((alias_token, model))
+    return rows
+
+
+def _resolve_active_model_providers(
+    *,
+    api_keys: dict[str, dict[str, str]],
+    config_payload: dict[str, Any] | None,
+    start_path: Path,
+    home: Path | None,
+) -> set[Provider]:
+    active_providers: set[Provider] = set()
+
+    for provider_name, status in api_keys.items():
+        if not status.get("env") and not status.get("config"):
+            continue
+        try:
+            active_providers.add(Provider(provider_name))
+        except ValueError:
+            continue
+
+    config_mapping: dict[str, Any] = config_payload if isinstance(config_payload, dict) else {}
+    active_providers.update(
+        ModelSelectionCatalog.configured_providers(
+            config_mapping,
+            start_path=start_path,
+            home=home,
+        )
+    )
+    return active_providers
+
+
+def find_config_files(start_path: Path, home: Path | None = None) -> dict[str, Path | None]:
+    """Find FastAgent configuration files using home then cwd discovery."""
+    resolved_home = resolve_fast_agent_home(cwd=start_path, cli_override=home)
+    discovery = discover_config_files(cwd=start_path, home=resolved_home)
+    return {
+        "config": discovery.config_path,
+        "secrets": discovery.secrets_path,
+    }
+
+
+def get_system_info() -> dict:
+    """Get system information including Python version, OS, etc."""
+    return {
+        "platform": platform.system(),
+        "platform_version": platform.version(),
+        "python_version": sys.version,
+        "python_path": sys.executable,
+    }
+
+
+def get_secrets_summary(secrets_path: Path | None) -> dict:
+    """Extract information from the secrets file."""
+    result = {
+        "status": "not_found",  # Default status: not found
+        "error": None,
+        "secrets": {},
+    }
+
+    if not secrets_path:
+        return result
+
+    if not secrets_path.exists():
+        result["status"] = "not_found"
+        return result
+
+    # File exists, attempt to parse
+    try:
+        with secrets_path.open("r") as f:
+            secrets = yaml.safe_load(f)
+
+        # Mark as successfully parsed
+        result["status"] = "parsed"
+        result["secrets"] = secrets or {}
+
+    except Exception as e:
+        # File exists but has parse errors
+        result["status"] = "error"
+        result["error"] = str(e)
+        console.print(f"[yellow]Warning:[/yellow] Error parsing secrets file: {e}")
+
+    return result
+
+
+def _empty_api_key_results() -> dict[str, dict[str, str]]:
+    return {
+        provider.config_name: {"env": "", "config": ""}
+        for provider in Provider
+        if provider not in {Provider.FAST_AGENT, Provider.ANTHROPIC_VERTEX}
+    }
+
+
+def _mask_configured_secret(secret_value: str) -> str:
+    if len(secret_value) > 5:
+        return f"...{secret_value[-5:]}"
+    return "...***"
+
+
+def _parsed_main_config(config_summary: dict[str, Any]) -> dict[str, Any]:
+    if config_summary.get("status") != "parsed":
+        return {}
+    config_payload = config_summary.get("config")
+    return config_payload if isinstance(config_payload, dict) else {}
+
+
+def _resolve_azure_key_source(
+    *,
+    secrets_status: object,
+    secrets: dict[str, Any],
+    config_azure: dict[str, Any],
+) -> dict[str, Any]:
+    if secrets_status == "parsed" and "azure" in secrets:
+        azure_cfg = secrets.get("azure", {})
+        return azure_cfg if isinstance(azure_cfg, dict) else {}
+    return config_azure
+
+
+def _resolve_azure_default_credential_label(
+    provider_name: str,
+    *,
+    secrets_status: object,
+    secrets: dict[str, Any],
+    config_azure: dict[str, Any],
+) -> str | None:
+    if provider_name != "azure":
+        return None
+
+    azure_cfg = _resolve_azure_key_source(
+        secrets_status=secrets_status,
+        secrets=secrets,
+        config_azure=config_azure,
+    )
+    use_default_cred = azure_cfg.get("use_default_azure_credential", False)
+    base_url = azure_cfg.get("base_url")
+    if use_default_cred and base_url:
+        return "DefaultAzureCredential"
+    return None
+
+
+def _resolve_google_vertex_label(
+    provider_name: str,
+    *,
+    main_config: dict[str, Any],
+) -> str | None:
+    if provider_name != Provider.GOOGLE.config_name:
+        return None
+
+    google_payload = main_config.get("google", {})
+    google_cfg = google_payload if isinstance(google_payload, dict) else {}
+    vertex_payload = google_cfg.get("vertex_ai", {})
+    vertex_cfg = vertex_payload if isinstance(vertex_payload, dict) else {}
+    if vertex_cfg.get("enabled") is True:
+        return "Vertex AI ADC"
+    return None
+
+
+def _resolve_provider_config_key(
+    provider_name: str,
+    *,
+    secrets_status: object,
+    secrets: dict[str, Any],
+    main_config: dict[str, Any],
+) -> str | None:
+    config_key: str | None = None
+    if secrets_status == "parsed":
+        config_key = ProviderKeyManager.get_config_file_key(provider_name, secrets)
+
+    if main_config and (not config_key or config_key == API_KEY_HINT_TEXT):
+        config_key = ProviderKeyManager.get_config_file_key(provider_name, main_config)
+
+    if not config_key or config_key == API_KEY_HINT_TEXT:
+        return None
+    return _mask_configured_secret(config_key)
+
+
+def _resolve_huggingface_login_label(provider_name: str) -> str | None:
+    if provider_name not in {Provider.HUGGINGFACE.config_name, "huggingface"}:
+        return None
+
+    return "Hub login" if is_huggingface_hub_logged_in() else None
+
+
+def _resolve_codex_oauth_label(provider_name: str) -> str | None:
+    if provider_name != Provider.CODEX_RESPONSES.config_name:
+        return None
+
+    try:
+        from fast_agent.llm.provider.openai.codex_oauth import get_codex_token_status
+
+        codex_status = get_codex_token_status()
+    except Exception:
+        codex_status = {"present": False, "source": None}
+
+    if not codex_status.get("present"):
+        return None
+
+    source_label = codex_oauth_source_label(codex_status.get("source"))
+
+    if codex_status.get("expired"):
+        return f"Expired {source_label}"
+    return source_label
+
+
+def _resolve_anthropic_sdk_credentials_label(provider_name: str) -> str | None:
+    if provider_name != Provider.ANTHROPIC.config_name:
+        return None
+
+    try:
+        from anthropic import AsyncAnthropic
+    except Exception:
+        return None
+
+    try:
+        client = AsyncAnthropic()
+    except Exception:
+        return None
+
+    if client.auth_token is not None:
+        return "ANTHROPIC_AUTH_TOKEN"
+    if client.credentials is not None:
+        return "Anthropic SDK credentials"
+    return None
+
+
+def check_api_keys(secrets_summary: dict, config_summary: dict) -> dict:
+    """Check if API keys are configured in secrets file or environment, including Azure DefaultAzureCredential.
+    Now also checks Azure config in main config file for retrocompatibility.
+    """
+
+    results = _empty_api_key_results()
+    secrets_payload = secrets_summary.get("secrets", {})
+    secrets = secrets_payload if isinstance(secrets_payload, dict) else {}
+    secrets_status = secrets_summary.get("status", "not_found")
+    main_config = _parsed_main_config(config_summary)
+    config_azure_payload = main_config.get("azure", {})
+    config_azure = config_azure_payload if isinstance(config_azure_payload, dict) else {}
+
+    for provider_name, status in results.items():
+        env_key_name = ProviderKeyManager.get_env_key_name(provider_name)
+        env_key_value = os.environ.get(env_key_name) if env_key_name else None
+        if env_key_value:
+            status["env"] = _mask_configured_secret(env_key_value)
+
+        azure_label = _resolve_azure_default_credential_label(
+            provider_name,
+            secrets_status=secrets_status,
+            secrets=secrets,
+            config_azure=config_azure,
+        )
+        if azure_label is not None:
+            status["config"] = azure_label
+            continue
+
+        google_vertex_label = _resolve_google_vertex_label(
+            provider_name,
+            main_config=main_config,
+        )
+        if google_vertex_label is not None:
+            status["config"] = google_vertex_label
+            continue
+
+        config_key = _resolve_provider_config_key(
+            provider_name,
+            secrets_status=secrets_status,
+            secrets=secrets,
+            main_config=main_config,
+        )
+        if config_key is not None:
+            status["config"] = config_key
+
+        if status["env"] or status["config"]:
+            continue
+
+        anthropic_sdk_label = _resolve_anthropic_sdk_credentials_label(provider_name)
+        if anthropic_sdk_label is not None:
+            status["config"] = anthropic_sdk_label
+            continue
+
+        huggingface_label = _resolve_huggingface_login_label(provider_name)
+        if huggingface_label is not None:
+            status["config"] = huggingface_label
+            continue
+
+        codex_label = _resolve_codex_oauth_label(provider_name)
+        if codex_label is not None:
+            status["config"] = codex_label
+
+    return results
+
+
+def get_fastagent_version() -> str:
+    """Get the installed version of FastAgent."""
+    try:
+        return version("fast-agent-mcp")
+    except Exception:
+        return "unknown"
+
+
+def _default_logger_summary(default_settings: Any) -> dict[str, Any]:
+    return {
+        "level": default_settings.logger.level,
+        "type": default_settings.logger.type,
+        "streaming": default_settings.logger.streaming,
+        "theme_file": default_settings.logger.theme_file,
+        "code_theme": default_settings.logger.code_theme,
+        "apply_patch_preview_max_lines": default_settings.logger.apply_patch_preview_max_lines,
+        "render_fences_with_syntax": default_settings.logger.render_fences_with_syntax,
+        "code_word_wrap": default_settings.logger.code_word_wrap,
+        "progress_display": default_settings.logger.progress_display,
+        "show_chat": default_settings.logger.show_chat,
+        "show_tools": default_settings.logger.show_tools,
+        "truncate_tools": default_settings.logger.truncate_tools,
+        "enable_markup": default_settings.logger.enable_markup,
+        "enable_prompt_marks": default_settings.logger.enable_prompt_marks,
+    }
+
+
+def _build_default_config_summary(default_settings: Any) -> dict[str, Any]:
+    diagnostics = default_settings.mcp.diagnostics
+    return {
+        "status": "not_found",
+        "error": None,
+        "default_model": default_settings.default_model,
+        "logger": _default_logger_summary(default_settings),
+        "timeline": {
+            "enabled": diagnostics.enabled,
+            "steps": diagnostics.timeline.steps,
+            "step_seconds": diagnostics.timeline.step_seconds,
+        },
+        "mcp_servers": [],
+        "skills_directories": None,
+    }
+
+
+def _build_logger_summary(
+    logger_config: dict[str, Any],
+    *,
+    default_settings: Any,
+) -> dict[str, Any]:
+    return {
+        "level": logger_config.get("level", default_settings.logger.level),
+        "type": logger_config.get("type", default_settings.logger.type),
+        "streaming": logger_config.get("streaming", default_settings.logger.streaming),
+        "theme_file": logger_config.get("theme_file", default_settings.logger.theme_file),
+        "code_theme": logger_config.get("code_theme", default_settings.logger.code_theme),
+        "apply_patch_preview_max_lines": logger_config.get(
+            "apply_patch_preview_max_lines",
+            default_settings.logger.apply_patch_preview_max_lines,
+        ),
+        "render_fences_with_syntax": logger_config.get(
+            "render_fences_with_syntax",
+            default_settings.logger.render_fences_with_syntax,
+        ),
+        "code_word_wrap": logger_config.get(
+            "code_word_wrap",
+            default_settings.logger.code_word_wrap,
+        ),
+        "progress_display": logger_config.get(
+            "progress_display",
+            default_settings.logger.progress_display,
+        ),
+        "show_chat": logger_config.get("show_chat", default_settings.logger.show_chat),
+        "show_tools": logger_config.get("show_tools", default_settings.logger.show_tools),
+        "truncate_tools": logger_config.get(
+            "truncate_tools",
+            default_settings.logger.truncate_tools,
+        ),
+        "enable_markup": logger_config.get(
+            "enable_markup",
+            default_settings.logger.enable_markup,
+        ),
+        "enable_prompt_marks": logger_config.get(
+            "enable_prompt_marks",
+            default_settings.logger.enable_prompt_marks,
+        ),
+    }
+
+
+def _resolve_timeline_summary(
+    config: dict[str, Any],
+    *,
+    default_settings: Any,
+) -> dict[str, int | bool]:
+    default_diagnostics = default_settings.mcp.diagnostics
+    timeline = {
+        "enabled": default_diagnostics.enabled,
+        "steps": default_diagnostics.timeline.steps,
+        "step_seconds": default_diagnostics.timeline.step_seconds,
+    }
+    raw_mcp = config.get("mcp")
+    if not isinstance(raw_mcp, dict):
+        return timeline
+    raw_diagnostics = raw_mcp.get("diagnostics")
+    if not isinstance(raw_diagnostics, dict):
+        return timeline
+
+    from fast_agent.config import MCPDiagnosticsSettings
+
+    try:
+        diagnostics = MCPDiagnosticsSettings(**raw_diagnostics)
+    except Exception as exc:  # pragma: no cover - defensive
+        console.print(
+            "[yellow]Warning:[/yellow] Invalid mcp.diagnostics configuration; using defaults."
+        )
+        console.print(f"[yellow]Details:[/yellow] {exc}")
+        return timeline
+
+    return {
+        "enabled": diagnostics.enabled,
+        "steps": diagnostics.timeline.steps,
+        "step_seconds": diagnostics.timeline.step_seconds,
+    }
+
+
+def _truncate_server_display(value: str) -> str:
+    return _truncate_summary_text(value, 60)
+
+
+def _resolve_mcp_server_transport(server_config: dict[str, Any]) -> tuple[str, str]:
+    url = str(server_config.get("url", "") or "")
+    if not url:
+        return "STDIO", ""
+
+    try:
+        from .url_parser import parse_server_url
+
+        _, transport_type, _ = parse_server_url(url)
+        transport = transport_type.upper()
+    except Exception:
+        transport = "HTTP"
+    return transport, _truncate_server_display(url)
+
+
+def _resolve_mcp_server_command(server_config: dict[str, Any]) -> str:
+    command = str(server_config.get("command", "") or "")
+    if not command:
+        return ""
+
+    args = server_config.get("args", [])
+    if not args:
+        return command
+
+    args_str = " ".join(str(arg) for arg in args)
+    return _truncate_server_display(f"{command} {args_str}")
+
+
+def _build_mcp_server_summaries(config: dict[str, Any]) -> list[dict[str, str]]:
+    mcp_config = config.get("mcp")
+    if not isinstance(mcp_config, dict):
+        return []
+
+    servers_config = mcp_config.get("servers")
+    if not isinstance(servers_config, dict):
+        return []
+
+    server_summaries: list[dict[str, str]] = []
+    for server_name, server_config in servers_config.items():
+        if not isinstance(server_name, str) or not isinstance(server_config, dict):
+            continue
+        transport, url = _resolve_mcp_server_transport(server_config)
+        server_summaries.append(
+            {
+                "name": server_name,
+                "transport": transport,
+                "command": _resolve_mcp_server_command(server_config),
+                "url": url,
+            }
+        )
+    return server_summaries
+
+
+def _extract_skills_directories(config: dict[str, Any]) -> list[str] | None:
+    skills_cfg = config.get("skills")
+    if not isinstance(skills_cfg, dict):
+        return None
+
+    directory_value = skills_cfg.get("directories")
+    if not isinstance(directory_value, list):
+        return None
+
+    cleaned = _clean_string_values(directory_value)
+    return cleaned or None
+
+
+def _clean_string_values(values: Iterable[object]) -> list[str]:
+    return [cleaned for value in values if (cleaned := strip_to_none(str(value))) is not None]
+
+
+def get_config_summary(config_path: Path | None) -> dict:
+    """Extract key information from the configuration file."""
+    from fast_agent.config import Settings
+
+    default_settings = Settings()
+    result = _build_default_config_summary(default_settings)
+
+    if not config_path:
+        return result
+
+    if not config_path.exists():
+        result["status"] = "not_found"
+        return result
+
+    # File exists, attempt to parse
+    try:
+        with config_path.open("r") as f:
+            config = yaml.safe_load(f)
+
+        result["status"] = "parsed"
+        result["config"] = config
+
+        if not config:
+            return result
+
+        if not isinstance(config, dict):
+            return result
+
+        if "default_model" in config:
+            result["default_model"] = config["default_model"]
+        logger_config = config.get("logger")
+        if isinstance(logger_config, dict):
+            result["logger"] = _build_logger_summary(
+                logger_config,
+                default_settings=default_settings,
+            )
+        result["timeline"] = _resolve_timeline_summary(
+            config,
+            default_settings=default_settings,
+        )
+        result["mcp_servers"] = _build_mcp_server_summaries(config)
+        result["skills_directories"] = _extract_skills_directories(config)
+
+    except Exception as e:
+        # File exists but has parse errors
+        result["status"] = "error"
+        result["error"] = str(e)
+        console.print(f"[red]Error parsing configuration file:[/red] {e}")
+
+    return result
+
+
+def _load_catalog_config(home: Path | None) -> dict[str, Any] | None:
+    from fast_agent.config import load_implicit_settings
+
+    config_payload, _ = load_implicit_settings(start_path=Path.cwd(), home=home)
+    return config_payload or None
+
+
+def show_models_overview(home: Path | None = None) -> None:
+    """Show providers accepted by `fast-agent check models <provider>` and alias status."""
+    cwd = Path.cwd()
+    config_files = find_config_files(cwd, home=home)
+    config_summary = get_config_summary(config_files["config"])
+    secrets_summary = get_secrets_summary(config_files["secrets"])
+    api_keys = check_api_keys(secrets_summary, config_summary)
+    config_payload = _load_catalog_config(home)
+    active_providers = _resolve_active_model_providers(
+        api_keys=api_keys,
+        config_payload=config_payload,
+        start_path=cwd,
+        home=home,
+    )
+
+    _print_section_header("Model Catalog", color="blue")
+
+    provider_table = Table(show_header=True, box=None)
+    provider_table.add_column("Provider Arg", style="cyan", header_style="bold bright_white")
+    provider_table.add_column("Scope", style="white", header_style="bold bright_white")
+    provider_table.add_column("Active", justify="center", header_style="bold bright_white")
+
+    for scope_name in _PROVIDER_CATALOG_VISIBLE_CHOICES:
+        scope = _PROVIDER_CATALOG_SCOPES_BY_KEY.get(scope_name)
+        if scope is None:
+            continue
+        if len(scope.providers) > 1:
+            scope_label = ", ".join(provider.display_name for provider in scope.providers)
+            scope_text = f"{scope_label} (family)"
+        elif scope_name in {"responses", "codexresponses"}:
+            scope_text = f"{scope.providers[0].display_name} (direct)"
+        else:
+            scope_text = scope.providers[0].display_name
+        is_active = any(provider in active_providers for provider in scope.providers)
+        active_symbol = "[bold green]✓[/bold green]" if is_active else "[dim]✗[/dim]"
+        provider_table.add_row(scope_name, scope_text, active_symbol)
+
+    console.print(provider_table)
+
+    alias_rows = sorted(_PROVIDER_CATALOG_SCOPE_ALIASES.items())
+    if alias_rows:
+        alias_table = Table(show_header=True, box=None)
+        alias_table.add_column("Arg Alias", style="cyan", header_style="bold bright_white")
+        alias_table.add_column("Resolves To", style="white", header_style="bold bright_white")
+        for alias, target in alias_rows:
+            alias_table.add_row(alias, target)
+        console.print(alias_table)
+
+    _print_section_header("Named Model Aliases", color="blue")
+    alias_rows = _get_named_alias_rows(config_payload)
+    if alias_rows:
+        alias_table = Table(show_header=True, box=None)
+        alias_table.add_column("Alias", style="magenta", header_style="bold bright_white")
+        alias_table.add_column("Resolves To", style="green", header_style="bold bright_white")
+
+        for alias_token, model in alias_rows:
+            alias_table.add_row(alias_token, model)
+        console.print(alias_table)
+    else:
+        console.print("[dim]No model_references configured in fast-agent.yaml[/dim]")
+
+    console.print()
+    console.print(
+        "Use [cyan]fast-agent check models <provider>[/cyan] to inspect provider models and aliases."
+    )
+    console.print(
+        "Use [cyan]fast-agent check models <provider> --all[/cyan] to list every known model."
+    )
+
+
+def _load_all_models_by_provider(
+    scope: ProviderCatalogScope,
+    *,
+    config_payload: dict[str, Any] | None,
+    overlay_registry: ModelOverlayRegistry,
+) -> dict[Provider, list[str]]:
+    return {
+        provider: ModelSelectionCatalog.list_all_models(
+            provider,
+            config=config_payload,
+            overlay_registry=overlay_registry,
+        )
+        for provider in scope.providers
+    }
+
+
+def _build_curated_models_table(
+    scope: ProviderCatalogScope,
+    *,
+    overlay_registry: ModelOverlayRegistry,
+) -> tuple[Table, dict[Provider, set[str]], int]:
+    curated_table = Table(show_header=True, box=None)
+    curated_table.add_column("Provider", style="white", header_style="bold bright_white")
+    curated_table.add_column("Alias", style="magenta", header_style="bold bright_white")
+    curated_table.add_column("Tags", style="cyan", header_style="bold bright_white")
+    curated_table.add_column(
+        "Model",
+        style="green",
+        header_style="bold bright_white",
+        overflow="fold",
+    )
+
+    row_count = 0
+    curated_models_by_provider: dict[Provider, set[str]] = {}
+    for provider in scope.providers:
+        provider_entries = ModelSelectionCatalog.list_current_entries(
+            provider,
+            overlay_registry=overlay_registry,
+        )
+        curated_models_by_provider[provider] = {entry.model for entry in provider_entries}
+        for entry in provider_entries:
+            curated_table.add_row(
+                provider.display_name,
+                entry.alias if entry.alias else "[dim]-[/dim]",
+                "fast" if entry.fast else "[dim]-[/dim]",
+                entry.model,
+            )
+            row_count += 1
+
+    return curated_table, curated_models_by_provider, row_count
+
+
+def _has_additional_provider_models(
+    *,
+    all_models_by_provider: dict[Provider, list[str]],
+    curated_models_by_provider: dict[Provider, set[str]],
+) -> bool:
+    return any(
+        any(model not in curated_models_by_provider.get(provider, set()) for model in all_models)
+        for provider, all_models in all_models_by_provider.items()
+    )
+
+
+def _build_all_models_table(
+    scope: ProviderCatalogScope,
+    *,
+    all_models_by_provider: dict[Provider, list[str]],
+    curated_models_by_provider: dict[Provider, set[str]],
+) -> tuple[Table, int]:
+    all_models_table = Table(show_header=True, box=None)
+    all_models_table.add_column("Provider", style="white", header_style="bold bright_white")
+    all_models_table.add_column("Tags", style="cyan", header_style="bold bright_white")
+    all_models_table.add_column(
+        "Model",
+        style="green",
+        header_style="bold bright_white",
+        overflow="fold",
+    )
+
+    all_row_count = 0
+    for provider in scope.providers:
+        models = all_models_by_provider.get(provider, [])
+        curated_models = curated_models_by_provider.get(provider, set())
+        if not models:
+            all_models_table.add_row(provider.display_name, "[dim]-[/dim]", "[dim]-[/dim]")
+            all_row_count += 1
+            continue
+
+        for model in models:
+            labels: list[str] = []
+            if ModelSelectionCatalog.is_fast_model(model):
+                labels.append("fast")
+            if model in curated_models:
+                labels.append("catalog")
+            all_models_table.add_row(
+                provider.display_name,
+                " • ".join(labels) if labels else "[dim]-[/dim]",
+                model,
+            )
+            all_row_count += 1
+
+    return all_models_table, all_row_count
+
+
+def show_provider_model_catalog(
+    provider_name: str,
+    *,
+    show_all: bool = False,
+    home: Path | None = None,
+) -> None:
+    """Show provider model catalog with curated entries first."""
+    scope = _resolve_provider_catalog_scope(provider_name)
+    config_payload = _load_catalog_config(home)
+    overlay_registry = load_model_overlay_registry(start_path=Path.cwd(), home=home)
+    all_models_by_provider = _load_all_models_by_provider(
+        scope,
+        config_payload=config_payload,
+        overlay_registry=overlay_registry,
+    )
+
+    mode = "curated + all models" if show_all else "curated"
+    _print_section_header(f"{scope.display_name} model catalog ({mode})", color="blue")
+
+    curated_table, curated_models_by_provider, row_count = _build_curated_models_table(
+        scope,
+        overlay_registry=overlay_registry,
+    )
+    if row_count == 0:
+        console.print("[yellow]No curated models found for this provider scope.[/yellow]")
+    else:
+        console.print(curated_table)
+
+    has_additional_models = _has_additional_provider_models(
+        all_models_by_provider=all_models_by_provider,
+        curated_models_by_provider=curated_models_by_provider,
+    )
+
+    if not show_all:
+        if has_additional_models:
+            console.print(
+                f"[dim]More models are available. Run [cyan]fast-agent check models {provider_name} --all[/cyan] "
+                "for the complete catalog.[/dim]"
+            )
+        return
+
+    _print_section_header("All known models", color="blue")
+    all_models_table, all_row_count = _build_all_models_table(
+        scope,
+        all_models_by_provider=all_models_by_provider,
+        curated_models_by_provider=curated_models_by_provider,
+    )
+    if all_row_count:
+        console.print(all_models_table)
+
+
+def _split_model_specs(raw_models: str) -> list[str]:
+    return _clean_string_values(raw_models.split(","))
+
+
+def _build_model_references(config_payload: dict[str, Any] | None) -> dict[str, str]:
+    aliases = ModelFactory.get_runtime_presets()
+
+    if not isinstance(config_payload, dict):
+        return aliases
+
+    alias_tree = config_payload.get("model_references")
+    if not isinstance(alias_tree, dict):
+        return aliases
+
+    for namespace, entries in alias_tree.items():
+        if not isinstance(namespace, str) or not isinstance(entries, dict):
+            continue
+        for alias_name, model_spec in entries.items():
+            if not isinstance(alias_name, str) or not isinstance(model_spec, str):
+                continue
+            token = f"${namespace}.{alias_name}"
+            aliases[token] = model_spec
+            aliases[f"{namespace}.{alias_name}"] = model_spec
+
+    return aliases
+
+
+def _resolve_model_secret_entry(
+    spec: str,
+    *,
+    aliases: dict[str, str],
+    api_keys: dict[str, dict[str, str]],
+) -> tuple[dict[str, Any], str | None]:
+    parsed = ModelFactory.parse_model_string(spec, presets=aliases)
+    provider = parsed.provider
+    provider_key = provider.config_name
+    env_var_value = ProviderKeyManager.get_env_key_name(provider_key)
+    env_var = env_var_value if isinstance(env_var_value, str) else None
+    provider_status = api_keys.get(provider_key, {})
+    return (
+        {
+            "input": spec,
+            "resolved_model": parsed.model_name,
+            "provider": provider_key,
+            "provider_display": provider.display_name,
+            "required_env": env_var,
+            "local_env_present": bool(provider_status.get("env")),
+            "local_config_present": bool(provider_status.get("config")),
+        },
+        env_var,
+    )
+
+
+def _resolve_model_secret_entries(
+    specs: list[str],
+    *,
+    aliases: dict[str, str],
+    api_keys: dict[str, dict[str, str]],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    resolved_entries: list[dict[str, Any]] = []
+    unique_secret_envs: list[str] = []
+
+    for spec in specs:
+        try:
+            entry, env_var = _resolve_model_secret_entry(
+                spec,
+                aliases=aliases,
+                api_keys=api_keys,
+            )
+            resolved_entries.append(entry)
+            if env_var is not None and env_var not in unique_secret_envs:
+                unique_secret_envs.append(env_var)
+        except Exception as exc:
+            resolved_entries.append({"input": spec, "error": str(exc)})
+
+    return resolved_entries, unique_secret_envs
+
+
+def _build_model_secret_payload(
+    *,
+    specs: list[str],
+    resolved_entries: list[dict[str, Any]],
+    unique_secret_envs: list[str],
+) -> dict[str, Any]:
+    return {
+        "models": specs,
+        "resolved": resolved_entries,
+        "candidate_secret_env_vars": unique_secret_envs,
+        "safety_rule": (
+            "Pass secret names only; never pass secret values via CLI arguments. "
+            "Use secure job secret references (for example --secrets ENV_VAR_NAME)."
+        ),
+    }
+
+
+def _render_model_secret_requirements_table(
+    *,
+    resolved_entries: list[dict[str, Any]],
+    unique_secret_envs: list[str],
+) -> None:
+    _print_section_header("Model secret requirements", color="blue")
+
+    results_table = Table(show_header=True, box=None)
+    results_table.add_column("Input", style="cyan", header_style="bold bright_white")
+    results_table.add_column("Provider", style="white", header_style="bold bright_white")
+    results_table.add_column("Resolved Model", style="green", header_style="bold bright_white")
+    results_table.add_column("Required Env", style="magenta", header_style="bold bright_white")
+    results_table.add_column("Local Key Status", style="yellow", header_style="bold bright_white")
+
+    for entry in resolved_entries:
+        if entry.get("error"):
+            results_table.add_row(
+                entry.get("input", "?"),
+                "[red]unresolved[/red]",
+                "[red]-[/red]",
+                "[red]-[/red]",
+                f"[red]{entry['error']}[/red]",
+            )
+            continue
+
+        local_bits: list[str] = []
+        if entry.get("local_env_present"):
+            local_bits.append("env")
+        if entry.get("local_config_present"):
+            local_bits.append("config")
+        local_status = " + ".join(local_bits) if local_bits else "missing"
+
+        results_table.add_row(
+            entry["input"],
+            entry["provider_display"],
+            entry["resolved_model"],
+            entry["required_env"],
+            local_status,
+        )
+
+    console.print(results_table)
+
+    if unique_secret_envs:
+        console.print()
+        console.print(
+            "[bold]Candidate secret env var names:[/bold] " + ", ".join(unique_secret_envs)
+        )
+
+    console.print()
+    console.print(
+        "[bold yellow]IMPORTANT:[/bold yellow] Never pass secret values through command arguments. "
+        "Forward secret [bold]names[/bold] only via secure secret stores (for example: "
+        "[cyan]hf jobs ... --secrets OPENAI_API_KEY[/cyan])."
+    )
+
+
+def show_model_secret_requirements(
+    models: str,
+    *,
+    home: Path | None = None,
+    json_output: bool = False,
+) -> None:
+    """Show provider + secret-env requirements for one or more model specs."""
+
+    specs = _split_model_specs(models)
+    if not specs:
+        raise ValueError("No model values provided. Pass one or more model specs.")
+
+    config_files = find_config_files(Path.cwd(), home=home)
+    config_summary = get_config_summary(config_files["config"])
+    secrets_summary = get_secrets_summary(config_files["secrets"])
+    api_keys = check_api_keys(secrets_summary, config_summary)
+    config_payload = _load_catalog_config(home)
+    aliases = _build_model_references(config_payload)
+    resolved_entries, unique_secret_envs = _resolve_model_secret_entries(
+        specs,
+        aliases=aliases,
+        api_keys=api_keys,
+    )
+    payload = _build_model_secret_payload(
+        specs=specs,
+        resolved_entries=resolved_entries,
+        unique_secret_envs=unique_secret_envs,
+    )
+
+    if json_output:
+        console.print(json.dumps(payload, indent=2, sort_keys=True))
+        return
+
+    _render_model_secret_requirements_table(
+        resolved_entries=resolved_entries,
+        unique_secret_envs=unique_secret_envs,
+    )
+
+
+def _effective_home_override(
+    *,
+    home: Path | None,
+    config_summary: dict[str, Any],
+) -> str | Path:
+    if home is not None:
+        return home
+
+    home_override = os.getenv("FAST_AGENT_HOME")
+    normalized_home_override = strip_str_to_none(home_override)
+    if normalized_home_override is not None:
+        return normalized_home_override
+
+    config_payload = config_summary.get("config")
+    if isinstance(config_payload, dict):
+        configured_home = config_payload.get("home")
+        normalized_configured_home = strip_str_to_none(configured_home)
+        if normalized_configured_home is not None:
+            return normalized_configured_home
+
+    return DEFAULT_HOME_DIR
+
+
+def _validate_effective_settings(
+    *,
+    cwd: Path,
+    config_files: dict[str, Path | None],
+    home_override: str | Path,
+) -> str | None:
+    from fast_agent.config import (
+        Settings,
+        deep_merge,
+        load_implicit_settings,
+        load_yaml_mapping,
+    )
+
+    try:
+        merged_settings, discovery = load_implicit_settings(start_path=cwd, home=home_override)
+
+        secrets_path = discovery.secrets_path or config_files.get("secrets")
+        if isinstance(secrets_path, Path):
+            merged_settings = deep_merge(merged_settings, load_yaml_mapping(secrets_path))
+
+        Settings(**merged_settings)
+    except Exception as exc:
+        return str(exc)
+
+    return None
+
+
+@dataclass(frozen=True)
+class _CheckSummaryContext:
+    cwd: Path
+    search_root: Path
+    config_files: dict[str, Path | None]
+    system_info: dict[str, str]
+    config_summary: dict[str, Any]
+    secrets_summary: dict[str, Any]
+    api_keys: dict[str, dict[str, str]]
+    fastagent_version: str
+    home_override: str | Path
+    effective_settings_error: str | None
+    keyring: Any | None
+    keyring_status: KeyringStatus
+    skills_dirs: list[Path]
+    skills_manifests: list[SkillManifest]
+    skill_errors: list[dict[str, str]]
+    home_paths: HomePaths
+    server_names: set[str] | None
+    overlay_preset_collision_messages: tuple[str, ...]
+    environment_rows: tuple[tuple[str, str, str, str], ...]
+
+
+def _relative_summary_path(search_root: Path, path: Path) -> str:
+    try:
+        return str(path.relative_to(search_root))
+    except ValueError:
+        return str(path)
+
+
+def _truncate_summary_text(text: str, length: int = 70) -> str:
+    if len(text) <= length:
+        return text
+    return text[: length - 3] + "..."
+
+
+def _load_optional_keyring_module() -> Any | None:
+    try:
+        import keyring as keyring_module
+
+        return keyring_module
+    except Exception:
+        return None
+
+
+def _collect_environment_rows(
+    *,
+    cwd: Path,
+    config_files: dict[str, Path | None],
+    home_override: str | Path,
+) -> tuple[tuple[str, str, str, str], ...]:
+    from fast_agent.config import (
+        Settings,
+        deep_merge,
+        load_implicit_settings,
+        load_yaml_mapping,
+    )
+    from fast_agent.tools.environment_config import LocalEnvironmentSpec
+    from fast_agent.tools.environment_factory import build_environment
+
+    try:
+        merged_settings, discovery = load_implicit_settings(start_path=cwd, home=home_override)
+        secrets_path = discovery.secrets_path or config_files.get("secrets")
+        if isinstance(secrets_path, Path):
+            merged_settings = deep_merge(merged_settings, load_yaml_mapping(secrets_path))
+        settings = Settings(**merged_settings)
+    except Exception as exc:
+        return (("config", "-", "", f"[orange_red1]{exc}[/orange_red1]"),)
+
+    environment_specs = dict(settings.environments)
+    environment_specs.setdefault("local", LocalEnvironmentSpec())
+    valid_names = ", ".join(sorted(environment_specs))
+    rows: list[tuple[str, str, str, str]] = []
+    for name, spec in sorted(environment_specs.items(), key=lambda item: item[0]):
+        default_marker = "[green]yes[/green]" if name == settings.default_environment else ""
+        try:
+            environment = build_environment(
+                spec,
+                settings=settings,
+                workspace_root=cwd,
+                name=name,
+            )
+            runtime_info = environment.runtime_info()
+            detail = runtime_info.provider or runtime_info.kind
+            status = f"[green]valid[/green] ({detail})"
+        except Exception as exc:
+            status = f"[orange_red1]{exc}[/orange_red1] [dim]Valid names: {valid_names}[/dim]"
+        rows.append((name, spec.type, default_marker, status))
+    return tuple(rows)
+
+
+def _build_check_summary_context(home: Path | None) -> _CheckSummaryContext:
+    cwd = Path.cwd()
+    resolved_home = resolve_fast_agent_home(cwd=cwd, cli_override=home)
+    search_root = resolved_home.path if resolved_home is not None else cwd
+    config_files = find_config_files(cwd, home=home)
+    system_info = get_system_info()
+    config_summary = get_config_summary(config_files["config"])
+    secrets_summary = get_secrets_summary(config_files["secrets"])
+    api_keys = check_api_keys(secrets_summary, config_summary)
+    fastagent_version = get_fastagent_version()
+    home_override = _effective_home_override(
+        home=home,
+        config_summary=config_summary,
+    )
+    effective_settings_error = _validate_effective_settings(
+        cwd=cwd,
+        config_files=config_files,
+        home_override=home_override,
+    )
+    keyring = _load_optional_keyring_module()
+    keyring_status = get_keyring_status()
+
+    skills_override = config_summary.get("skills_directories")
+    override_directories = (
+        [Path(entry).expanduser() for entry in skills_override]
+        if isinstance(skills_override, list)
+        else None
+    )
+    default_directories = (
+        default_skill_paths(cwd=search_root, override=home_override)
+        if override_directories is None
+        else None
+    )
+    skills_registry = SkillRegistry(
+        base_dir=search_root,
+        directories=override_directories
+        if override_directories is not None
+        else default_directories,
+    )
+    skills_dirs = list(skills_registry.directories)
+    skills_manifests, skill_errors = skills_registry.load_manifests_with_errors()
+    home_paths = resolve_home_paths(cwd=cwd, override=home_override)
+    server_names = _build_server_names_from_config(config_summary)
+    overlay_preset_collision_messages = _collect_overlay_preset_collision_messages(
+        start_path=cwd,
+        home=home_override,
+    )
+    environment_rows = _collect_environment_rows(
+        cwd=cwd,
+        config_files=config_files,
+        home_override=home_override,
+    )
+
+    return _CheckSummaryContext(
+        cwd=cwd,
+        search_root=search_root,
+        config_files=config_files,
+        system_info=system_info,
+        config_summary=config_summary,
+        secrets_summary=secrets_summary,
+        api_keys=api_keys,
+        fastagent_version=fastagent_version,
+        home_override=home_override,
+        effective_settings_error=effective_settings_error,
+        keyring=keyring,
+        keyring_status=keyring_status,
+        skills_dirs=skills_dirs,
+        skills_manifests=skills_manifests,
+        skill_errors=skill_errors,
+        home_paths=home_paths,
+        server_names=server_names,
+        overlay_preset_collision_messages=overlay_preset_collision_messages,
+        environment_rows=environment_rows,
+    )
+
+
+def _built_in_preset_sources() -> dict[str, str]:
+    sources = dict.fromkeys(ModelFactory.MODEL_PRESETS, "built-in model preset")
+    for provider_entries in ModelSelectionCatalog.CATALOG_ENTRIES_BY_PROVIDER.values():
+        for entry in provider_entries:
+            sources.setdefault(entry.alias, "curated model alias")
+    return sources
+
+
+def _collect_overlay_preset_collision_messages(
+    *,
+    start_path: Path,
+    home: str | Path | None,
+) -> tuple[str, ...]:
+    preset_sources = _built_in_preset_sources()
+    overlay_registry = load_model_overlay_registry(start_path=start_path, home=home)
+
+    messages: list[str] = []
+    for overlay in overlay_registry.overlays:
+        source = preset_sources.get(overlay.name)
+        if source is None:
+            continue
+        message = (
+            f'Local model overlay "{overlay.name}" overrides existing {source} "{overlay.name}".'
+        )
+        messages.append(message)
+        logger.info(
+            "Local model overlay overrides existing preset",
+            overlay_name=overlay.name,
+            source=source,
+            overlay_path=str(overlay.manifest_path),
+        )
+
+    return tuple(messages)
+
+
+def _render_environment_summary(context: _CheckSummaryContext) -> None:
+    header_title = f"fast-agent v{context.fastagent_version} ({context.system_info['platform']})"
+    _print_section_header(header_title, color="blue")
+
+    config_path = context.config_files["config"]
+    secrets_path = context.config_files["secrets"]
+    env_table = Table(show_header=False, box=None)
+    env_table.add_column("Setting", style="white")
+    env_table.add_column("Value")
+
+    python_version = ".".join(context.system_info["python_version"].split(".")[:3])
+    env_table.add_row("Python Version", f"[green]{python_version}[/green]")
+    env_table.add_row("Python Path", f"[green]{context.system_info['python_path']}[/green]")
+
+    secrets_status = context.secrets_summary.get("status", "not_found")
+    if secrets_status == "not_found":
+        env_table.add_row("Secrets File", "[yellow]Not found[/yellow]")
+    elif secrets_status == "error":
+        env_table.add_row("Secrets File", f"[orange_red1]Errors[/orange_red1] ({secrets_path})")
+        env_table.add_row(
+            "Secrets Error",
+            f"[orange_red1]{context.secrets_summary.get('error', 'Unknown error')}[/orange_red1]",
+        )
+    else:
+        env_table.add_row("Secrets File", f"[green]Found[/green] ({secrets_path})")
+
+    config_status = context.config_summary.get("status", "not_found")
+    if config_status == "not_found":
+        env_table.add_row("Config File", "[red]Not found[/red]")
+    elif config_status == "error":
+        env_table.add_row("Config File", f"[orange_red1]Errors[/orange_red1] ({config_path})")
+        env_table.add_row(
+            "Config Error",
+            f"[orange_red1]{context.config_summary.get('error', 'Unknown error')}[/orange_red1]",
+        )
+    else:
+        env_table.add_row("Config File", f"[green]Found[/green] ({config_path})")
+        default_model_value = context.config_summary.get("default_model")
+        default_model_display = (
+            f"[green]{default_model_value}[/green]"
+            if default_model_value
+            else "[yellow]Not configured[/yellow]"
+        )
+        env_table.add_row("Default Model", default_model_display)
+
+    if context.effective_settings_error:
+        env_table.add_row("Effective Config", "[orange_red1]Errors[/orange_red1]")
+        env_table.add_row(
+            "Effective Error",
+            f"[orange_red1]{context.effective_settings_error}[/orange_red1]",
+        )
+
+    if context.keyring_status.available:
+        if context.keyring_status.writable:
+            keyring_display = f"[green]{context.keyring_status.name}[/green]"
+        else:
+            keyring_display = f"[yellow]{context.keyring_status.name} (not writable)[/yellow]"
+    else:
+        keyring_display = "[red]not available[/red]"
+    env_table.add_row("Keyring Backend", keyring_display)
+
+    console.print(env_table)
+
+
+def _bool_to_symbol(value: object) -> str:
+    return "[bold green]✓[/bold green]" if value else "[bold red]✗[/bold red]"
+
+
+def _format_step_interval(seconds: int | str) -> str:
+    try:
+        total = int(seconds)
+    except (TypeError, ValueError):
+        return str(seconds)
+
+    if total <= 0:
+        return "0s"
+
+    for unit_seconds, suffix in _STEP_INTERVAL_UNITS:
+        if total % unit_seconds == 0:
+            return f"{total // unit_seconds}{suffix}"
+
+    minutes, secs = divmod(total, 60)
+    return f"{minutes}m{secs:02d}s" if minutes else f"{secs}s"
+
+
+def _build_application_settings_rows(
+    config_summary: dict[str, Any],
+) -> list[SettingsTableRow]:
+    logger = config_summary.get("logger", {})
+
+    timeline_settings = config_summary.get("timeline", {})
+    timeline_enabled = timeline_settings.get("enabled", True)
+    timeline_steps = timeline_settings.get("steps", 20)
+    timeline_step_seconds = timeline_settings.get("step_seconds", 30)
+
+    return [
+        ("Log Level", logger.get("level", "warning (default)")),
+        ("Log Type", logger.get("type", "file (default)")),
+        ("Streaming Mode", f"[green]{logger.get('streaming', 'markdown')}[/green]"),
+        ("Theme File", logger.get("theme_file") or "[dim]default[/dim]"),
+        ("Code Theme", f"[green]{logger.get('code_theme', 'native')}[/green]"),
+        (
+            "Patch Preview Lines",
+            (
+                "[dim]unlimited[/dim]"
+                if logger.get("apply_patch_preview_max_lines") is None
+                else f"[green]{logger.get('apply_patch_preview_max_lines')}[/green]"
+            ),
+        ),
+        ("Streaming Display", _bool_to_symbol(logger.get("streaming_display", True))),
+        ("Syntax Fences", _bool_to_symbol(logger.get("render_fences_with_syntax", True))),
+        ("Wrap Code", _bool_to_symbol(logger.get("code_word_wrap", True))),
+        ("Progress Display", _bool_to_symbol(logger.get("progress_display", True))),
+        ("Show Chat", _bool_to_symbol(logger.get("show_chat", True))),
+        ("Show Tools", _bool_to_symbol(logger.get("show_tools", True))),
+        ("Truncate Tools", _bool_to_symbol(logger.get("truncate_tools", True))),
+        ("Enable Markup", _bool_to_symbol(logger.get("enable_markup", True))),
+        ("Prompt Marks", _bool_to_symbol(logger.get("enable_prompt_marks", False))),
+        ("MCP Diagnostics", _bool_to_symbol(timeline_enabled)),
+        ("Timeline Steps", f"[green]{timeline_steps}[/green]"),
+        (
+            "Timeline Interval",
+            f"[green]{_format_step_interval(timeline_step_seconds)}[/green]",
+        ),
+    ]
+
+
+def _adjacent_settings_pairs(
+    rows: Sequence[SettingsTableRow],
+) -> list[tuple[SettingsTableRow, SettingsTableRow | None]]:
+    row_iter = iter(rows)
+    return [(left, right) for left, right in zip_longest(row_iter, row_iter) if left is not None]
+
+
+def _split_provider_status_rows(
+    api_keys: dict[str, dict[str, str]],
+) -> list[tuple[ProviderStatusRow, ProviderStatusRow | None]]:
+    providers = list(api_keys.items())
+    mid_point = (len(providers) + 1) // 2
+    return list(zip_longest(providers[:mid_point], providers[mid_point:]))
+
+
+def _render_application_settings(config_summary: dict[str, Any]) -> None:
+    logger_table = Table(show_header=True, box=None)
+    logger_table.add_column("Setting", style="white", header_style="bold bright_white")
+    logger_table.add_column("Value", header_style="bold bright_white")
+    logger_table.add_column("Setting", style="white", header_style="bold bright_white")
+    logger_table.add_column("Value", header_style="bold bright_white")
+
+    for left_row, right_row in _adjacent_settings_pairs(
+        _build_application_settings_rows(config_summary)
+    ):
+        left_setting, left_value = left_row
+        if left_setting in {"Log Level", "Log Type"}:
+            left_value = f"[green]{left_value}[/green]"
+
+        if right_row is not None:
+            right_setting, right_value = right_row
+            if right_setting in {"Log Level", "Log Type"}:
+                right_value = f"[green]{right_value}[/green]"
+            logger_table.add_row(left_setting, left_value, right_setting, right_value)
+        else:
+            logger_table.add_row(left_setting, left_value, "", "")
+
+    _print_section_header("Application Settings", color="blue")
+    console.print(logger_table)
+
+
+def _render_environments_panel(context: _CheckSummaryContext) -> None:
+    _print_section_header("Environments", color="blue")
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("Name", style="cyan")
+    table.add_column("Type")
+    table.add_column("Default")
+    table.add_column("Status")
+
+    for name, environment_type, default_marker, status in context.environment_rows:
+        table.add_row(name, environment_type, default_marker, status)
+
+    console.print(table)
+
+
+def _render_model_overlay_notices(context: _CheckSummaryContext) -> None:
+    if not context.overlay_preset_collision_messages:
+        return
+
+    _print_section_header("Model Overlays", color="blue")
+    for message in context.overlay_preset_collision_messages:
+        console.print(f"[cyan]Info:[/cyan] {message}")
+
+
+def _format_provider_row(provider: str, status: dict[str, str]) -> tuple[str, str, str, str]:
+    if status["env"] and status["config"]:
+        env_status = "[yellow]✓[/yellow]"
+    elif status["env"]:
+        env_status = "[bold green]✓[/bold green]"
+    else:
+        env_status = "[dim]✗[/dim]"
+
+    config_status = "[bold green]✓[/bold green]" if status["config"] else "[dim]✗[/dim]"
+
+    if status["config"]:
+        active = f"[bold green]{status['config']}[/bold green]"
+    elif status["env"]:
+        active = f"[bold green]{status['env']}[/bold green]"
+    elif provider == "generic":
+        active = "[green]ollama (default)[/green]"
+    elif provider == "openresponses":
+        active = "[green]none (default)[/green]"
+    else:
+        active = "[dim]Not configured[/dim]"
+
+    display_name = Provider(provider).display_name
+    return display_name, env_status, config_status, active
+
+
+def _render_api_keys_panel(api_keys: dict[str, dict[str, str]]) -> None:
+    keys_table = Table(show_header=True, box=None)
+    for title, style, justify in (
+        ("Provider", "white", None),
+        ("Env", None, "center"),
+        ("Config", None, "center"),
+        ("Active Key", "green", None),
+        ("Provider", "white", None),
+        ("Env", None, "center"),
+        ("Config", None, "center"),
+        ("Active Key", "green", None),
+    ):
+        if style is not None and justify is not None:
+            keys_table.add_column(
+                title,
+                style=style,
+                justify=justify,
+                header_style="bold bright_white",
+            )
+        elif style is not None:
+            keys_table.add_column(
+                title,
+                style=style,
+                header_style="bold bright_white",
+            )
+        elif justify is not None:
+            keys_table.add_column(
+                title,
+                justify=justify,
+                header_style="bold bright_white",
+            )
+        else:
+            keys_table.add_column(title, header_style="bold bright_white")
+
+    for left_row, right_row in _split_provider_status_rows(api_keys):
+        left_provider, left_status = left_row
+        left_data = _format_provider_row(left_provider, left_status)
+        if right_row is not None:
+            right_provider, right_status = right_row
+            right_data = _format_provider_row(right_provider, right_status)
+            keys_table.add_row(*left_data, *right_data)
+        else:
+            keys_table.add_row(*left_data, "", "", "", "")
+
+    _print_section_header("API Keys", color="blue")
+    console.print(keys_table)
+    console.print("[dim]Use [cyan]fast-agent check models[/cyan] to see/configure models.[/dim]")
+
+
+def _render_codex_oauth_panel(keyring_status: KeyringStatus) -> None:
+    try:
+        from datetime import datetime
+
+        from fast_agent.llm.provider.openai.codex_oauth import get_codex_token_status
+
+        codex_status = get_codex_token_status()
+    except Exception:
+        return
+
+    codex_table = Table(show_header=True, box=None)
+    codex_table.add_column("Token", style="white", header_style="bold bright_white")
+    codex_table.add_column("Source", style="white", header_style="bold bright_white")
+    codex_table.add_column("Expires", style="white", header_style="bold bright_white")
+    codex_table.add_column("Keyring", style="white", header_style="bold bright_white")
+
+    if not codex_status["present"]:
+        token_display = "[dim]Not configured[/dim]"
+        source_display = "[dim]-[/dim]"
+        expires_display = "[dim]-[/dim]"
+    else:
+        token_display = "[bold green]OAuth token[/bold green]"
+        source_display = codex_oauth_source_display(codex_status)
+        expires_display = codex_oauth_expiry_display(codex_status, datetime_type=datetime)
+
+    codex_table.add_row(
+        token_display,
+        source_display,
+        expires_display,
+        _format_keyring_status(keyring_status),
+    )
+    _print_section_header("Codex OAuth", color="blue")
+    console.print(codex_table)
+
+
+def _format_keyring_status(keyring_status: KeyringStatus) -> str:
+    if not keyring_status.available:
+        return "[red]not available[/red]"
+    if not keyring_status.writable:
+        return f"[yellow]{keyring_status.name} (not writable)[/yellow]"
+    return f"[green]{keyring_status.name}[/green]"
+
+
+def _build_mcp_servers_table() -> Table:
+    servers_table = Table(show_header=True, box=None)
+    servers_table.add_column("Name", style="white", header_style="bold bright_white")
+    servers_table.add_column("Transport", style="white", header_style="bold bright_white")
+    servers_table.add_column("Command/URL", header_style="bold bright_white")
+    servers_table.add_column("OAuth", header_style="bold bright_white")
+    servers_table.add_column("Token", header_style="bold bright_white")
+    return servers_table
+
+
+def _display_mcp_server_target(server: dict[str, str]) -> str:
+    transport = server["transport"]
+    command_url = (
+        server["command"] if transport == "STDIO" else server["url"]
+    ) or "[dim]Not configured[/dim]"
+    if "Not configured" in command_url:
+        return command_url
+    return f"[green]{command_url}[/green]"
+
+
+def _build_mcp_server_settings(server: dict[str, str]) -> Any | None:
+    from fast_agent.config import MCPServerSettings
+
+    try:
+        return MCPServerSettings(
+            name=server["name"],
+            transport="sse"
+            if server["transport"] == "SSE"
+            else ("stdio" if server["transport"] == "STDIO" else "http"),
+            url=(server.get("url") or None),
+        )
+    except Exception:
+        return None
+
+
+def _resolve_oauth_enabled(cfg: Any) -> bool:
+    auth = cfg.auth
+    if auth is None:
+        return True
+    return bool(auth.oauth)
+
+
+def _resolve_oauth_persist_mode(cfg: Any) -> str:
+    auth = cfg.auth
+    if auth is None:
+        return "keyring"
+    return auth.persist or "keyring"
+
+
+def _resolve_mcp_token_status(
+    context: _CheckSummaryContext,
+    cfg: Any,
+    *,
+    compute_server_identity: Any,
+    oauth_enabled: bool,
+    persist: str,
+) -> str:
+    if not oauth_enabled:
+        return "[dim]n/a[/dim]"
+    if context.keyring is not None and context.keyring_status.writable and persist == "keyring":
+        identity = compute_server_identity(cfg)
+        token_key = f"oauth:tokens:{identity}"
+        try:
+            has_token = context.keyring.get_password("fast-agent-mcp", token_key) is not None
+        except Exception:
+            has_token = False
+        return "[bold green]✓[/bold green]" if has_token else "[dim]✗[/dim]"
+    if persist == "keyring" and not context.keyring_status.available:
+        return "[red]not available[/red]"
+    if persist == "keyring" and not context.keyring_status.writable:
+        return "[yellow]not writable[/yellow]"
+    if persist == "memory":
+        return "[yellow]memory[/yellow]"
+    return "[dim]n/a[/dim]"
+
+
+def _resolve_mcp_oauth_columns(
+    context: _CheckSummaryContext,
+    cfg: Any | None,
+    *,
+    compute_server_identity: Any,
+) -> tuple[str, str]:
+    if cfg is None or not uses_mcp_remote_transport(cfg.transport):
+        return "[dim]-[/dim]", "[dim]n/a[/dim]"
+
+    oauth_enabled = _resolve_oauth_enabled(cfg)
+    oauth_status = "[green]on[/green]" if oauth_enabled else "[dim]off[/dim]"
+    token_status = _resolve_mcp_token_status(
+        context,
+        cfg,
+        compute_server_identity=compute_server_identity,
+        oauth_enabled=oauth_enabled,
+        persist=_resolve_oauth_persist_mode(cfg),
+    )
+    return oauth_status, token_status
+
+
+def _build_mcp_server_row(
+    context: _CheckSummaryContext,
+    server: dict[str, str],
+    *,
+    compute_server_identity: Any,
+) -> tuple[str, str, str, str, str]:
+    cfg = _build_mcp_server_settings(server)
+    oauth_status, token_status = _resolve_mcp_oauth_columns(
+        context,
+        cfg,
+        compute_server_identity=compute_server_identity,
+    )
+    return (
+        server["name"],
+        server["transport"],
+        _display_mcp_server_target(server),
+        oauth_status,
+        token_status,
+    )
+
+
+def _render_mcp_servers_panel(context: _CheckSummaryContext) -> None:
+    if context.config_summary.get("status") != "parsed":
+        return
+
+    mcp_servers = context.config_summary.get("mcp_servers", [])
+    if not mcp_servers:
+        return
+
+    from fast_agent.mcp.oauth_client import compute_server_identity
+
+    servers_table = _build_mcp_servers_table()
+
+    for server in mcp_servers:
+        servers_table.add_row(
+            *_build_mcp_server_row(
+                context,
+                server,
+                compute_server_identity=compute_server_identity,
+            )
+        )
+
+    _print_section_header("MCP Servers", color="blue")
+    console.print(servers_table)
+
+
+def _render_skills_panel(context: _CheckSummaryContext) -> None:
+    _print_section_header("Agent Skills", color="blue")
+    if not context.skills_dirs:
+        console.print(
+            "[dim]Agent Skills not configured. Go to https://fast-agent.ai/agents/skills/[/dim]"
+        )
+        return
+
+    if len(context.skills_dirs) == 1:
+        directory_display = _relative_summary_path(context.search_root, context.skills_dirs[0])
+        console.print(f"Directory: [green]{directory_display}[/green]")
+    else:
+        console.print("Directories:")
+        for directory in context.skills_dirs:
+            relative = _relative_summary_path(context.search_root, directory)
+            console.print(f"- [green]{relative}[/green]")
+
+    if not context.skills_manifests and not context.skill_errors:
+        console.print("[yellow]No skills found in the configured directories[/yellow]")
+        return
+
+    skills_table = Table(show_header=True, box=None)
+    skills_table.add_column("Name", style="cyan", header_style="bold bright_white")
+    skills_table.add_column("Description", style="white", header_style="bold bright_white")
+    skills_table.add_column("Source", style="dim", header_style="bold bright_white")
+    skills_table.add_column("Status", style="green", header_style="bold bright_white")
+
+    for manifest in context.skills_manifests:
+        source_display = _relative_summary_path(context.search_root, manifest.path.parent)
+        skills_table.add_row(
+            manifest.name,
+            _truncate_summary_text(manifest.description or ""),
+            source_display,
+            "[green]ok[/green]",
+        )
+
+    for error in context.skill_errors:
+        error_path_str = error.get("path", "")
+        source_display = "[dim]n/a[/dim]"
+        if error_path_str:
+            error_path = Path(error_path_str)
+            source_display = _relative_summary_path(context.search_root, error_path.parent)
+        message = error.get("error", "Failed to parse skill manifest")
+        skills_table.add_row(
+            "[red]—[/red]",
+            "[red]n/a[/red]",
+            source_display,
+            f"[red]{_truncate_summary_text(message, 60)}[/red]",
+        )
+
+    console.print(skills_table)
+
+
+def _build_server_names_from_config(
+    config_summary: dict[str, Any],
+) -> set[str] | None:
+    if config_summary.get("status") != "parsed":
+        return None
+
+    mcp_servers = config_summary.get("mcp_servers", [])
+    if not isinstance(mcp_servers, list):
+        return None
+
+    return {
+        server.get("name", "")
+        for server in mcp_servers
+        if isinstance(server, dict) and server.get("name")
+    }
+
+
+def _should_warn_for_provider(
+    provider: Provider,
+    config_summary: dict[str, Any],
+) -> bool:
+    if provider in {Provider.FAST_AGENT, Provider.GENERIC}:
+        return False
+    if provider == Provider.OPENRESPONSES:
+        cfg = config_summary.get("config") if config_summary.get("status") == "parsed" else {}
+        openresponses_cfg = cfg.get("openresponses", {}) if isinstance(cfg, dict) else {}
+        configured_base_url = None
+        if isinstance(openresponses_cfg, dict):
+            raw_base_url = openresponses_cfg.get("base_url")
+            configured_base_url = strip_str_to_none(raw_base_url)
+        if configured_base_url is None:
+            env_base_url = os.getenv("OPENRESPONSES_BASE_URL")
+            configured_base_url = strip_str_to_none(env_base_url)
+        if configured_base_url is None:
+            return False
+        return configured_base_url.rstrip("/") != DEFAULT_OPENRESPONSES_BASE_URL.rstrip("/")
+    if provider == Provider.GOOGLE:
+        cfg = config_summary.get("config") if config_summary.get("status") == "parsed" else {}
+        google_cfg = cfg.get("google", {}) if isinstance(cfg, dict) else {}
+        vertex_cfg = google_cfg.get("vertex_ai", {}) if isinstance(google_cfg, dict) else {}
+        if isinstance(vertex_cfg, dict) and vertex_cfg.get("enabled") is True:
+            return False
+    return provider != Provider.ANTHROPIC_VERTEX
+
+
+def _collect_card_directories(
+    home_paths: HomePaths,
+) -> list[tuple[str, Path]]:
+    return [
+        ("Agent Cards", home_paths.agent_cards),
+        ("Tool Cards", home_paths.tool_cards),
+    ]
+
+
+def _collect_all_card_names(
+    card_directories: list[tuple[str, Path]],
+    *,
+    server_names: set[str] | None,
+) -> tuple[bool, set[str]]:
+    found_card_dir = False
+    all_card_names: set[str] = set()
+    for _, directory in card_directories:
+        if not directory.is_dir():
+            continue
+        found_card_dir = True
+        entries = scan_agent_card_directory(directory, server_names=server_names)
+        for entry in entries:
+            if entry.name != "—" and entry.ignored_reason is None:
+                all_card_names.add(entry.name)
+    return found_card_dir, all_card_names
+
+
+def _format_agent_card_error_status(entry: AgentCardScanResult) -> str:
+    if entry.ignored_reason:
+        return f"[dim]ignored - {entry.ignored_reason}[/dim]"
+    if entry.errors:
+        error_text = _truncate_summary_text(entry.errors[0], 60)
+        if len(entry.errors) > 1:
+            error_text = f"{error_text} (+{len(entry.errors) - 1} more)"
+        return f"[red]{error_text}[/red]"
+    return "[green]ok[/green]"
+
+
+def _load_agent_cards_for_status(entry: AgentCardScanResult) -> list[Any]:
+    try:
+        from fast_agent.core.agent_card_loader import load_agent_cards
+
+        return load_agent_cards(entry.path)
+    except Exception:
+        return []
+
+
+def _update_default_agent_tracking(
+    *,
+    card_name: str,
+    config: AgentConfig | None,
+    default_agent_names: list[str],
+    default_agent_seen: set[str],
+) -> None:
+    if config is None or not config.default:
+        return
+    if card_name in default_agent_seen:
+        return
+    default_agent_names.append(card_name)
+    default_agent_seen.add(card_name)
+
+
+def _runtime_mcp_entry_count(config: AgentConfig | None) -> int:
+    if config is None:
+        return 0
+    return len(config.mcp_connect or [])
+
+
+def _record_missing_api_key_warning(
+    *,
+    card_name: str,
+    model: str | None,
+    api_keys: dict[str, dict[str, str]],
+    config_summary: dict[str, Any],
+    warned_cards: set[str],
+    api_warning_messages: list[str],
+) -> None:
+    if not model:
+        return
+    try:
+        model_config = ModelFactory.parse_model_string(model)
+    except ModelConfigError:
+        return
+
+    provider = model_config.provider
+    if not _should_warn_for_provider(provider, config_summary):
+        return
+
+    key_status = api_keys.get(provider.config_name)
+    if not key_status or key_status["env"] or key_status["config"]:
+        return
+
+    api_warning_messages.append(
+        f'Warning: Card "{card_name}" uses model "{model}" '
+        f"({provider.display_name}) but no API key configured."
+    )
+    warned_cards.add(card_name)
+
+
+def _format_runtime_mcp_status(runtime_mcp_count: int) -> str:
+    if runtime_mcp_count <= 0:
+        return "[green]ok[/green]"
+    return (
+        "[green]ok[/green] "
+        f"[dim](mcp_connect: {runtime_mcp_count} {plural_label(runtime_mcp_count, 'entry', 'entries')})[/dim]"
+    )
+
+
+def _build_agent_card_status(
+    entry: AgentCardScanResult,
+    *,
+    api_keys: dict[str, dict[str, str]],
+    config_summary: dict[str, Any],
+    warned_cards: set[str],
+    api_warning_messages: list[str],
+    default_agent_names: list[str],
+    default_agent_seen: set[str],
+) -> str:
+    status = _format_agent_card_error_status(entry)
+    if entry.errors or entry.ignored_reason is not None or entry.name in warned_cards:
+        return status
+
+    runtime_mcp_count = 0
+    cards = _load_agent_cards_for_status(entry)
+    for card in cards:
+        raw_config = card.agent_data.get("config")
+        config = raw_config if isinstance(raw_config, AgentConfig) else None
+        runtime_mcp_count += _runtime_mcp_entry_count(config)
+        _update_default_agent_tracking(
+            card_name=card.name,
+            config=config,
+            default_agent_names=default_agent_names,
+            default_agent_seen=default_agent_seen,
+        )
+        _record_missing_api_key_warning(
+            card_name=card.name,
+            model=config.model if config else None,
+            api_keys=api_keys,
+            config_summary=config_summary,
+            warned_cards=warned_cards,
+            api_warning_messages=api_warning_messages,
+        )
+
+    return _format_runtime_mcp_status(runtime_mcp_count)
+
+
+def _render_agent_card_panel(context: _CheckSummaryContext) -> None:
+    _print_section_header("Agent Cards", color="blue")
+    card_directories = _collect_card_directories(context.home_paths)
+    found_card_dir, all_card_names = _collect_all_card_names(
+        card_directories,
+        server_names=context.server_names,
+    )
+
+    api_warning_messages: list[str] = []
+    warned_cards: set[str] = set()
+    default_agent_names: list[str] = []
+    default_agent_seen: set[str] = set()
+
+    for label, directory in card_directories:
+        if not directory.is_dir():
+            continue
+
+        relative_directory = _relative_summary_path(context.search_root, directory)
+        console.print(f"{label} Directory: [green]{relative_directory}[/green]")
+        entries = scan_agent_card_directory(
+            directory,
+            server_names=context.server_names,
+            extra_agent_names=all_card_names,
+        )
+        if not entries:
+            console.print("[yellow]No AgentCards found in this directory[/yellow]")
+            continue
+
+        cards_table = Table(show_header=True, box=None)
+        cards_table.add_column("Name", style="cyan", header_style="bold bright_white")
+        cards_table.add_column("Type", style="white", header_style="bold bright_white")
+        cards_table.add_column("Source", style="dim", header_style="bold bright_white")
+        cards_table.add_column("Status", style="green", header_style="bold bright_white")
+
+        for entry in entries:
+            status = _build_agent_card_status(
+                entry,
+                api_keys=context.api_keys,
+                config_summary=context.config_summary,
+                warned_cards=warned_cards,
+                api_warning_messages=api_warning_messages,
+                default_agent_names=default_agent_names,
+                default_agent_seen=default_agent_seen,
+            )
+            cards_table.add_row(
+                entry.name,
+                entry.type,
+                _relative_summary_path(context.search_root, entry.path),
+                status,
+            )
+
+        console.print(cards_table)
+
+    if len(default_agent_names) > 1:
+        joined = ", ".join(default_agent_names)
+        console.print(f"[yellow]Warning:[/yellow] multiple agents are set as default: {joined}")
+
+    for warning in api_warning_messages:
+        console.print(f"[yellow]{warning}[/yellow]")
+
+    if not found_card_dir:
+        console.print("[dim]No local AgentCard directories found in the fast-agent home.[/dim]")
+
+
+def _render_check_summary_guidance(context: _CheckSummaryContext) -> None:
+    config_status = context.config_summary.get("status", "not_found")
+    secrets_status = context.secrets_summary.get("status", "not_found")
+
+    if config_status == "error" or secrets_status == "error" or context.effective_settings_error:
+        console.print("\n[bold]Config File Issues:[/bold]")
+        if context.effective_settings_error:
+            console.print(f"[orange_red1]{context.effective_settings_error}[/orange_red1]")
+        console.print("Fix the YAML syntax errors in your configuration files")
+    elif config_status == "not_found" or secrets_status == "not_found":
+        console.print("\n[bold]Setup Tips:[/bold]")
+        console.print(
+            "Run [cyan]fast-agent scaffold[/cyan] to create configuration files. Visit [cyan][link=https://fast-agent.ai]fast-agent.ai[/link][/cyan] for configuration guides. "
+        )
+
+    if all(
+        not context.api_keys[provider]["env"] and not context.api_keys[provider]["config"]
+        for provider in context.api_keys
+    ):
+        console.print(
+            "\n[yellow]No API keys configured. Set up API keys to use LLM services:[/yellow]"
+        )
+        console.print("1. Add keys to fast-agent.secrets.yaml")
+        env_vars = ", ".join(
+            filter(
+                None,
+                (
+                    ProviderKeyManager.get_env_key_name(p.config_name)
+                    for p in Provider
+                    if p != Provider.FAST_AGENT
+                ),
+            )
+        )
+        console.print(f"2. Or set environment variables ({env_vars})")
+
+
+def show_check_summary(home: Path | None = None) -> None:
+    """Show a summary of checks with colorful styling."""
+    context = _build_check_summary_context(home)
+    _render_environment_summary(context)
+    _render_application_settings(context.config_summary)
+    _render_environments_panel(context)
+    _render_model_overlay_notices(context)
+    _render_api_keys_panel(context.api_keys)
+    _render_codex_oauth_panel(context.keyring_status)
+    _render_mcp_servers_panel(context)
+    _render_skills_panel(context)
+    _render_agent_card_panel(context)
+    _render_check_summary_guidance(context)
+
+
+@app.command()
+def show(
+    path: str | None = typer.Argument(None, help="Path to configuration file to display"),
+    secrets: bool = typer.Option(
+        False, "--secrets", "-s", help="Show secrets file instead of config"
+    ),
+) -> None:
+    """Display the configuration file content or search for it."""
+    file_type = "secrets" if secrets else "config"
+
+    if path:
+        config_path = Path(path).resolve()
+        if not config_path.exists():
+            console.print(
+                f"[red]Error:[/red] {file_type.capitalize()} file not found at {config_path}"
+            )
+            raise typer.Exit(1)
+    else:
+        config_files = find_config_files(Path.cwd())
+        config_path = config_files[file_type]
+        if not config_path:
+            console.print(
+                f"[yellow]No {file_type} file found in current directory or parents[/yellow]"
+            )
+            console.print("Run [cyan]fast-agent scaffold[/cyan] to create configuration files")
+            raise typer.Exit(1)
+
+    console.print(f"\n[bold]{file_type.capitalize()} file:[/bold] {config_path}\n")
+
+    try:
+        with config_path.open("r") as f:
+            content = f.read()
+
+        # Try to parse as YAML to check validity
+        parsed = yaml.safe_load(content)
+
+        # Show parsing success status
+        console.print("[green]YAML syntax is valid[/green]")
+        if parsed is None:
+            console.print("[yellow]Warning: File is empty or contains only comments[/yellow]\n")
+        else:
+            console.print(
+                f"[green]Successfully parsed {len(parsed) if isinstance(parsed, dict) else 0} root keys[/green]\n"
+            )
+
+        # Print the content
+        console.print(content)
+
+    except Exception as e:
+        console.print(f"[red]Error parsing {file_type} file:[/red] {e}")
+
+
+def _context_home(ctx: typer.Context) -> Path | None:
+    payload = ctx.obj
+    if not isinstance(payload, dict):
+        return None
+
+    home = payload.get("home")
+    if isinstance(home, Path):
+        return home
+    return None
+
+
+def _resolve_check_update_notice(
+    ctx: typer.Context,
+    home: Path | None,
+) -> str | None:
+    if ctx.invoked_subcommand is not None:
+        return None
+
+    payload = ctx.obj
+    no_update_check = False
+    if isinstance(payload, dict):
+        raw_no_update_check = payload.get("no_update_check")
+        if isinstance(raw_no_update_check, bool):
+            no_update_check = raw_no_update_check
+
+    if not should_run_update_check(disabled=no_update_check):
+        return None
+
+    return check_for_update_notice(home=home)
+
+
+@app.command("models")
+def models(
+    ctx: typer.Context,
+    provider: str | None = typer.Argument(
+        None,
+        help=(
+            "Provider scope to inspect. Omit to list available providers, key status, "
+            "and configured named aliases."
+        ),
+    ),
+    all_models: bool = typer.Option(
+        False,
+        "--all",
+        help="Show all known models after curated entries (requires a provider argument)",
+    ),
+    for_model: str | None = typer.Option(
+        None,
+        "--for-model",
+        help="Resolve one or more model specs (comma-separated) to provider and secret env requirements.",
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Emit JSON output (supported with --for-model).",
+    ),
+) -> None:
+    """Show model catalog provider guidance or provider-specific model entries."""
+    home = _context_home(ctx)
+
+    if for_model is not None:
+        if provider is not None:
+            raise typer.BadParameter("Do not pass a provider argument with --for-model.")
+        if all_models:
+            raise typer.BadParameter("Do not combine --all with --for-model.")
+        try:
+            show_model_secret_requirements(for_model, home=home, json_output=json_output)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc), param_hint="--for-model") from exc
+        return
+
+    if json_output:
+        raise typer.BadParameter("--json currently requires --for-model.")
+
+    if provider is None:
+        if all_models:
+            console.print(
+                "[yellow]Tip:[/yellow] Pass a provider name with [cyan]--all[/cyan], "
+                "for example: [cyan]fast-agent check models openai --all[/cyan]"
+            )
+        show_models_overview(home=home)
+        return
+
+    try:
+        show_provider_model_catalog(
+            provider,
+            show_all=all_models,
+            home=home,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="provider") from exc
+
+
+@app.command("structured-tools")
+def structured_tools(
+    models: str = typer.Option(
+        ...,
+        "--models",
+        "--model",
+        help="Model id, alias, or comma-separated list of models to probe.",
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
+    structured_tool_policy: str = typer.Option(
+        "auto",
+        "--structured-tool-policy",
+        help="Policy to probe: auto, always, defer, or no_tools.",
+    ),
+) -> None:
+    """Probe structured output compatibility when tools are available."""
+    _run_structured_output_probe(
+        models=models,
+        json_output=json_output,
+        structured_tool_policy=structured_tool_policy,
+        mode="tools",
+    )
+
+
+@app.command("structured")
+@app.command("structured-output")
+def structured_output(
+    models: str = typer.Option(
+        ...,
+        "--models",
+        "--model",
+        help="Model id, alias, or comma-separated list of models to probe.",
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
+    mode: str = typer.Option(
+        "all",
+        "--mode",
+        help=(
+            "Probe mode: direct, pydantic, tools, both, or all. "
+            "Default runs direct JSON Schema, direct Pydantic, then tools."
+        ),
+    ),
+    structured_tool_policy: str = typer.Option(
+        "auto",
+        "--structured-tool-policy",
+        help="Tool policy for --mode tools/both/all: auto, always, defer, or no_tools.",
+    ),
+) -> None:
+    """Probe direct structured output, Pydantic structured output, and tools."""
+    _run_structured_output_probe(
+        models=models,
+        json_output=json_output,
+        structured_tool_policy=structured_tool_policy,
+        mode=mode,
+    )
+
+
+def _run_structured_output_probe(
+    *,
+    models: str,
+    json_output: bool,
+    structured_tool_policy: str,
+    mode: str,
+) -> None:
+    if structured_tool_policy not in {"auto", "always", "defer", "no_tools"}:
+        raise typer.BadParameter(
+            "structured tool policy must be 'auto', 'always', 'defer', or 'no_tools'",
+            param_hint="--structured-tool-policy",
+        )
+    if mode not in {"direct", "pydantic", "tools", "both", "all"}:
+        raise typer.BadParameter(
+            "mode must be 'direct', 'pydantic', 'tools', 'both', or 'all'",
+            param_hint="--mode",
+        )
+
+    model_names = _split_model_specs(models)
+    if not model_names:
+        raise typer.BadParameter("At least one model is required.", param_hint="--models")
+
+    from fast_agent.cli.checks.structured_tools_probe import (
+        StructuredProbeMode,
+        _print_text_summary,
+        run_probe_suite,
+    )
+
+    modes = {
+        "both": ["direct", "tools"],
+        "all": ["direct", "pydantic", "tools"],
+    }.get(mode, [cast("StructuredProbeMode", mode)])
+    results = run_coroutine(
+        run_probe_suite(
+            model_names,
+            structured_tool_policy=structured_tool_policy,
+            modes=cast("list[StructuredProbeMode]", modes),
+        )
+    )
+    if json_output:
+        console.print_json(json.dumps([asdict(result) for result in results]))
+    else:
+        _print_text_summary(results)
+
+    if not all(result.passed for result in results):
+        raise typer.Exit(1)
+
+
+@app.callback(invoke_without_command=True)
+def main(
+    ctx: typer.Context,
+    home: Path | None = typer.Option(None, "--home", help="Override the base fast-agent home"),
+) -> None:
+    """Check and diagnose FastAgent configuration."""
+    home = resolve_home_option(ctx, home)
+    if isinstance(ctx.obj, dict):
+        ctx.obj["home"] = home
+    else:
+        ctx.obj = {"home": home}
+
+    update_notice = _resolve_check_update_notice(ctx, home)
+    if update_notice:
+        console.print(update_notice)
+
+    if ctx.invoked_subcommand is None:
+        show_check_summary(home=home)

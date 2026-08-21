@@ -1,0 +1,496 @@
+"""
+Listeners for the logger module of MCP Agent.
+"""
+
+import asyncio
+import logging
+from abc import ABC, abstractmethod
+from contextlib import suppress
+from typing import TYPE_CHECKING, Any, cast
+
+if TYPE_CHECKING:
+    from fast_agent.event_progress import ProgressAction, ProgressEvent
+
+from fast_agent.core.logging.events import Event, EventFilter, EventType
+from fast_agent.utils.text import strip_str_to_none
+from fast_agent.utils.tool_names import POLL_PROCESS_TOOL_NAME, matches_tool_name
+
+
+def _optional_text_or_none(value: object) -> str | None:
+    return strip_str_to_none(value)
+
+
+def _optional_text(value: object) -> str:
+    return _optional_text_or_none(value) or ""
+
+
+def _optional_float(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return max(float(value), 0.0)
+
+
+def _optional_nonnegative_int(value: object) -> int | None:
+    return value if type(value) is int and value >= 0 else None
+
+
+def _optional_bool(value: object) -> bool | None:
+    return value if isinstance(value, bool) else None
+
+
+def _first_text(*values: object) -> str | None:
+    return next(
+        (normalized for value in values if (normalized := _optional_text_or_none(value))),
+        None,
+    )
+
+
+def _append_details(base: str, extra: str | None, *, separator: str = " - ") -> str:
+    """Append extra details using a stable separator when both parts exist."""
+    normalized_extra = _optional_text(extra)
+    if not normalized_extra:
+        return base
+    if not base:
+        return normalized_extra
+    return f"{base}{separator}{normalized_extra}"
+
+
+def _format_tool_context(
+    *,
+    tool_name: str | None,
+    server_name: str | None,
+    tool_event: str | None = None,
+) -> str:
+    """Build a concise, stable tool context string for progress details."""
+    normalized_tool = _optional_text(tool_name)
+    normalized_server = _optional_text(server_name)
+    normalized_event = _optional_text(tool_event)
+
+    # Prefer tool name for compactness. Server names can be long and
+    # overwhelm progress rows; only fall back to server name when tool
+    # name is unavailable.
+    context = normalized_tool or normalized_server
+
+    if context and normalized_event:
+        return f"{context} ({normalized_event})"
+
+    return context
+
+
+def _coerce_progress_action(raw_action: object) -> "ProgressAction | None":
+    from fast_agent.event_progress import ProgressAction
+
+    with suppress(Exception):
+        return (
+            raw_action
+            if isinstance(raw_action, ProgressAction)
+            else ProgressAction(str(raw_action))
+        )
+    return None
+
+
+def _event_data(event: Event) -> dict[str, Any] | None:
+    if not event.data:
+        return None
+
+    event_data = event.data.get("data")
+    return event_data if isinstance(event_data, dict) else None
+
+
+def _is_hidden_provider_web_tool_event(
+    *,
+    action: "ProgressAction",
+    event_data: dict[str, Any],
+) -> bool:
+    from fast_agent.event_progress import ProgressAction
+
+    tool_name = event_data.get("tool_name")
+    return (
+        action in {ProgressAction.CALLING_TOOL, ProgressAction.TOOL_PROGRESS}
+        and isinstance(tool_name, str)
+        and tool_name in {"web_search", "web_fetch"}
+        and not event_data.get("server_name")
+    )
+
+
+def _mcp_progress_details(
+    *,
+    tool_context: str,
+    server_name: object,
+    raw_details: object,
+) -> str:
+    details = tool_context or _optional_text(server_name)
+    return _append_details(details, str(raw_details or ""))
+
+
+def _llm_progress_details(event_data: dict[str, Any], tool_context: str) -> str:
+    model = _optional_text(event_data.get("model", ""))
+    chat_turn = event_data.get("chat_turn")
+    details = (
+        model if chat_turn is None else _append_details(model, f"turn {chat_turn}", separator=" ")
+    )
+
+    if tool_context:
+        return _append_details(details, tool_context, separator=" • ")
+    return details
+
+
+def _generic_progress_details(
+    *,
+    action: "ProgressAction",
+    tool_context: str,
+    raw_details: object,
+) -> str:
+    from fast_agent.event_progress import ProgressAction
+
+    if action == ProgressAction.TOOL_PROGRESS:
+        return _append_details(tool_context, str(raw_details or ""))
+    return _append_details(tool_context, str(raw_details or ""))
+
+
+def _target_and_details(
+    *,
+    event: Event,
+    action: "ProgressAction",
+    event_data: dict[str, Any],
+    tool_context: str,
+) -> tuple[str, str]:
+    from fast_agent.event_progress import ProgressAction
+
+    target = event_data.get("agent_name")
+    raw_details = event_data.get("details", "")
+    server_name = event_data.get("server_name")
+    tool_name = _optional_text_or_none(event_data.get("tool_name"))
+
+    if action == ProgressAction.FATAL_ERROR:
+        fallback_target = _optional_text(server_name)
+        error_message = str(event_data.get("error_message", "An error occurred"))
+        if "mcp_aggregator" in event.namespace:
+            error_message = _append_details(fallback_target, error_message)
+        return str(target or fallback_target), error_message
+    if action == ProgressAction.CALLING_TOOL and matches_tool_name(
+        tool_name,
+        POLL_PROCESS_TOOL_NAME,
+    ):
+        return str(target or ""), _optional_text(raw_details)
+
+    if "mcp_aggregator" in event.namespace:
+        return str(target or ""), _mcp_progress_details(
+            tool_context=tool_context,
+            server_name=server_name,
+            raw_details=raw_details,
+        )
+
+    if "llm" in event.namespace:
+        return str(target or ""), _llm_progress_details(event_data, tool_context)
+
+    return (
+        str(target or event_data.get("target", "unknown")),
+        _generic_progress_details(
+            action=action,
+            tool_context=tool_context,
+            raw_details=raw_details,
+        ),
+    )
+
+
+def _streaming_tokens(action: "ProgressAction", event_data: dict[str, Any]) -> str | None:
+    from fast_agent.event_progress import ProgressAction
+
+    if action in (ProgressAction.STREAMING, ProgressAction.THINKING):
+        return _optional_text_or_none(event_data.get("details", ""))
+    return None
+
+
+def _tool_progress_counts(
+    action: "ProgressAction", event_data: dict[str, Any]
+) -> tuple[float | None, float | None]:
+    from fast_agent.event_progress import ProgressAction
+
+    if action == ProgressAction.TOOL_PROGRESS:
+        return cast("float | None", event_data.get("progress")), cast(
+            "float | None", event_data.get("total")
+        )
+    return None, None
+
+
+def convert_log_event(event: Event) -> "ProgressEvent | None":
+    """Convert a log event to a progress event if applicable."""
+
+    # Import at runtime to avoid circular imports
+    from fast_agent.event_progress import ProgressAction, ProgressEvent
+
+    event_data = _event_data(event)
+    if event_data is None:
+        return None
+
+    raw_action = event_data.get("progress_action")
+    if not raw_action:
+        return None
+
+    action = _coerce_progress_action(raw_action)
+    if action is None:
+        return None
+
+    # LOADED events are useful telemetry but too noisy for the live progress board.
+    if action == ProgressAction.LOADED:
+        return None
+
+    # Provider-managed web tools (e.g., Anthropic/OpenAI built-ins) should not
+    # render progress rows. MCP web tools include server_name and remain visible.
+    tool_name = event_data.get("tool_name")
+    if _is_hidden_provider_web_tool_event(action=action, event_data=event_data):
+        return None
+
+    # Build target string based on the event type.
+    # Progress display is currently [time] [event] --- [target] [details]
+    server_name = event_data.get("server_name")
+    tool_event = event_data.get("tool_event")
+    tool_context = _format_tool_context(
+        tool_name=tool_name,
+        server_name=server_name,
+        tool_event=tool_event if action == ProgressAction.CALLING_TOOL else None,
+    )
+    target, details = _target_and_details(
+        event=event,
+        action=action,
+        event_data=event_data,
+        tool_context=tool_context,
+    )
+    progress, total = _tool_progress_counts(action, event_data)
+
+    return ProgressEvent(
+        action=action,
+        target=target or "unknown",
+        details=details,
+        agent_name=_optional_text_or_none(event_data.get("agent_name")),
+        server_name=_optional_text_or_none(event_data.get("server_name")),
+        correlation_id=_first_text(
+            event_data.get("tool_use_id"),
+            event_data.get("tool_call_id"),
+            event_data.get("correlation_id"),
+        ),
+        tool_name=_optional_text_or_none(event_data.get("tool_name")),
+        tool_event=_optional_text_or_none(event_data.get("tool_event")),
+        tool_state=_optional_text_or_none(event_data.get("tool_state")),
+        tool_terminal=bool(event_data.get("tool_terminal", False)),
+        process_elapsed_seconds=_optional_float(event_data.get("process_elapsed_seconds")),
+        process_command=_optional_text_or_none(event_data.get("process_command")),
+        process_id=_optional_text_or_none(event_data.get("process_id")),
+        process_wait_seconds=_optional_nonnegative_int(event_data.get("process_wait_seconds")),
+        process_yield_reason=_optional_text_or_none(event_data.get("process_yield_reason")),
+        process_has_observed_output=_optional_bool(event_data.get("process_has_observed_output")),
+        process_seconds_since_last_output=_optional_float(
+            event_data.get("process_seconds_since_last_output")
+        ),
+        process_total_output_bytes=_optional_nonnegative_int(
+            event_data.get("process_total_output_bytes")
+        ),
+        process_seconds_since_last_stdout=_optional_float(
+            event_data.get("process_seconds_since_last_stdout")
+        ),
+        process_seconds_since_last_stderr=_optional_float(
+            event_data.get("process_seconds_since_last_stderr")
+        ),
+        process_stdout_bytes=_optional_nonnegative_int(event_data.get("process_stdout_bytes")),
+        process_stderr_bytes=_optional_nonnegative_int(event_data.get("process_stderr_bytes")),
+        streaming_tokens=_streaming_tokens(action, event_data),
+        progress=progress,
+        total=total,
+    )
+
+
+class EventListener(ABC):
+    """Base async listener that processes events."""
+
+    @abstractmethod
+    async def handle_event(self, event: Event):
+        """Process an incoming event."""
+
+
+class LifecycleAwareListener(EventListener):
+    """
+    Optionally override start()/stop() for setup/teardown.
+    The event bus calls these at bus start/stop time.
+    """
+
+    async def start(self) -> None:
+        """Start an event listener, usually when the event bus is set up."""
+
+    async def stop(self) -> None:
+        """Stop an event listener, usually when the event bus is shutting down."""
+
+
+class FilteredListener(LifecycleAwareListener):
+    """
+    Only processes events that pass the given filter.
+    Subclasses override _handle_matched_event().
+    """
+
+    def __init__(self, event_filter: EventFilter | None = None) -> None:
+        """
+        Initialize the listener.
+        Args:
+            filter: Event filter to apply to incoming events.
+        """
+        self.filter = event_filter
+
+    async def handle_event(self, event) -> None:
+        if not self.filter or self.filter.matches(event):
+            await self.handle_matched_event(event)
+
+    async def handle_matched_event(self, event: Event) -> None:
+        """Process an event that matches the filter."""
+
+
+class LoggingListener(FilteredListener):
+    """
+    Routes events to Python's logging facility with appropriate severity level.
+    """
+
+    def __init__(
+        self,
+        event_filter: EventFilter | None = None,
+        logger: logging.Logger | None = None,
+    ) -> None:
+        """
+        Initialize the listener.
+        Args:
+            logger: Logger to use for event processing. Defaults to 'fast_agent'.
+        """
+        super().__init__(event_filter=event_filter)
+        self.logger = logger or logging.getLogger("fast_agent")
+
+    async def handle_matched_event(self, event) -> None:
+        level_map: dict[EventType, int] = {
+            "debug": logging.DEBUG,
+            "info": logging.INFO,
+            "warning": logging.WARNING,
+            "error": logging.ERROR,
+        }
+        level = level_map.get(event.type, logging.INFO)
+
+        # Check if this is a server stderr message and format accordingly
+        if event.name == "mcpserver.stderr":
+            message = f"MCP Server: {event.message}"
+        else:
+            message = event.message
+
+        self.logger.log(
+            level,
+            "[%s] %s",
+            event.namespace,
+            message,
+            extra={
+                "event_data": event.data,
+                "span_id": event.span_id,
+                "trace_id": event.trace_id,
+                "event_name": event.name,
+            },
+        )
+
+
+class ProgressListener(LifecycleAwareListener):
+    """
+    Listens for all events pre-filtering and converts them to progress events
+    for display. By inheriting directly from LifecycleAwareListener instead of
+    FilteredListener, we get events before any filtering occurs.
+    """
+
+    def __init__(self, display=None) -> None:
+        """Initialize the progress listener.
+        Args:
+            display: Optional display handler. If None, the shared progress_display will be used.
+        """
+        from fast_agent.ui.progress_display import progress_display
+
+        self.display = display or progress_display
+
+    async def start(self) -> None:
+        """Start the progress display."""
+        self.display.start()
+
+    async def stop(self) -> None:
+        """Stop the progress display."""
+        self.display.stop()
+
+    async def handle_event(self, event: Event) -> None:
+        """Process an incoming event and display progress if relevant."""
+
+        if event.data:
+            progress_event = convert_log_event(event)
+            if progress_event:
+                self.display.update(progress_event)
+
+
+class BatchingListener(FilteredListener):
+    """
+    Accumulates events in memory, flushes them in batches.
+    Here we just print the batch size, but you might store or forward them.
+    """
+
+    def __init__(
+        self,
+        event_filter: EventFilter | None = None,
+        batch_size: int = 5,
+        flush_interval: float = 2.0,
+    ) -> None:
+        """
+        Initialize the listener.
+        Args:
+            batch_size: Number of events to accumulate before flushing.
+            flush_interval: Time in seconds to wait before flushing events.
+        """
+        super().__init__(event_filter=event_filter)
+        self.batch_size = batch_size
+        self.flush_interval = flush_interval
+        self.batch: list[Event] = []
+        self._flush_task: asyncio.Task | None = None  # Task for periodic flush loop
+        self._stop_event = None  # Event to signal flush task to stop
+
+    async def start(self) -> None:
+        """Spawn a periodic flush loop."""
+        self._stop_event = asyncio.Event()
+        self._flush_task = asyncio.create_task(self._periodic_flush())
+
+    async def stop(self) -> None:
+        """Stop flush loop and flush any remaining events."""
+        if self._stop_event:
+            self._stop_event.set()
+
+        if self._flush_task and not self._flush_task.done():
+            self._flush_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._flush_task
+            self._flush_task = None
+        await self.flush()
+
+    async def _periodic_flush(self) -> None:
+        if self._stop_event is None:
+            return
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    await asyncio.wait_for(self._stop_event.wait(), timeout=self.flush_interval)
+                except asyncio.TimeoutError:
+                    await self.flush()
+        # except asyncio.CancelledError:
+        #     break
+        finally:
+            await self.flush()  # Final flush
+
+    async def handle_matched_event(self, event) -> None:
+        self.batch.append(event)
+        if len(self.batch) >= self.batch_size:
+            await self.flush()
+
+    async def flush(self) -> None:
+        """Flush the current batch of events."""
+        if not self.batch:
+            return
+        to_process = self.batch[:]
+        self.batch.clear()
+        await self._process_batch(to_process)
+
+    async def _process_batch(self, events: list[Event]) -> None:
+        pass

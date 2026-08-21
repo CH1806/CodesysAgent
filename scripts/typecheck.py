@@ -1,0 +1,33 @@
+import subprocess
+import sys
+
+import typer
+
+TYPECHECK_TARGETS = [
+    "./tests",
+    "./src",
+    "./publish/fast-agent-acp/src",
+    "./publish/hf-inference-acp/src",
+]
+
+
+def main() -> None:
+    try:
+        command = ["ty", "check", *TYPECHECK_TARGETS]
+        process = subprocess.run(
+            command,
+            check=True,
+            stdout=sys.stdout,
+            stderr=sys.stderr,
+        )
+        sys.exit(process.returncode)
+    except subprocess.CalledProcessError as e:
+        print(f"Error: {e}")
+        sys.exit(e.returncode)
+    except FileNotFoundError:
+        print("Error: `ty` command not found. Make sure it's installed in the environment.")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    typer.run(main)

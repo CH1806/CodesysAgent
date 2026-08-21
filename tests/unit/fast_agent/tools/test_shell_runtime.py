@@ -1,0 +1,3627 @@
+import asyncio
+import json
+import logging
+import os
+import platform
+import shlex
+import signal
+import subprocess
+import sys
+import time
+from collections.abc import Mapping
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, cast
+
+import pytest
+from mcp_types import TextContent
+
+import fast_agent.tools.local_shell_executor as local_shell_executor
+import fast_agent.tools.shell_runtime as shell_runtime_module
+from fast_agent.config import LoggerSettings, Settings, ShellSettings, ToolDisplaySettings
+from fast_agent.constants import (
+    DEFAULT_TERMINAL_OUTPUT_BYTE_LIMIT,
+    FAST_AGENT_SHELL_PROCESS_METADATA,
+    MAX_FOREGROUND_AUTO_AWAIT_SECONDS,
+    MAX_PROCESS_POLL_WAIT_SECONDS,
+    MAX_TERMINAL_OUTPUT_BYTE_LIMIT,
+)
+from fast_agent.event_progress import ProgressAction
+from fast_agent.mcp.tool_result_metadata import tool_result_display_metadata
+from fast_agent.tools.execution_environment import (
+    ShellExecution,
+    ShellExecutionCallbacks,
+    ShellExecutionOptions,
+    ShellExecutionRequest,
+    ShellExecutionResult,
+    ShellRuntimeInfo,
+)
+from fast_agent.tools.local_shell_executor import LocalShellExecutor
+from fast_agent.tools.process_resources import ProcessResourceSnapshot
+from fast_agent.tools.shell_output import ShellOutputBuffer
+from fast_agent.tools.shell_runtime import ShellRuntime
+from fast_agent.tools.shell_tool_definitions import parse_poll_process_arguments
+from fast_agent.ui import console
+from fast_agent.ui.display_suppression import (
+    InteractiveDisplayMode,
+    suppress_interactive_display,
+)
+from fast_agent.ui.progress_display import progress_display
+from fast_agent.ui.shell_output_truncation import SHELL_OUTPUT_TRUNCATION_MARKER
+
+
+class DummyStream:
+    def __init__(self, lines: list[bytes] | None = None) -> None:
+        self._lines = list(lines or [])
+
+    async def readline(self) -> bytes:
+        if self._lines:
+            return self._lines.pop(0)
+        return b""
+
+    async def read(self, n: int = -1) -> bytes:
+        if not self._lines:
+            return b""
+        if n < 0:
+            data = b"".join(self._lines)
+            self._lines.clear()
+            return data
+
+        chunks: list[bytes] = []
+        remaining = n
+        while self._lines and remaining > 0:
+            current = self._lines[0]
+            if len(current) <= remaining:
+                chunks.append(self._lines.pop(0))
+                remaining -= len(current)
+                continue
+            chunks.append(current[:remaining])
+            self._lines[0] = current[remaining:]
+            remaining = 0
+        return b"".join(chunks)
+
+
+class DummyProcess:
+    def __init__(self) -> None:
+        self.stdout = DummyStream()
+        self.stderr = DummyStream()
+        self.returncode: int | None = None
+        self.pid = 1234
+        self.sent_signals: list[Any] = []
+        self.terminated = False
+
+    async def wait(self) -> int:
+        if self.returncode is None:
+            self.returncode = 0
+        return self.returncode
+
+    def send_signal(self, sig: Any) -> None:
+        self.sent_signals.append(sig)
+
+    def terminate(self) -> None:
+        self.terminated = True
+        self.returncode = 1 if self.returncode is None else self.returncode
+
+    def kill(self) -> None:
+        self.returncode = 1 if self.returncode is None else self.returncode
+
+
+class StagedTerminationProcess(DummyProcess):
+    def __init__(self) -> None:
+        super().__init__()
+        self.exited = asyncio.Event()
+        self.killed = False
+
+    async def wait(self) -> int:
+        await self.exited.wait()
+        assert self.returncode is not None
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.terminated = True
+        self.returncode = 0
+        self.exited.set()
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -signal.SIGKILL
+        self.exited.set()
+
+
+class RecordingFastLogger:
+    def __init__(self) -> None:
+        self.info_calls: list[tuple[str, dict[str, Any]]] = []
+        self.debug_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+        self.error_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    def info(self, message: str, **kwargs: Any) -> None:
+        self.info_calls.append((message, kwargs))
+
+    def debug(self, *args: Any, **kwargs: Any) -> None:
+        self.debug_calls.append((args, kwargs))
+
+    def error(self, *args: Any, **kwargs: Any) -> None:
+        self.error_calls.append((args, kwargs))
+
+
+class _TestLocalShellExecutor(LocalShellExecutor):
+    def __init__(
+        self,
+        *,
+        runtime_info: Mapping[str, str | None],
+        **kwargs: Any,
+    ) -> None:
+        self._test_runtime_info = dict(runtime_info)
+        super().__init__(**kwargs)
+
+    def runtime_info(self) -> ShellRuntimeInfo:
+        return ShellRuntimeInfo(
+            name=self._test_runtime_info.get("name") or "shell",
+            path=self._test_runtime_info.get("path"),
+        )
+
+
+class _RecordingShellEnvironment:
+    def __init__(self, cwd: str = "/workspace") -> None:
+        self._cwd = cwd
+        self.requests: list[ShellExecutionRequest] = []
+        self.resolved_paths: list[str] = []
+
+    async def open(self) -> None:
+        return None
+
+    @property
+    def cwd(self) -> str:
+        return self._cwd
+
+    def runtime_info(self) -> ShellRuntimeInfo:
+        return ShellRuntimeInfo(name="bash", kind="docker", provider="test")
+
+    def resolve_path(self, path: str) -> str:
+        self.resolved_paths.append(path)
+        return path if path.startswith("/") else f"{self._cwd}/{path}"
+
+    async def execute(
+        self,
+        request: ShellExecutionRequest,
+        *,
+        callbacks: ShellExecutionCallbacks | None = None,
+    ) -> ShellExecution:
+        del callbacks
+        self.requests.append(request)
+        return ShellExecution(
+            result=ShellExecutionResult(stdout="", stderr="", exit_code=0),
+            options=ShellExecutionOptions(),
+        )
+
+    async def close(self) -> None:
+        return None
+
+
+class _DirectShellEnvironment:
+    def __init__(
+        self,
+        *,
+        stream_output: bool,
+        timed_out: bool = False,
+        stdout: str | None = None,
+    ) -> None:
+        self.stream_output = stream_output
+        self.timed_out = timed_out
+        self.stdout = stdout
+        self.requests: list[ShellExecutionRequest] = []
+
+    async def open(self) -> None:
+        return None
+
+    @property
+    def cwd(self) -> str:
+        return "/workspace"
+
+    def runtime_info(self) -> ShellRuntimeInfo:
+        return ShellRuntimeInfo(name="bash", kind="remote", provider="test")
+
+    async def execute(
+        self,
+        request: ShellExecutionRequest,
+        *,
+        callbacks: ShellExecutionCallbacks | None = None,
+    ) -> ShellExecution:
+        self.requests.append(request)
+        stdout = self.stdout or ("streamed\n" if self.stream_output else "buffered\n")
+        if self.stream_output and callbacks is not None:
+            for line in stdout.splitlines(keepends=True):
+                await callbacks.on_stdout(line)
+            if self.timed_out:
+                await callbacks.on_timeout()
+            return ShellExecution(
+                result=ShellExecutionResult(stdout=stdout, stderr="", exit_code=0),
+                options=ShellExecutionOptions(timeout_seconds=request.timeout),
+                timed_out=self.timed_out,
+            )
+        return ShellExecution(
+            result=ShellExecutionResult(stdout=stdout, stderr="", exit_code=0),
+            options=ShellExecutionOptions(timeout_seconds=request.timeout),
+            timed_out=self.timed_out,
+        )
+
+    async def close(self) -> None:
+        return None
+
+
+class _ManagedShellEnvironment:
+    def __init__(self) -> None:
+        self._cwd = "/workspace"
+        self.requests: list[ShellExecutionRequest] = []
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.cancelled = False
+        self.stdout = "managed complete\n"
+        self.exit_code = 0
+
+    async def open(self) -> None:
+        return None
+
+    @property
+    def cwd(self) -> str:
+        return self._cwd
+
+    def runtime_info(self) -> ShellRuntimeInfo:
+        return ShellRuntimeInfo(name="bash", kind="remote", provider="managed-test")
+
+    async def execute(
+        self,
+        request: ShellExecutionRequest,
+        *,
+        callbacks: ShellExecutionCallbacks | None = None,
+    ) -> ShellExecution:
+        self.requests.append(request)
+        if callbacks is not None:
+            await callbacks.on_started(4321)
+        self.started.set()
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.cancelled = request.terminate_on_cancel
+            raise
+        if callbacks is not None and self.stdout:
+            await callbacks.on_stdout(self.stdout)
+        return ShellExecution(
+            result=ShellExecutionResult(
+                stdout=self.stdout if request.retain_output else "",
+                stderr="",
+                exit_code=self.exit_code,
+            ),
+            options=ShellExecutionOptions(timeout_seconds=request.timeout),
+        )
+
+    async def close(self) -> None:
+        return None
+
+
+class _LocalManagedShellEnvironment(_ManagedShellEnvironment):
+    def runtime_info(self) -> ShellRuntimeInfo:
+        return ShellRuntimeInfo(name="bash", kind="local", provider="managed-test")
+
+
+class _ActiveManagedShellEnvironment(_ManagedShellEnvironment):
+    async def execute(
+        self,
+        request: ShellExecutionRequest,
+        *,
+        callbacks: ShellExecutionCallbacks | None = None,
+    ) -> ShellExecution:
+        self.requests.append(request)
+        if callbacks is not None:
+            await callbacks.on_started(4321)
+        self.started.set()
+        try:
+            while not self.release.is_set():
+                if callbacks is not None:
+                    await callbacks.on_stdout("still working\n")
+                await asyncio.sleep(0.01)
+        except asyncio.CancelledError:
+            self.cancelled = request.terminate_on_cancel
+            raise
+        return ShellExecution(
+            result=ShellExecutionResult(stdout="", stderr="", exit_code=0),
+            options=ShellExecutionOptions(timeout_seconds=request.timeout),
+        )
+
+
+class _ParallelManagedShellEnvironment(_ManagedShellEnvironment):
+    def __init__(self) -> None:
+        super().__init__()
+        self.all_started = asyncio.Event()
+        self.releases = {
+            "first-build": asyncio.Event(),
+            "second-build": asyncio.Event(),
+        }
+
+    async def execute(
+        self,
+        request: ShellExecutionRequest,
+        *,
+        callbacks: ShellExecutionCallbacks | None = None,
+    ) -> ShellExecution:
+        self.requests.append(request)
+        if callbacks is not None:
+            await callbacks.on_started(4320 + len(self.requests))
+        if len(self.requests) == len(self.releases):
+            self.all_started.set()
+        try:
+            await self.releases[request.command].wait()
+        except asyncio.CancelledError:
+            self.cancelled = request.terminate_on_cancel
+            raise
+        if callbacks is not None:
+            await callbacks.on_stdout(f"{request.command} complete\n")
+        return ShellExecution(
+            result=ShellExecutionResult(stdout="", stderr="", exit_code=0),
+            options=ShellExecutionOptions(timeout_seconds=request.timeout),
+        )
+
+
+class _BurstThenQuietShellEnvironment(_ManagedShellEnvironment):
+    def __init__(self) -> None:
+        super().__init__()
+        self.emit = asyncio.Event()
+
+    async def execute(
+        self,
+        request: ShellExecutionRequest,
+        *,
+        callbacks: ShellExecutionCallbacks | None = None,
+    ) -> ShellExecution:
+        self.requests.append(request)
+        if callbacks is not None:
+            await callbacks.on_started(4321)
+        self.started.set()
+        try:
+            await self.emit.wait()
+            if callbacks is not None:
+                await callbacks.on_stdout("burst output\n")
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.cancelled = request.terminate_on_cancel
+            raise
+        return ShellExecution(
+            result=ShellExecutionResult(stdout="", stderr="", exit_code=0),
+            options=ShellExecutionOptions(timeout_seconds=request.timeout),
+        )
+
+
+class _FailedCancellationShellEnvironment(_ManagedShellEnvironment):
+    async def execute(
+        self,
+        request: ShellExecutionRequest,
+        *,
+        callbacks: ShellExecutionCallbacks | None = None,
+    ) -> ShellExecution:
+        self.requests.append(request)
+        if callbacks is not None:
+            await callbacks.on_started(4321)
+        self.started.set()
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError as exc:
+            raise RuntimeError("remote termination failed") from exc
+        raise AssertionError("unreachable")
+
+
+class _CancellableLocalShellExecutor(LocalShellExecutor):
+    def __init__(self, *, logger: logging.Logger) -> None:
+        super().__init__(logger=logger)
+        self.processes: list[DummyProcess] = []
+        self.terminated_pids: list[int] = []
+        self.waiting_count = 0
+        self.waiting = asyncio.Event()
+
+    async def _start_shell_process(
+        self,
+        command: str,
+        plan: Any,
+    ) -> asyncio.subprocess.Process:
+        process = DummyProcess()
+        process.pid = 10_000 + len(self.processes)
+        self.processes.append(process)
+        return cast("asyncio.subprocess.Process", process)
+
+    async def _wait_for_process_exit(self, process: Any) -> int:
+        self.waiting_count += 1
+        self.waiting.set()
+        await asyncio.Future()
+        raise AssertionError("unreachable")
+
+    async def _terminate_process_group(
+        self,
+        process: Any,
+        *,
+        is_windows: bool,
+        reason: str,
+    ) -> None:
+        self.terminated_pids.append(process.pid)
+        process.returncode = -signal.SIGTERM
+
+
+@contextmanager
+def _no_progress():
+    yield
+
+
+def _setup_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    runtime_info: dict[str, str],
+    **runtime_kwargs: Any,
+) -> tuple[ShellRuntime, DummyProcess, dict[str, Any]]:
+    logger = logging.getLogger("shell-runtime-test")
+    shell_environment = _TestLocalShellExecutor(
+        logger=logger,
+        runtime_info=runtime_info,
+        timeout_seconds=runtime_kwargs.get("timeout_seconds", 90),
+        warning_interval_seconds=runtime_kwargs.get("warning_interval_seconds", 30),
+        config=runtime_kwargs.get("config"),
+    )
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logger,
+        shell_environment=shell_environment,
+        **runtime_kwargs,
+    )
+
+    dummy_process = DummyProcess()
+    captured: dict[str, Any] = {}
+
+    async def fake_exec(*args, **kwargs):
+        captured["exec_args"] = args
+        captured["exec_kwargs"] = kwargs
+        return dummy_process
+
+    async def fail_shell(*args, **kwargs):
+        pytest.fail("create_subprocess_shell should not be used for this test")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(asyncio, "create_subprocess_shell", fail_shell)
+    monkeypatch.setattr(console.console, "print", lambda *a, **k: None)
+    monkeypatch.setattr(progress_display, "paused", _no_progress)
+    if not hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
+        monkeypatch.setattr(
+            subprocess,
+            "CREATE_NEW_PROCESS_GROUP",
+            0x00000200,
+            raising=False,
+        )
+    if not hasattr(signal, "CTRL_BREAK_EVENT"):
+        monkeypatch.setattr(signal, "CTRL_BREAK_EVENT", object(), raising=False)
+
+    return runtime, dummy_process, captured
+
+
+def _extract_progress_payloads(logger: RecordingFastLogger) -> list[dict[str, Any]]:
+    payloads: list[dict[str, Any]] = []
+    for _, kwargs in logger.info_calls:
+        payload = kwargs.get("data")
+        if not isinstance(payload, dict):
+            continue
+        action = payload.get("progress_action")
+        if action in {ProgressAction.CALLING_TOOL, ProgressAction.TOOL_PROGRESS}:
+            payloads.append(payload)
+    return payloads
+
+
+def _parse_poll(runtime: ShellRuntime, arguments: dict[str, Any]):
+    return parse_poll_process_arguments(
+        arguments,
+        default_wait_seconds=runtime._process_poll_default_wait_seconds,
+        max_wait_seconds=runtime._max_process_poll_seconds,
+    )
+
+
+def test_shell_output_byte_limit_coerces_invalid_values() -> None:
+    logger = logging.getLogger("shell-runtime-test")
+    runtime = ShellRuntime(activation_reason="test", logger=logger)
+
+    for value in (None, 0, -1, True):
+        runtime.set_output_byte_limit(value)  # type: ignore[arg-type]
+        assert runtime.output_byte_limit == DEFAULT_TERMINAL_OUTPUT_BYTE_LIMIT
+
+    runtime.set_output_byte_limit(MAX_TERMINAL_OUTPUT_BYTE_LIMIT + 1)
+    assert runtime.output_byte_limit == MAX_TERMINAL_OUTPUT_BYTE_LIMIT
+
+    runtime.set_output_byte_limit(1024)
+    assert runtime.output_byte_limit == 1024
+
+
+def test_shell_runtime_preserves_detachment_helper_imports() -> None:
+    from fast_agent.tools.shell_command import (
+        ShellDetachmentKind,
+        classify_shell_detachment,
+    )
+
+    assert shell_runtime_module.ShellDetachmentKind is ShellDetachmentKind
+    assert shell_runtime_module.classify_shell_detachment is classify_shell_detachment
+
+
+def test_truncation_notice_style_reflects_per_call_limit() -> None:
+    configured_limit = ShellOutputBuffer(output_byte_limit=1024)
+    per_call_limit = ShellOutputBuffer(
+        output_byte_limit=1024,
+        output_byte_limit_requested=True,
+    )
+
+    assert ShellRuntime._truncation_notice_style(configured_limit) == "black on red"
+    assert ShellRuntime._truncation_notice_style(per_call_limit) == "black on blue"
+
+
+def test_shell_runtime_reads_typed_shell_settings() -> None:
+    settings = Settings(
+        shell_execution=ShellSettings(
+            output_display_lines=7,
+            show_bash=False,
+            prefer_local_shell=True,
+            process_poll_max_wait_seconds=240,
+            foreground_auto_await_max_seconds=45,
+            managed_process_poll_history_folding="on",
+        )
+    )
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger(__name__),
+        config=settings,
+    )
+
+    assert runtime._output_display_lines == 7
+    assert runtime._show_bash_output is False
+    assert runtime.prefer_local_shell is True
+    assert runtime._max_process_poll_seconds == 240
+    assert runtime._foreground_auto_await_max_seconds == 45
+
+
+@pytest.mark.parametrize(
+    "value",
+    [True, -1, float("nan"), float("inf"), MAX_FOREGROUND_AUTO_AWAIT_SECONDS + 1],
+)
+def test_shell_runtime_rejects_invalid_foreground_auto_await_override(
+    value: float,
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match="foreground_auto_await_max_seconds must be finite and between",
+    ):
+        ShellRuntime(
+            activation_reason="test",
+            logger=logging.getLogger("shell-runtime-test"),
+            foreground_auto_await_max_seconds=value,
+        )
+
+
+def test_execute_tool_schema_declares_per_call_options() -> None:
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        config=Settings(shell_execution=ShellSettings(tool_profile="native")),
+    )
+
+    assert runtime.tool is not None
+    assert runtime.tool.description is not None
+    assert "keeps running and returns a process ID" in runtime.tool.description
+    assert "Do not append '&'" in runtime.tool.description
+    assert "lifecycle='persistent'" in runtime.tool.description
+    assert set(runtime.tool.input_schema["properties"]) == {
+        "command",
+        "cwd",
+        "background",
+        "lifecycle",
+        "yield_after_idle_sec",
+        "output_byte_limit",
+    }
+    lifecycle_schema = runtime.tool.input_schema["properties"]["lifecycle"]
+    assert lifecycle_schema["enum"] == ["session", "persistent"]
+    assert lifecycle_schema["default"] == "persistent"
+    assert runtime.tool.input_schema["required"] == ["command"]
+    assert runtime.tool.input_schema["additionalProperties"] is False
+    assert {tool.name for tool in runtime.tools} == {
+        "execute",
+        "poll_process",
+        "terminate_process",
+    }
+    poll_tool = next(tool for tool in runtime.tools if tool.name == "poll_process")
+    assert set(poll_tool.input_schema["properties"]) == {
+        "process_id",
+        "wait_sec",
+        "wake_on_output",
+    }
+    assert (
+        poll_tool.input_schema["properties"]["wait_sec"]["maximum"] == MAX_PROCESS_POLL_WAIT_SECONDS
+    )
+    wake_schema = poll_tool.input_schema["properties"]["wake_on_output"]
+    assert wake_schema["default"] is False
+    assert "quiet for 2 seconds" in wake_schema["description"]
+    assert "does not end the wait by default" in (poll_tool.description or "")
+    assert "continuous output remains buffered" in (poll_tool.description or "")
+
+
+def test_minimal_process_profile_exposes_only_bash_and_process() -> None:
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        config=Settings(shell_execution=ShellSettings(tool_profile="minimal_process")),
+    )
+
+    assert [tool.name for tool in runtime.tools] == ["bash", "process"]
+    assert runtime.tool is not None
+    assert set(runtime.tool.input_schema["properties"]) == {
+        "command",
+        "run_in_background",
+    }
+    process_tool = runtime.tools[1]
+    assert set(process_tool.input_schema["properties"]) == {
+        "process_id",
+        "action",
+        "wait_sec",
+        "offset",
+        "limit",
+        "query",
+    }
+    assert process_tool.input_schema["properties"]["action"]["enum"] == [
+        "list",
+        "status",
+        "wait",
+        "stop",
+        "read_output",
+    ]
+    assert "required" not in process_tool.input_schema
+    wait_schema = process_tool.input_schema["properties"]["wait_sec"]
+    assert "default" not in wait_schema
+    assert wait_schema["maximum"] == MAX_PROCESS_POLL_WAIT_SECONDS
+    assert "Values below 10 are clamped to 10" in wait_schema["description"]
+    assert "`wait` defaults to 30 seconds" in (process_tool.description or "")
+
+
+def test_minimal_process_profile_supports_catalog_driven_shell_contract() -> None:
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        config=Settings(shell_execution=ShellSettings(tool_profile="minimal_process")),
+        minimal_shell_tool_name="Shell",
+        minimal_shell_tool_requires_description=True,
+    )
+
+    assert [tool.name for tool in runtime.tools] == ["Shell", "process"]
+    assert runtime.tool is not None
+    assert set(runtime.tool.input_schema["properties"]) == {
+        "command",
+        "description",
+        "run_in_background",
+    }
+    assert runtime.tool.input_schema["required"] == ["command", "description"]
+    assert "returned by Shell" in (runtime.tools[1].description or "")
+
+
+@pytest.mark.asyncio
+async def test_catalog_driven_shell_contract_requires_description_at_runtime() -> None:
+    environment = _RecordingShellEnvironment()
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        shell_environment=environment,
+        config=Settings(shell_execution=ShellSettings(tool_profile="minimal_process")),
+        minimal_shell_tool_name="Shell",
+        minimal_shell_tool_requires_description=True,
+    )
+
+    missing = await runtime.call_tool("Shell", {"command": "pwd"})
+    accepted = await runtime.call_tool(
+        "shell",
+        {"command": "pwd", "description": "Show the working directory"},
+    )
+
+    assert missing.is_error is True
+    assert accepted.is_error is False
+    assert [request.command for request in environment.requests] == ["pwd"]
+
+
+def test_shell_output_retention_product_defaults() -> None:
+    settings = ShellSettings()
+
+    assert settings.output_byte_limit == 16_000
+    assert settings.retain_truncated_output is True
+    assert settings.retained_output_max_bytes == 2 * 1024 * 1024
+    assert settings.retained_output_temp_directory is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "command",
+    [
+        "nohup service >service.log 2>&1 &",
+        "service &",
+        'echo "$(service >/dev/null 2>&1 &)"',
+    ],
+)
+async def test_minimal_bash_rejects_detachment_before_environment_execution(
+    command: str,
+) -> None:
+    environment = _RecordingShellEnvironment()
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        shell_environment=environment,
+        config=Settings(shell_execution=ShellSettings(tool_profile="minimal_process")),
+    )
+
+    result = await runtime.call_tool(
+        "Bash",
+        {"command": command},
+    )
+
+    assert result.is_error is True
+    assert environment.requests == []
+    assert isinstance(result.content[0], TextContent)
+    assert "run_in_background=true" in result.content[0].text
+
+
+@pytest.mark.asyncio
+async def test_minimal_bash_accepts_bitwise_arithmetic() -> None:
+    environment = _RecordingShellEnvironment()
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        shell_environment=environment,
+        config=Settings(shell_execution=ShellSettings(tool_profile="minimal_process")),
+    )
+
+    result = await runtime.call_tool(
+        "Bash",
+        {"command": "echo $((3 & 1))"},
+    )
+
+    assert result.is_error is False
+    assert [request.command for request in environment.requests] == ["echo $((3 & 1))"]
+
+
+@pytest.mark.asyncio
+async def test_direct_user_shell_bypasses_model_detachment_policy() -> None:
+    environment = _DirectShellEnvironment(stream_output=False)
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        shell_environment=environment,
+        config=Settings(shell_execution=ShellSettings(tool_profile="minimal_process")),
+    )
+
+    await runtime.execute_direct_shell("nohup service >service.log 2>&1 &")
+
+    assert environment.requests[0].command == "nohup service >service.log 2>&1 &"
+
+
+@pytest.mark.asyncio
+async def test_minimal_process_actions_map_to_managed_runtime() -> None:
+    environment = _ManagedShellEnvironment()
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        shell_environment=environment,
+        process_poll_default_wait_seconds=7,
+        config=Settings(shell_execution=ShellSettings(tool_profile="minimal_process")),
+    )
+
+    started = await runtime.call_tool(
+        "Bash",
+        {"command": "service", "run_in_background": True},
+    )
+    started_metadata = shell_runtime_module.process_result_metadata(started)
+    assert started_metadata is not None
+    assert started_metadata["lifecycle"] == "persistent"
+    assert environment.requests[0].terminate_on_cancel is False
+    assert environment.requests[0].detach is True
+    assert isinstance(started.content[0], TextContent)
+    assert "os_pid" not in started.content[0].text
+
+    status = await runtime.call_tool(
+        "Process",
+        {"process_id": "process-1", "action": "status"},
+    )
+    status_metadata = shell_runtime_module.process_result_metadata(status)
+    assert status_metadata is not None
+    assert status_metadata["poll_wait_sec"] == 0
+
+    environment.release.set()
+    waited = await runtime.call_tool(
+        "Process",
+        {"process_id": "process-1", "action": "wait"},
+    )
+    waited_metadata = shell_runtime_module.process_result_metadata(waited)
+    assert waited_metadata is not None
+    assert waited_metadata["poll_wait_sec"] == 10
+
+
+@pytest.mark.asyncio
+async def test_minimal_process_wait_uses_nonzero_fallback() -> None:
+    environment = _ManagedShellEnvironment()
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        shell_environment=environment,
+        config=Settings(shell_execution=ShellSettings(tool_profile="minimal_process")),
+    )
+
+    await runtime.call_tool(
+        "Bash",
+        {"command": "service", "run_in_background": True},
+    )
+    facade_metadata = runtime.process_tool_metadata(
+        "Process",
+        {"process_id": "process-1", "action": "status"},
+    )
+    assert "seconds_since_last_stdout" not in facade_metadata
+    assert "seconds_since_last_stderr" not in facade_metadata
+
+    environment.release.set()
+    waited = await runtime.call_tool(
+        "Process",
+        {"process_id": "process-1", "action": "wait"},
+    )
+
+    metadata = shell_runtime_module.process_result_metadata(waited)
+    assert metadata is not None
+    assert metadata["poll_wait_sec"] == 30
+    facade_metadata = runtime.process_tool_metadata(
+        "Process",
+        {"process_id": "process-1", "action": "wait"},
+    )
+    assert facade_metadata["wait_sec"] == 30
+
+
+@pytest.mark.asyncio
+async def test_minimal_process_wait_clamps_explicit_budget_to_ten_seconds() -> None:
+    environment = _ManagedShellEnvironment()
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        shell_environment=environment,
+        process_poll_default_wait_seconds=7,
+        config=Settings(shell_execution=ShellSettings(tool_profile="minimal_process")),
+    )
+
+    await runtime.call_tool(
+        "Bash",
+        {"command": "service", "run_in_background": True},
+    )
+    environment.release.set()
+    waited = await runtime.call_tool(
+        "Process",
+        {"process_id": "process-1", "action": "wait", "wait_sec": 3},
+    )
+
+    metadata = shell_runtime_module.process_result_metadata(waited)
+    assert metadata is not None
+    assert metadata["poll_wait_sec"] == 10
+
+
+def test_minimal_process_metadata_matches_facade_operations() -> None:
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        process_poll_default_wait_seconds=7,
+        config=Settings(shell_execution=ShellSettings(tool_profile="minimal_process")),
+    )
+
+    bash_metadata = runtime.metadata({"command": "service", "run_in_background": True})
+    assert bash_metadata["background"] is True
+    assert bash_metadata["lifecycle"] == "persistent"
+
+    status_metadata = runtime.process_tool_metadata(
+        "Process",
+        {"process_id": "process-1", "action": "status"},
+    )
+    assert status_metadata["action"] == "poll"
+    assert status_metadata["wait_sec"] == 0
+
+    wait_metadata = runtime.process_tool_metadata(
+        "Process",
+        {"process_id": "process-1", "action": "wait"},
+    )
+    assert wait_metadata["action"] == "poll"
+    assert wait_metadata["wait_sec"] == 10
+    explicit_wait_metadata = runtime.process_tool_metadata(
+        "Process",
+        {"process_id": "process-1", "action": "wait", "wait_sec": 3},
+    )
+    assert explicit_wait_metadata["action"] == "poll"
+    assert explicit_wait_metadata["wait_sec"] == 10
+
+    stop_metadata = runtime.process_tool_metadata(
+        "Process",
+        {"process_id": "process-1", "action": "stop"},
+    )
+    assert stop_metadata["action"] == "terminate"
+    assert stop_metadata["wait_sec"] is None
+
+    list_metadata = runtime.process_tool_metadata("Process", {"action": "list"})
+    assert list_metadata == {
+        "variant": "shell_process",
+        "action": "list",
+        "process_id": None,
+        "wait_sec": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_minimal_process_list_reports_retained_handles_in_creation_order() -> None:
+    environment = _ManagedShellEnvironment()
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        shell_environment=environment,
+        config=Settings(shell_execution=ShellSettings(tool_profile="minimal_process")),
+    )
+
+    empty = await runtime.call_tool("Process", {"action": "list"})
+    assert empty.is_error is False
+    assert empty.content
+    assert isinstance(empty.content[0], TextContent)
+    assert empty.content[0].text == "No managed processes."
+
+    await runtime.call_tool(
+        "Bash",
+        {"command": "service-one", "run_in_background": True},
+    )
+    await runtime.call_tool(
+        "Bash",
+        {"command": "service-two", "run_in_background": True},
+    )
+
+    listed = await runtime.call_tool("Process", {"action": "list"})
+
+    assert listed.is_error is False
+    assert listed.content
+    assert isinstance(listed.content[0], TextContent)
+    payload = json.loads(listed.content[0].text)
+    assert [process["process_id"] for process in payload["processes"]] == [
+        "process-1",
+        "process-2",
+    ]
+    assert [process["command"] for process in payload["processes"]] == [
+        "service-one",
+        "service-two",
+    ]
+    assert all(process["status"] == "running" for process in payload["processes"])
+    assert all(process["lifecycle"] == "persistent" for process in payload["processes"])
+    assert all("os_process_id" not in process for process in payload["processes"])
+    assert all("output_spool_path" not in process for process in payload["processes"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("arguments", "expected_error"),
+    [
+        (
+            {"action": "list", "process_id": "process-1"},
+            "'process_id' must be omitted",
+        ),
+        (
+            {"action": "list", "wait_sec": 10},
+            "'wait_sec' must be omitted",
+        ),
+        (
+            {"action": "status"},
+            "'process_id' argument is required",
+        ),
+    ],
+)
+async def test_minimal_process_list_validates_discriminated_arguments(
+    arguments: dict[str, Any],
+    expected_error: str,
+) -> None:
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        config=Settings(shell_execution=ShellSettings(tool_profile="minimal_process")),
+    )
+
+    result = await runtime.call_tool("Process", arguments)
+
+    assert result.is_error is True
+    assert result.content
+    assert isinstance(result.content[0], TextContent)
+    assert expected_error in result.content[0].text
+
+
+@pytest.mark.parametrize("action", ["status", "stop"])
+def test_minimal_process_ignores_wait_for_non_wait_actions(action: str) -> None:
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        config=Settings(shell_execution=ShellSettings(tool_profile="minimal_process")),
+    )
+
+    metadata = runtime.process_tool_metadata(
+        "Process",
+        {"process_id": "process-1", "action": action, "wait_sec": 30},
+    )
+
+    assert metadata["action"] == ("poll" if action == "status" else "terminate")
+    if action == "status":
+        assert metadata["wait_sec"] == 0
+
+
+@pytest.mark.asyncio
+async def test_minimal_process_stop_terminates_managed_process() -> None:
+    environment = _ManagedShellEnvironment()
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        shell_environment=environment,
+        config=Settings(shell_execution=ShellSettings(tool_profile="minimal_process")),
+    )
+    await runtime.call_tool(
+        "Bash",
+        {"command": "service", "run_in_background": True},
+    )
+
+    stopped = await runtime.call_tool(
+        "Process",
+        {"process_id": "process-1", "action": "stop"},
+    )
+
+    metadata = shell_runtime_module.process_result_metadata(stopped)
+    assert metadata is not None
+    assert metadata["process_status"] == "terminated"
+    assert environment.cancelled is True
+
+
+def test_poll_process_schema_uses_configured_maximum_wait() -> None:
+    settings = Settings(
+        shell_execution=ShellSettings(
+            tool_profile="native",
+            process_poll_max_wait_seconds=240,
+        )
+    )
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        config=settings,
+    )
+
+    poll_tool = next(tool for tool in runtime.tools if tool.name == "poll_process")
+    wait_schema = poll_tool.input_schema["properties"]["wait_sec"]
+    assert wait_schema["maximum"] == 240
+    assert "through 240" in wait_schema["description"]
+    assert "Routine stdout/stderr is buffered" in (poll_tool.description or "")
+
+
+def test_poll_process_uses_model_default_wait_and_buffers_output() -> None:
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        process_poll_default_wait_seconds=30,
+        config=Settings(shell_execution=ShellSettings(tool_profile="native")),
+    )
+
+    poll_tool = next(tool for tool in runtime.tools if tool.name == "poll_process")
+    wait_schema = poll_tool.input_schema["properties"]["wait_sec"]
+    assert wait_schema["default"] == 30
+    assert _parse_poll(runtime, {"process_id": "process-1"}).wait_sec == 30
+    assert _parse_poll(runtime, {"process_id": "process-1"}).wake_on_output is False
+    metadata = runtime.process_tool_metadata("poll_process", {"process_id": "process-1"})
+    assert metadata["wait_sec"] == 30
+
+
+def test_poll_process_clamps_model_default_to_configured_maximum() -> None:
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        process_poll_default_wait_seconds=120,
+        config=Settings(
+            shell_execution=ShellSettings(
+                tool_profile="native",
+                process_poll_max_wait_seconds=50,
+            )
+        ),
+    )
+
+    poll_tool = next(tool for tool in runtime.tools if tool.name == "poll_process")
+    wait_schema = poll_tool.input_schema["properties"]["wait_sec"]
+    assert wait_schema["default"] == 50
+    assert _parse_poll(runtime, {"process_id": "process-1"}).wait_sec == 50
+
+
+def test_poll_process_updates_default_for_model_switch() -> None:
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        config=Settings(shell_execution=ShellSettings(tool_profile="native")),
+    )
+
+    runtime.set_process_poll_default_wait_seconds(25)
+
+    poll_tool = next(tool for tool in runtime.tools if tool.name == "poll_process")
+    wait_schema = poll_tool.input_schema["properties"]["wait_sec"]
+    assert wait_schema["default"] == 25
+    assert _parse_poll(runtime, {"process_id": "process-1"}).wait_sec == 25
+
+
+@pytest.mark.asyncio
+async def test_poll_process_rejects_wait_above_configured_maximum() -> None:
+    settings = Settings(shell_execution=ShellSettings(process_poll_max_wait_seconds=240))
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        config=settings,
+    )
+
+    result = await runtime.poll_process({"process_id": "process-1", "wait_sec": 241})
+
+    assert result.is_error is True
+    assert isinstance(result.content[0], TextContent)
+    assert "'wait_sec' argument must be at most 240" in result.content[0].text
+
+
+def test_shell_metadata_uses_effective_per_call_options() -> None:
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        working_directory=Path("/default"),
+        timeout_seconds=90,
+        output_byte_limit=1000,
+        config=Settings(shell_execution=ShellSettings(tool_profile="native")),
+    )
+
+    metadata = runtime.metadata(
+        {
+            "command": "pwd",
+            "cwd": "/per-call",
+            "yield_after_idle_sec": 15,
+            "output_byte_limit": 80,
+        }
+    )
+
+    assert metadata["working_dir"] == "/per-call"
+    assert metadata["idle_yield_seconds"] == 15
+    assert metadata["foreground_yield_seconds"] == 30
+    assert metadata["output_byte_limit"] == 80
+    assert metadata["lifecycle"] == "session"
+
+
+@pytest.mark.asyncio
+async def test_shell_environment_exports_runtime_home(tmp_path: Path) -> None:
+    settings = Settings()
+    settings._fast_agent_home = str(tmp_path / ".fast-agent")
+    executor = LocalShellExecutor(logger=logging.getLogger(__name__), config=settings)
+
+    result = await executor.execute_shell(
+        f"{sys.executable} -c \"import os; print(os.environ['FAST_AGENT_HOME'])\"",
+        cwd=tmp_path,
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout.strip() == str((tmp_path / ".fast-agent").resolve())
+
+
+@pytest.mark.asyncio
+async def test_shell_environment_strips_runtime_home_in_no_home(tmp_path: Path) -> None:
+    settings = Settings()
+    settings._fast_agent_home = str(tmp_path / ".fast-agent")
+    settings._fast_agent_no_home = True
+    executor = LocalShellExecutor(logger=logging.getLogger(__name__), config=settings)
+
+    result = await executor.execute_shell(
+        (f"{sys.executable} -c \"import os; print(os.environ.get('FAST_AGENT_HOME', 'missing'))\""),
+        cwd=tmp_path,
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout.strip() == "missing"
+
+
+@pytest.mark.asyncio
+async def test_shell_environment_terminates_process_when_cancelled() -> None:
+    executor = _CancellableLocalShellExecutor(logger=logging.getLogger(__name__))
+
+    task = asyncio.create_task(executor.execute(ShellExecutionRequest(command="long-running")))
+    await executor.waiting.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert executor.terminated_pids == [10_000]
+
+
+@pytest.mark.asyncio
+async def test_shell_environment_terminates_parallel_processes_when_cancelled() -> None:
+    executor = _CancellableLocalShellExecutor(logger=logging.getLogger(__name__))
+
+    tasks = [
+        asyncio.create_task(executor.execute(ShellExecutionRequest(command="long-running-a"))),
+        asyncio.create_task(executor.execute(ShellExecutionRequest(command="long-running-b"))),
+    ]
+    while executor.waiting_count < len(tasks):
+        await executor.waiting.wait()
+        executor.waiting.clear()
+
+    for task in tasks:
+        task.cancel()
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    assert all(isinstance(result, asyncio.CancelledError) for result in results)
+    assert executor.terminated_pids == [10_000, 10_001]
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(platform.system() == "Windows", reason="Unix process groups")
+async def test_terminate_process_returns_when_term_exits_process() -> None:
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        config=Settings(shell_execution=ShellSettings(show_bash=False)),
+    )
+
+    try:
+        await runtime.execute(
+            {
+                "command": (f'exec "{sys.executable}" -c "import time; time.sleep(30)"'),
+                "background": True,
+            }
+        )
+        for _ in range(100):
+            snapshot = (await runtime.process_snapshots())[0]
+            if snapshot.os_process_id is not None:
+                break
+            await asyncio.sleep(0.01)
+        assert snapshot.os_process_id is not None
+
+        started = time.monotonic()
+        result = await runtime.terminate_process({"process_id": "process-1"})
+        elapsed = time.monotonic() - started
+
+        assert result.is_error is False
+        assert elapsed < 1.5
+    finally:
+        await runtime.close()
+
+
+def _terminate_pid(pid_path: Path) -> None:
+    if not pid_path.exists():
+        return
+    try:
+        pid = int(pid_path.read_text(encoding="utf-8").strip())
+    except ValueError:
+        return
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            return
+        except OSError:
+            return
+        time.sleep(0.1)
+
+
+@pytest.mark.asyncio
+async def test_execute_simple_command() -> None:
+    """Test that shell runtime can execute a simple cross-platform command."""
+    logger = logging.getLogger("shell-runtime-test")
+    runtime = ShellRuntime(activation_reason="test", logger=logger, timeout_seconds=10)
+
+    # Use 'echo' which works on Windows, Linux, macOS
+    result = await runtime.execute({"command": "echo hello"})
+
+    assert result.is_error is False
+    assert result.content is not None
+    assert result.content[0].type == "text"
+    assert isinstance(result.content[0], TextContent)
+    assert "hello" in result.content[0].text
+    assert "exit code" in result.content[0].text
+
+
+@pytest.mark.asyncio
+async def test_execute_command_with_exit_code() -> None:
+    """Test that shell runtime captures non-zero exit codes."""
+    logger = logging.getLogger("shell-runtime-test")
+    runtime = ShellRuntime(activation_reason="test", logger=logger, timeout_seconds=10)
+
+    # Use different exit commands based on platform
+    if platform.system() == "Windows":
+        # Windows cmd.exe
+        result = await runtime.execute({"command": "exit 1"})
+    else:
+        # Unix shells
+        result = await runtime.execute({"command": "false"})
+
+    assert result.is_error is True
+    assert result.content is not None
+    assert result.content[0].type == "text"
+    assert isinstance(result.content[0], TextContent)
+    assert "exit code" in result.content[0].text
+
+
+@pytest.mark.asyncio
+async def test_execute_shell_returns_structured_output(tmp_path: Path) -> None:
+    logger = logging.getLogger("shell-runtime-test")
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logger,
+        timeout_seconds=10,
+        config=Settings(shell_execution=ShellSettings(show_bash=False)),
+    )
+
+    script = (
+        "import os, pathlib, sys; "
+        "print(pathlib.Path.cwd().name); "
+        "print(os.environ['FAST_AGENT_TEST_ENV']); "
+        "print('problem', file=sys.stderr)"
+    )
+    result = await runtime.execute_shell(
+        f"{sys.executable} -c {script!r}",
+        cwd=tmp_path,
+        env={"FAST_AGENT_TEST_ENV": "present"},
+    )
+
+    assert isinstance(result, ShellExecutionResult)
+    assert result.exit_code == 0
+    assert result.stdout.splitlines() == [tmp_path.name, "present"]
+    assert result.stderr == "problem\n"
+
+
+@pytest.mark.asyncio
+async def test_set_working_directory_updates_execute_shell_cwd(tmp_path: Path) -> None:
+    initial_dir = tmp_path / "initial"
+    updated_dir = tmp_path / "updated"
+    initial_dir.mkdir()
+    updated_dir.mkdir()
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        timeout_seconds=10,
+        working_directory=initial_dir,
+        config=Settings(shell_execution=ShellSettings(show_bash=False)),
+    )
+
+    runtime.set_working_directory(updated_dir)
+    result = await runtime.execute_shell(
+        f'{sys.executable} -c "import pathlib; print(pathlib.Path.cwd())"'
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout.strip() == str(updated_dir)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permits deleting the process cwd")
+@pytest.mark.asyncio
+async def test_shell_recovers_after_workspace_directory_is_replaced(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    previous_cwd = Path.cwd()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-cwd-recovery-test"),
+        timeout_seconds=10,
+        working_directory=workspace,
+        config=Settings(shell_execution=ShellSettings(show_bash=False)),
+    )
+
+    try:
+        os.chdir(workspace)
+        command = (
+            f"rm -rf -- {shlex.quote(str(workspace))} && mkdir -- {shlex.quote(str(workspace))}"
+        )
+        first = await runtime.execute_shell(command)
+
+        assert first.exit_code == 0
+        assert Path.cwd() == workspace
+        assert "Recovered deleted process working directory" in caplog.text
+        assert runtime.metadata({"command": "pwd"})["working_dir_display"] == "."
+
+        second = await runtime.execute_shell("pwd")
+
+        assert second.exit_code == 0
+        assert second.stdout.strip() == str(workspace)
+    finally:
+        os.chdir(previous_cwd)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permits deleting the process cwd")
+@pytest.mark.asyncio
+async def test_shell_recovers_to_parent_when_workspace_directory_remains_deleted(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    previous_cwd = Path.cwd()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-cwd-parent-recovery-test"),
+        timeout_seconds=10,
+        working_directory=workspace,
+        config=Settings(shell_execution=ShellSettings(show_bash=False)),
+    )
+
+    try:
+        os.chdir(workspace)
+        result = await runtime.execute_shell(f"rm -rf -- {shlex.quote(str(workspace))}")
+
+        assert result.exit_code == 0
+        assert Path.cwd() == tmp_path
+        assert "recovered to parent directory" in caplog.text
+        assert Path("trajectory.json").resolve() == tmp_path / "trajectory.json"
+        with pytest.raises(ValueError, match="Shell working directory does not exist"):
+            await runtime.execute_shell("pwd")
+    finally:
+        os.chdir(previous_cwd)
+
+
+@pytest.mark.asyncio
+async def test_shared_shell_environment_preserves_runtime_working_directory() -> None:
+    environment = _RecordingShellEnvironment(cwd="/workspace")
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        working_directory=Path("/agent-cwd"),
+        shell_environment=environment,
+    )
+
+    await runtime.execute_shell("pwd")
+
+    assert environment.cwd == "/workspace"
+    assert [(request.command, request.cwd) for request in environment.requests] == [
+        ("pwd", "/agent-cwd")
+    ]
+    assert [request.timeout for request in environment.requests] == [90]
+
+
+@pytest.mark.asyncio
+async def test_execute_tool_uses_runtime_working_directory_with_shared_environment() -> None:
+    environment = _RecordingShellEnvironment(cwd="/workspace")
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        working_directory=Path("/agent-cwd"),
+        shell_environment=environment,
+    )
+
+    result = await runtime.execute({"command": "pwd"})
+
+    assert result.is_error is False
+    assert environment.cwd == "/workspace"
+    assert [request.cwd for request in environment.requests] == ["/agent-cwd"]
+    assert [request.timeout for request in environment.requests] == [None]
+    assert [request.terminate_after_idle for request in environment.requests] == [False]
+    assert [request.retain_output for request in environment.requests] == [False]
+
+
+@pytest.mark.asyncio
+async def test_execute_honors_per_call_cwd_and_yield_options() -> None:
+    environment = _RecordingShellEnvironment(cwd="/workspace")
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        working_directory=Path("/agent-cwd"),
+        shell_environment=environment,
+    )
+
+    result = await runtime.execute(
+        {
+            "command": "pwd",
+            "cwd": "/per-call-cwd",
+            "yield_after_idle_sec": 20,
+        }
+    )
+
+    assert result.is_error is False
+    assert [
+        (request.cwd, request.timeout, request.terminate_after_idle)
+        for request in environment.requests
+    ] == [("/per-call-cwd", None, False)]
+
+
+@pytest.mark.asyncio
+async def test_execute_resolves_relative_per_call_cwd_against_active_working_directory() -> None:
+    environment = _RecordingShellEnvironment(cwd="/workspace")
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        working_directory=Path("/agent-cwd"),
+        shell_environment=environment,
+    )
+
+    result = await runtime.execute(
+        {
+            "command": "pwd",
+            "cwd": "subdir",
+        }
+    )
+
+    assert result.is_error is False
+    assert environment.resolved_paths[-1] == "/agent-cwd/subdir"
+    assert environment.requests[0].cwd == "/agent-cwd/subdir"
+
+
+@pytest.mark.asyncio
+async def test_execute_rejects_unknown_arguments_without_running() -> None:
+    environment = _RecordingShellEnvironment()
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        shell_environment=environment,
+    )
+
+    timeout_result = await runtime.execute({"command": "touch /tmp/nope", "timeout": 120000})
+    unknown_result = await runtime.execute({"command": "touch /tmp/nope", "stream": True})
+
+    assert timeout_result.is_error is True
+    assert unknown_result.is_error is True
+    assert environment.requests == []
+    assert timeout_result.content is not None
+    assert isinstance(timeout_result.content[0], TextContent)
+    assert "omit it to use the bounded foreground total-runtime cap" in (
+        timeout_result.content[0].text
+    )
+    assert "background=true to return a live process ID promptly" in (
+        timeout_result.content[0].text
+    )
+
+
+@pytest.mark.asyncio
+async def test_execute_rejects_idle_yield_over_thirty_seconds() -> None:
+    environment = _RecordingShellEnvironment()
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        shell_environment=environment,
+    )
+
+    result = await runtime.execute({"command": "sleep 3600", "yield_after_idle_sec": 31})
+
+    assert result.is_error is True
+    assert environment.requests == []
+    assert result.content is not None
+    assert isinstance(result.content[0], TextContent)
+    assert "'yield_after_idle_sec' argument must be at most 30" in result.content[0].text
+
+
+@pytest.mark.asyncio
+async def test_silent_command_yields_alive_then_poll_reports_completion() -> None:
+    environment = _ManagedShellEnvironment()
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        shell_environment=environment,
+        idle_yield_seconds=0.05,
+        foreground_yield_seconds=0.5,
+        foreground_auto_await_max_seconds=0,
+    )
+
+    result = await runtime.execute({"command": "slow-build"})
+
+    assert result.is_error is False
+    assert result.content is not None
+    assert isinstance(result.content[0], TextContent)
+    assert "Command is still running; no completion result is available yet" in (
+        result.content[0].text
+    )
+    assert "Do not rely on partial output or end the task" in result.content[0].text
+    assert "process_id: process-1" in result.content[0].text
+    assert environment.requests[0].terminate_after_idle is False
+    assert environment.requests[0].retain_output is False
+    yielded_metadata = shell_runtime_module.process_result_metadata(result)
+    assert yielded_metadata is not None
+    assert yielded_metadata["process_yield_reason"] == "idle"
+    disabled_auto_await = yielded_metadata["foreground_auto_await"]
+    assert disabled_auto_await["max_total_seconds"] == 0
+    assert disabled_auto_await["awaited_seconds"] == 0
+    assert disabled_auto_await["outcome"] == "disabled"
+
+    running_poll = await runtime.poll_process({"process_id": "process-1"})
+    assert running_poll.content is not None
+    assert isinstance(running_poll.content[0], TextContent)
+    assert "Command is still running; no completion result is available yet." in (
+        running_poll.content[0].text
+    )
+    assert "Next: call `process` with action='wait' or 'status'." in (running_poll.content[0].text)
+    assert "because it is still running" not in running_poll.content[0].text
+    assert "output_activity: 0 lines / 0 bytes since last poll" in (running_poll.content[0].text)
+    assert "no output observed for" in running_poll.content[0].text
+    running_metadata = (running_poll.meta or {})[FAST_AGENT_SHELL_PROCESS_METADATA]
+    assert running_metadata["output_bytes_since_last_poll"] == 0
+    assert running_metadata["seconds_since_last_output"] >= 0
+    assert running_metadata["has_observed_output"] is False
+    assert running_metadata["foreground_auto_await"] == disabled_auto_await
+
+    environment.release.set()
+    poll_result = await runtime.poll_process({"process_id": "process-1", "wait_sec": 1})
+
+    assert poll_result.is_error is False
+    assert poll_result.content is not None
+    assert isinstance(poll_result.content[0], TextContent)
+    assert "managed complete" in poll_result.content[0].text
+    assert "process exit code was 0" in poll_result.content[0].text
+    assert tool_result_display_metadata(poll_result).get("output_line_count") == 1
+
+
+@pytest.mark.asyncio
+async def test_foreground_auto_await_returns_completion_after_idle_yield() -> None:
+    environment = _ManagedShellEnvironment()
+    logger = RecordingFastLogger()
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logger,
+        shell_environment=environment,
+        idle_yield_seconds=0.01,
+        foreground_yield_seconds=1,
+    )
+
+    task = asyncio.create_task(
+        runtime.execute(
+            {"command": "slow-build"},
+            tool_use_id="call-build",
+        )
+    )
+    await environment.started.wait()
+    await asyncio.sleep(0.03)
+
+    assert task.done() is False
+    assert any(message == "Foreground process auto-await" for message, _ in logger.info_calls)
+
+    environment.release.set()
+    result = await asyncio.wait_for(task, timeout=0.5)
+
+    assert result.is_error is False
+    assert isinstance(result.content[0], TextContent)
+    assert "managed complete" in result.content[0].text
+    assert "still running" not in result.content[0].text
+    metadata = shell_runtime_module.process_result_metadata(result)
+    assert metadata is not None
+    assert metadata["process_status"] == "completed"
+    auto_await = metadata["foreground_auto_await"]
+    assert auto_await["initial_yield_reason"] == "idle"
+    assert auto_await["max_total_seconds"] == 240
+    assert auto_await["outcome"] == "process_finished"
+    assert auto_await["initial_yield_elapsed_seconds"] >= 0.01
+    assert auto_await["awaited_seconds"] >= 0
+    assert auto_await["total_elapsed_seconds"] >= (auto_await["initial_yield_elapsed_seconds"])
+
+
+@pytest.mark.asyncio
+async def test_foreground_auto_await_returns_failure_after_initial_yield() -> None:
+    environment = _ManagedShellEnvironment()
+    environment.exit_code = 7
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        shell_environment=environment,
+        idle_yield_seconds=0.01,
+        foreground_yield_seconds=1,
+        foreground_auto_await_max_seconds=0.5,
+    )
+
+    task = asyncio.create_task(runtime.execute({"command": "failing-build"}))
+    await environment.started.wait()
+    await asyncio.sleep(0.03)
+    environment.release.set()
+    result = await asyncio.wait_for(task, timeout=0.5)
+
+    metadata = shell_runtime_module.process_result_metadata(result)
+    assert result.is_error is True
+    assert metadata is not None
+    assert metadata["process_status"] == "failed"
+    assert metadata["exit_code"] == 7
+    assert metadata["foreground_auto_await"]["outcome"] == "process_finished"
+
+
+@pytest.mark.asyncio
+async def test_foreground_auto_await_returns_completion_after_total_runtime_yield() -> None:
+    environment = _ActiveManagedShellEnvironment()
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        shell_environment=environment,
+        idle_yield_seconds=0.2,
+        foreground_yield_seconds=0.03,
+        foreground_auto_await_max_seconds=0.5,
+    )
+
+    task = asyncio.create_task(runtime.execute({"command": "chatty-build"}))
+    await environment.started.wait()
+    await asyncio.sleep(0.06)
+
+    assert task.done() is False
+    environment.release.set()
+    result = await asyncio.wait_for(task, timeout=0.5)
+
+    metadata = shell_runtime_module.process_result_metadata(result)
+    assert result.is_error is False
+    assert metadata is not None
+    assert metadata["process_status"] == "completed"
+    assert metadata["foreground_auto_await"]["initial_yield_reason"] == "foreground"
+    assert metadata["foreground_auto_await"]["outcome"] == "process_finished"
+
+
+@pytest.mark.asyncio
+async def test_foreground_auto_await_returns_live_process_at_cap_without_stopping() -> None:
+    environment = _ManagedShellEnvironment()
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        shell_environment=environment,
+        idle_yield_seconds=0.01,
+        foreground_yield_seconds=1,
+        foreground_auto_await_max_seconds=0.04,
+    )
+
+    result = await runtime.execute({"command": "hung-build"})
+
+    assert result.is_error is False
+    assert isinstance(result.content[0], TextContent)
+    assert "foreground auto-await total-runtime cap was reached" in result.content[0].text
+    assert "The command was not stopped" in result.content[0].text
+    metadata = shell_runtime_module.process_result_metadata(result)
+    assert metadata is not None
+    assert metadata["process_status"] == "running"
+    assert metadata["process_yield_reason"] == "auto_await_cap"
+    assert metadata["lifecycle"] == "session"
+    auto_await = metadata["foreground_auto_await"]
+    assert auto_await["initial_yield_reason"] == "idle"
+    assert auto_await["max_total_seconds"] == 0.04
+    assert auto_await["outcome"] == "cap_reached"
+    assert auto_await["initial_yield_elapsed_seconds"] >= 0.01
+    assert auto_await["awaited_seconds"] < 0.04
+    assert auto_await["total_elapsed_seconds"] >= 0.035
+    assert environment.cancelled is False
+    assert runtime.active_process_count == 1
+
+    status = await runtime.poll_process({"process_id": "process-1"})
+    status_metadata = shell_runtime_module.process_result_metadata(status)
+    assert status_metadata is not None
+    assert status_metadata["foreground_auto_await"] == metadata["foreground_auto_await"]
+
+    environment.release.set()
+    completed = await runtime.poll_process({"process_id": "process-1", "wait_sec": 1})
+    completed_metadata = shell_runtime_module.process_result_metadata(completed)
+    assert completed_metadata is not None
+    assert completed_metadata["process_status"] == "completed"
+    assert completed_metadata["foreground_auto_await"] == metadata["foreground_auto_await"]
+    assert environment.cancelled is False
+
+
+@pytest.mark.asyncio
+async def test_foreground_auto_await_does_not_restart_budget_after_initial_yield() -> None:
+    environment = _ManagedShellEnvironment()
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        shell_environment=environment,
+        idle_yield_seconds=0.02,
+        foreground_yield_seconds=1,
+        foreground_auto_await_max_seconds=0.01,
+    )
+
+    started_at = time.monotonic()
+    result = await runtime.execute({"command": "already-over-budget"})
+    elapsed = time.monotonic() - started_at
+
+    metadata = shell_runtime_module.process_result_metadata(result)
+    assert metadata is not None
+    assert metadata["process_status"] == "running"
+    auto_await = metadata["foreground_auto_await"]
+    assert auto_await["max_total_seconds"] == 0.01
+    assert auto_await["initial_yield_elapsed_seconds"] >= 0.02
+    assert auto_await["awaited_seconds"] < 0.01
+    assert auto_await["total_elapsed_seconds"] >= 0.02
+    assert elapsed < 0.1
+    assert environment.cancelled is False
+
+    await runtime.terminate_process({"process_id": "process-1"})
+
+
+@pytest.mark.asyncio
+async def test_foreground_auto_await_preserves_parallel_shell_execution() -> None:
+    environment = _ParallelManagedShellEnvironment()
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        shell_environment=environment,
+        idle_yield_seconds=0.01,
+        foreground_yield_seconds=1,
+        foreground_auto_await_max_seconds=0.5,
+    )
+
+    tasks = [
+        asyncio.create_task(runtime.execute({"command": command}))
+        for command in ("first-build", "second-build")
+    ]
+    await asyncio.wait_for(environment.all_started.wait(), timeout=0.2)
+    await asyncio.sleep(0.03)
+
+    assert all(task.done() is False for task in tasks)
+    for release in environment.releases.values():
+        release.set()
+    results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=0.5)
+
+    assert [request.command for request in environment.requests] == [
+        "first-build",
+        "second-build",
+    ]
+    for result in results:
+        metadata = shell_runtime_module.process_result_metadata(result)
+        assert metadata is not None
+        assert metadata["process_status"] == "completed"
+        assert metadata["foreground_auto_await"]["outcome"] == "process_finished"
+
+
+@pytest.mark.asyncio
+async def test_cancelling_foreground_auto_await_terminates_session_process() -> None:
+    environment = _ManagedShellEnvironment()
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        shell_environment=environment,
+        idle_yield_seconds=0.01,
+        foreground_yield_seconds=1,
+        foreground_auto_await_max_seconds=1,
+    )
+
+    task = asyncio.create_task(
+        runtime.execute(
+            {"command": "cancelled-build"},
+            tool_use_id="call-build",
+        )
+    )
+    await environment.started.wait()
+    await asyncio.sleep(0.03)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert environment.cancelled is True
+    assert environment.requests[0].terminate_on_cancel is True
+    assert runtime.active_process_count == 0
+
+
+@pytest.mark.asyncio
+async def test_stopping_during_foreground_auto_await_records_termination() -> None:
+    environment = _ManagedShellEnvironment()
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        shell_environment=environment,
+        idle_yield_seconds=0.01,
+        foreground_yield_seconds=1,
+        foreground_auto_await_max_seconds=1,
+    )
+
+    execute_task = asyncio.create_task(runtime.execute({"command": "stopped-build"}))
+    await environment.started.wait()
+    await asyncio.sleep(0.03)
+
+    stopped = await runtime.terminate_process({"process_id": "process-1"})
+    result = await execute_task
+
+    stopped_metadata = shell_runtime_module.process_result_metadata(stopped)
+    result_metadata = shell_runtime_module.process_result_metadata(result)
+    assert stopped_metadata is not None
+    assert stopped_metadata["process_status"] == "terminated"
+    assert result_metadata is not None
+    assert result_metadata["process_status"] == "terminated"
+    assert result_metadata["foreground_auto_await"]["outcome"] == "terminated"
+
+
+@pytest.mark.asyncio
+async def test_runtime_close_during_foreground_auto_await_records_termination() -> None:
+    environment = _ManagedShellEnvironment()
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        shell_environment=environment,
+        idle_yield_seconds=0.01,
+        foreground_yield_seconds=1,
+        foreground_auto_await_max_seconds=1,
+    )
+
+    execute_task = asyncio.create_task(runtime.execute({"command": "shutdown-build"}))
+    await environment.started.wait()
+    await asyncio.sleep(0.03)
+
+    await runtime.close()
+    result = await execute_task
+
+    metadata = shell_runtime_module.process_result_metadata(result)
+    assert metadata is not None
+    assert metadata["process_status"] == "terminated"
+    assert metadata["foreground_auto_await"]["outcome"] == "terminated"
+    assert environment.cancelled is True
+
+
+@pytest.mark.asyncio
+async def test_poll_resource_warning_is_anchored_to_same_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshots = iter(
+        [
+            ProcessResourceSnapshot(
+                sampled_at=1.0,
+                disk_total_bytes=10 * 1024**3,
+                disk_free_bytes=8 * 1024**3,
+            ),
+            ProcessResourceSnapshot(
+                sampled_at=2.0,
+                disk_total_bytes=10 * 1024**3,
+                disk_free_bytes=1024**3,
+            ),
+        ]
+    )
+
+    async def sample(working_directory: str, pid: int | None):
+        del working_directory, pid
+        return next(snapshots)
+
+    monkeypatch.setattr(shell_runtime_module, "sample_process_resources", sample)
+    environment = _LocalManagedShellEnvironment()
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        shell_environment=environment,
+    )
+    await runtime.execute({"command": "large install", "background": True})
+
+    result = await runtime.poll_process({"process_id": "process-1"})
+
+    assert result.content is not None
+    assert isinstance(result.content[0], TextContent)
+    assert "resource_observation: disk free 1.0 GiB/10.0 GiB" in result.content[0].text
+    metadata = (result.meta or {})[FAST_AGENT_SHELL_PROCESS_METADATA]
+    assert metadata["resource_observation"].startswith("disk free 1.0 GiB")
+    assert metadata["resource_snapshot"]["disk_free_bytes"] == 1024**3
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_resource_sampler_timeout_and_error_do_not_delay_poll(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    async def sample(working_directory: str, pid: int | None):
+        nonlocal calls
+        del working_directory, pid
+        calls += 1
+        if calls == 1:
+            raise OSError("sampling unavailable")
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(shell_runtime_module, "sample_process_resources", sample)
+    environment = _LocalManagedShellEnvironment()
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        shell_environment=environment,
+    )
+    await runtime.execute({"command": "large install", "background": True})
+    started = time.monotonic()
+
+    result = await runtime.poll_process({"process_id": "process-1"})
+
+    assert result.is_error is False
+    assert time.monotonic() - started < 0.2
+    metadata = (result.meta or {})[FAST_AGENT_SHELL_PROCESS_METADATA]
+    assert "resource_snapshot" not in metadata
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_continuous_output_still_yields_at_foreground_ceiling() -> None:
+    environment = _ActiveManagedShellEnvironment()
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        shell_environment=environment,
+        idle_yield_seconds=0.2,
+        foreground_yield_seconds=0.05,
+        foreground_auto_await_max_seconds=0,
+    )
+
+    result = await runtime.execute({"command": "chatty-build"})
+
+    assert result.is_error is False
+    assert result.content is not None
+    assert isinstance(result.content[0], TextContent)
+    text = result.content[0].text
+    assert "still working" in text
+    assert "reached the foreground yield threshold" in text
+    assert "process_id: process-1" in text
+    assert environment.cancelled is False
+
+    await runtime.terminate_process({"process_id": "process-1"})
+    assert environment.cancelled is True
+
+
+@pytest.mark.asyncio
+async def test_running_poll_with_new_output_is_not_suppressed() -> None:
+    environment = _ActiveManagedShellEnvironment()
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        shell_environment=environment,
+    )
+    await runtime.execute({"command": "chatty-build", "background": True})
+    await asyncio.sleep(0.03)
+
+    result = await runtime.poll_process({"process_id": "process-1"})
+
+    assert result.content is not None
+    assert isinstance(result.content[0], TextContent)
+    assert "still working" in result.content[0].text
+    assert tool_result_display_metadata(result).get("suppress_display") is False
+    process_metadata = (result.meta or {})[FAST_AGENT_SHELL_PROCESS_METADATA]
+    assert process_metadata["process_yield_reason"] == "nonblocking"
+    await runtime.terminate_process({"process_id": "process-1"})
+
+
+@pytest.mark.asyncio
+async def test_poll_with_pending_output_reports_output_after_debounce(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        shell_runtime_module,
+        "_PROCESS_OUTPUT_DEBOUNCE_SECONDS",
+        0.05,
+    )
+    environment = _BurstThenQuietShellEnvironment()
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        shell_environment=environment,
+    )
+    await runtime.execute({"command": "chatty-build", "background": True})
+
+    started = time.monotonic()
+    poll_task = asyncio.create_task(
+        runtime.poll_process(
+            {
+                "process_id": "process-1",
+                "wait_sec": 1,
+                "wake_on_output": True,
+            }
+        )
+    )
+    await asyncio.sleep(0.01)
+    environment.emit.set()
+    result = await poll_task
+    elapsed = time.monotonic() - started
+
+    process_metadata = (result.meta or {})[FAST_AGENT_SHELL_PROCESS_METADATA]
+    assert process_metadata["process_yield_reason"] == "output"
+    assert elapsed >= 0.04
+    assert process_metadata["poll_elapsed_seconds"] < 0.5
+    assert process_metadata["output_bytes_since_last_poll"] > 0
+    assert process_metadata["seconds_since_last_output"] >= 0
+    assert process_metadata["has_observed_output"] is True
+    assert result.content is not None
+    assert isinstance(result.content[0], TextContent)
+    assert "output_activity:" in result.content[0].text
+    assert "since last output" in result.content[0].text
+    await runtime.terminate_process({"process_id": "process-1"})
+
+
+@pytest.mark.asyncio
+async def test_continuous_output_waits_until_poll_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        shell_runtime_module,
+        "_PROCESS_OUTPUT_DEBOUNCE_SECONDS",
+        0.02,
+    )
+    environment = _ActiveManagedShellEnvironment()
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        shell_environment=environment,
+    )
+    await runtime.execute({"command": "chatty-build", "background": True})
+
+    started = time.monotonic()
+    result = await runtime.poll_process(
+        {
+            "process_id": "process-1",
+            "wait_sec": 1,
+            "wake_on_output": True,
+        }
+    )
+    elapsed = time.monotonic() - started
+
+    process_metadata = (result.meta or {})[FAST_AGENT_SHELL_PROCESS_METADATA]
+    assert elapsed >= 0.9
+    assert process_metadata["process_yield_reason"] == "deadline"
+    assert process_metadata["output_bytes_since_last_poll"] > 0
+    await runtime.terminate_process({"process_id": "process-1"})
+
+
+@pytest.mark.asyncio
+async def test_terminate_process_is_not_blocked_by_quiet_poll_wait() -> None:
+    environment = _ManagedShellEnvironment()
+    settings = Settings(shell_execution=ShellSettings(process_poll_max_wait_seconds=600))
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        shell_environment=environment,
+        config=settings,
+    )
+    await runtime.execute({"command": "slow-build", "background": True})
+    poll_task = asyncio.create_task(
+        runtime.poll_process(
+            {
+                "process_id": "process-1",
+                "wait_sec": 600,
+                "wake_on_output": False,
+            }
+        )
+    )
+    await asyncio.sleep(0.03)
+
+    terminate_result = await asyncio.wait_for(
+        runtime.terminate_process({"process_id": "process-1"}),
+        timeout=0.5,
+    )
+    poll_result = await asyncio.wait_for(poll_task, timeout=0.5)
+
+    assert terminate_result.is_error is False
+    assert environment.cancelled is True
+    process_metadata = (poll_result.meta or {})[FAST_AGENT_SHELL_PROCESS_METADATA]
+    assert process_metadata["process_status"] == "terminated"
+
+
+@pytest.mark.asyncio
+async def test_poll_can_buffer_output_until_process_completes() -> None:
+    environment = _ActiveManagedShellEnvironment()
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        shell_environment=environment,
+    )
+    await runtime.execute({"command": "chatty-build", "background": True})
+    await asyncio.sleep(0.03)
+
+    poll_task = asyncio.create_task(
+        runtime.poll_process(
+            {
+                "process_id": "process-1",
+                "wait_sec": 1,
+                "wake_on_output": False,
+            }
+        )
+    )
+    await asyncio.sleep(0.05)
+    assert not poll_task.done()
+
+    environment.release.set()
+    result = await asyncio.wait_for(poll_task, timeout=1)
+
+    assert result.content is not None
+    assert isinstance(result.content[0], TextContent)
+    assert "still working" in result.content[0].text
+    assert "process exit code was 0" in result.content[0].text
+    process_metadata = (result.meta or {})[FAST_AGENT_SHELL_PROCESS_METADATA]
+    assert process_metadata["process_status"] == "completed"
+    assert process_metadata["process_yield_reason"] == "completion"
+    assert process_metadata["poll_wait_sec"] == 1
+    assert process_metadata["poll_wake_on_output"] is False
+    assert process_metadata["poll_elapsed_seconds"] < 1
+    assert process_metadata["output_bytes_since_last_poll"] > 0
+    assert process_metadata["has_observed_output"] is True
+
+
+@pytest.mark.asyncio
+async def test_poll_can_buffer_output_until_deadline() -> None:
+    environment = _ActiveManagedShellEnvironment()
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        shell_environment=environment,
+    )
+    await runtime.execute({"command": "chatty-build", "background": True})
+    await asyncio.sleep(0.03)
+
+    started = time.monotonic()
+    result = await runtime.poll_process(
+        {
+            "process_id": "process-1",
+            "wait_sec": 1,
+            "wake_on_output": False,
+        }
+    )
+    elapsed = time.monotonic() - started
+
+    assert elapsed >= 0.9
+    assert result.content is not None
+    assert isinstance(result.content[0], TextContent)
+    assert "still working" in result.content[0].text
+    assert "Managed background process is still running." in result.content[0].text
+    assert "Do not wait for it to exit" in result.content[0].text
+    assert "run readiness checks in a separate `bash` call" in result.content[0].text
+    process_metadata = (result.meta or {})[FAST_AGENT_SHELL_PROCESS_METADATA]
+    assert process_metadata["poll_elapsed_seconds"] >= 0.9
+    assert process_metadata["poll_deadline_overshoot_seconds"] >= 0
+    await runtime.terminate_process({"process_id": "process-1"})
+
+
+@pytest.mark.asyncio
+async def test_poll_rejects_non_boolean_wake_on_output() -> None:
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+    )
+
+    result = await runtime.poll_process(
+        {
+            "process_id": "process-1",
+            "wake_on_output": "false",
+        }
+    )
+
+    assert result.is_error is True
+    assert result.content is not None
+    assert isinstance(result.content[0], TextContent)
+    assert result.content[0].text == ("Error: 'wake_on_output' argument must be a boolean")
+
+
+@pytest.mark.asyncio
+async def test_background_command_returns_handle_and_terminate_cancels_job() -> None:
+    environment = _ManagedShellEnvironment()
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        shell_environment=environment,
+        config=Settings(shell_execution=ShellSettings(tool_profile="native")),
+    )
+
+    with console.console.capture() as capture:
+        result = await runtime.execute({"command": "server", "background": True})
+    rendered = capture.get()
+    assert "process-1" in rendered
+    assert "▎▶ process-1" in rendered
+    assert "▎ ▶" not in rendered
+    assert "running • background" in rendered
+    assert "pid 4321" in rendered
+    assert runtime.active_process_count == 1
+    snapshots = await runtime.process_snapshots()
+    assert len(snapshots) == 1
+    assert snapshots[0].status == "running"
+    assert snapshots[0].os_process_id == 4321
+
+    terminate_result = await runtime.terminate_process({"process_id": "process-1"})
+
+    assert result.is_error is False
+    assert result.content is not None
+    assert isinstance(result.content[0], TextContent)
+    assert "os_pid: 4321" in result.content[0].text
+    result_metadata = shell_runtime_module.process_result_metadata(result)
+    assert result_metadata is not None
+    assert result_metadata["os_process_id"] == 4321
+    assert result_metadata["process_status"] == "running"
+    assert "foreground_auto_await" not in result_metadata
+    assert terminate_result.is_error is False
+    terminate_metadata = shell_runtime_module.process_result_metadata(terminate_result)
+    assert terminate_metadata == {
+        "process_id": "process-1",
+        "process_status": "terminated",
+    }
+    assert environment.cancelled is True
+    assert terminate_result.content is not None
+    assert isinstance(terminate_result.content[0], TextContent)
+    assert "outcome: terminated" in terminate_result.content[0].text
+    assert runtime.active_process_count == 0
+    snapshots = await runtime.process_snapshots()
+    assert snapshots[0].status == "terminated"
+
+
+@pytest.mark.asyncio
+async def test_completed_process_snapshot_elapsed_time_stops_advancing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = _ManagedShellEnvironment()
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        shell_environment=environment,
+    )
+
+    await runtime.execute({"command": "quick task", "background": True})
+    environment.release.set()
+    for _ in range(100):
+        if runtime.active_process_count == 0:
+            break
+        await asyncio.sleep(0)
+
+    first = (await runtime.process_snapshots())[0]
+    assert first.status == "completed"
+    monkeypatch.setattr(
+        shell_runtime_module.time,
+        "monotonic",
+        lambda: first.elapsed_seconds + 10_000,
+    )
+
+    later = (await runtime.process_snapshots())[0]
+
+    assert later.elapsed_seconds == first.elapsed_seconds
+
+
+@pytest.mark.asyncio
+async def test_background_deferred_display_exposes_ordered_result() -> None:
+    environment = _ManagedShellEnvironment()
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        shell_environment=environment,
+    )
+
+    result = await runtime.execute(
+        {"command": "server", "background": True},
+        defer_display_to_tool_result=True,
+    )
+
+    assert tool_result_display_metadata(result).get("suppress_display") is False
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_terminate_process_reports_environment_cancellation_failure() -> None:
+    environment = _FailedCancellationShellEnvironment()
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        shell_environment=environment,
+    )
+    await runtime.execute({"command": "server", "background": True})
+
+    result = await runtime.terminate_process({"process_id": "process-1"})
+
+    assert result.is_error is True
+    assert result.content is not None
+    assert isinstance(result.content[0], TextContent)
+    assert "outcome: termination_failed" in result.content[0].text
+    assert "remote termination failed" in result.content[0].text
+    metadata = shell_runtime_module.process_result_metadata(result)
+    assert metadata is not None
+    assert metadata["process_status"] == "termination_failed"
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_tool_calls_emit_correlated_progress() -> None:
+    environment = _ManagedShellEnvironment()
+    logger = RecordingFastLogger()
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logger,
+        shell_environment=environment,
+        agent_name="assistant",
+    )
+    await runtime.execute({"command": "server", "background": True})
+    logger.info_calls.clear()
+
+    result = await runtime.call_tool(
+        "poll_process",
+        {"process_id": "process-1", "wait_sec": 0},
+        tool_use_id="call-poll",
+    )
+
+    assert result.is_error is False
+    progress_payloads = _extract_progress_payloads(logger)
+    assert [payload["tool_name"] for payload in progress_payloads] == [
+        "poll_process",
+        "poll_process",
+    ]
+    assert progress_payloads[0]["tool_event"] == "start"
+    assert progress_payloads[0]["details"] == "process-1"
+    assert progress_payloads[0]["process_id"] == "process-1"
+    assert progress_payloads[0]["process_wait_seconds"] == 0
+    assert progress_payloads[0]["process_has_observed_output"] is False
+    assert progress_payloads[0]["process_seconds_since_last_output"] >= 0
+    assert progress_payloads[0]["process_total_output_bytes"] == 0
+    assert progress_payloads[0]["process_stdout_bytes"] == 0
+    assert progress_payloads[0]["process_stderr_bytes"] == 0
+    assert "process_seconds_since_last_stdout" not in progress_payloads[0]
+    assert "process_seconds_since_last_stderr" not in progress_payloads[0]
+    assert "≤0s" not in progress_payloads[0]["details"]
+    assert progress_payloads[0]["process_elapsed_seconds"] >= 0
+    assert progress_payloads[0]["process_command"] == "server"
+    assert progress_payloads[1]["tool_terminal"] is True
+    assert progress_payloads[1]["details"] == "process-1: running"
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_active_poll_emits_throttled_output_progress() -> None:
+    environment = _BurstThenQuietShellEnvironment()
+    logger = RecordingFastLogger()
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logger,
+        shell_environment=environment,
+        agent_name="assistant",
+    )
+    await runtime.execute({"command": "server", "background": True})
+    logger.info_calls.clear()
+
+    poll_task = asyncio.create_task(
+        runtime.call_tool(
+            "poll_process",
+            {
+                "process_id": "process-1",
+                "wait_sec": 1,
+                "wake_on_output": False,
+            },
+            tool_use_id="call-poll",
+        )
+    )
+    await asyncio.sleep(0.01)
+    environment.emit.set()
+    await asyncio.sleep(0.01)
+    environment.release.set()
+    await poll_task
+
+    progress_calls = [
+        (message, kwargs["data"])
+        for message, kwargs in logger.info_calls
+        if isinstance(kwargs.get("data"), dict)
+    ]
+    output_updates = [
+        payload for message, payload in progress_calls if message == "Process output progress"
+    ]
+    assert len(output_updates) == 1
+    update = output_updates[0]
+    assert update["tool_name"] == "poll_process"
+    assert update["tool_use_id"] == "call-poll"
+    assert update["tool_event"] == "progress"
+    assert update["details"] == "process-1"
+    assert update["process_id"] == "process-1"
+    assert update["process_wait_seconds"] in {0, 1}
+    assert update["process_has_observed_output"] is True
+    assert update["process_seconds_since_last_output"] == 0
+    assert update["process_total_output_bytes"] == len("burst output\n")
+    assert update["process_seconds_since_last_stdout"] >= 0
+    assert "process_seconds_since_last_stderr" not in update
+    assert update["process_stdout_bytes"] == len("burst output\n")
+    assert update["process_stderr_bytes"] == 0
+    assert update["process_elapsed_seconds"] >= 0
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_chatty_poll_coalesces_output_progress_and_refreshes_totals() -> None:
+    environment = _ActiveManagedShellEnvironment()
+    logger = RecordingFastLogger()
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logger,
+        shell_environment=environment,
+        agent_name="assistant",
+    )
+    await runtime.execute({"command": "server", "background": True})
+    logger.info_calls.clear()
+
+    poll_task = asyncio.create_task(
+        runtime.call_tool(
+            "poll_process",
+            {
+                "process_id": "process-1",
+                "wait_sec": 2,
+                "wake_on_output": False,
+            },
+            tool_use_id="call-poll",
+        )
+    )
+    await asyncio.sleep(1.05)
+    environment.release.set()
+    await poll_task
+
+    output_updates = [
+        kwargs["data"]
+        for message, kwargs in logger.info_calls
+        if message == "Process output progress" and isinstance(kwargs.get("data"), dict)
+    ]
+    assert 2 <= len(output_updates) <= 3
+    assert (
+        output_updates[-1]["process_total_output_bytes"]
+        > (output_updates[0]["process_total_output_bytes"])
+    )
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_close_detaches_default_background_process() -> None:
+    environment = _ManagedShellEnvironment()
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        shell_environment=environment,
+    )
+
+    await runtime.execute({"command": "server", "background": True})
+    await runtime.close()
+
+    assert environment.cancelled is False
+    assert environment.requests[0].terminate_on_cancel is False
+    assert environment.requests[0].detach is True
+
+
+@pytest.mark.asyncio
+async def test_runtime_close_terminates_explicit_session_process() -> None:
+    environment = _ManagedShellEnvironment()
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        shell_environment=environment,
+    )
+
+    await runtime.execute(
+        {
+            "command": "server",
+            "background": True,
+            "lifecycle": "session",
+        }
+    )
+    await runtime.close()
+
+    assert environment.cancelled is True
+    assert environment.requests[0].detach is False
+
+
+@pytest.mark.asyncio
+async def test_runtime_close_detaches_persistent_process() -> None:
+    environment = _ManagedShellEnvironment()
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        shell_environment=environment,
+    )
+
+    await runtime.execute(
+        {
+            "command": "server",
+            "background": True,
+            "lifecycle": "persistent",
+        }
+    )
+    await runtime.close()
+
+    assert environment.cancelled is False
+    assert environment.requests[0].terminate_on_cancel is False
+    assert environment.requests[0].detach is True
+
+
+@pytest.mark.asyncio
+async def test_background_result_reports_effective_persistent_lifecycle() -> None:
+    environment = _ManagedShellEnvironment()
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        shell_environment=environment,
+    )
+
+    result = await runtime.execute({"command": "server", "background": True})
+
+    assert result.content is not None
+    assert isinstance(result.content[0], TextContent)
+    assert "effective_lifecycle: persistent" in result.content[0].text
+    metadata = (result.meta or {})[FAST_AGENT_SHELL_PROCESS_METADATA]
+    assert metadata["lifecycle"] == "persistent"
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_completed_background_result_reports_effective_lifecycle() -> None:
+    environment = _RecordingShellEnvironment()
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        shell_environment=environment,
+    )
+
+    result = await runtime.execute({"command": "quick", "background": True})
+
+    assert result.content is not None
+    assert isinstance(result.content[0], TextContent)
+    assert "effective_lifecycle: persistent" in result.content[0].text
+    metadata = (result.meta or {})[FAST_AGENT_SHELL_PROCESS_METADATA]
+    assert metadata["lifecycle"] == "persistent"
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_automatically_yielded_foreground_process_remains_session_scoped() -> None:
+    environment = _ManagedShellEnvironment()
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        shell_environment=environment,
+        config=Settings(shell_execution=ShellSettings(tool_profile="minimal_process")),
+        idle_yield_seconds=0.05,
+        foreground_yield_seconds=0.5,
+        foreground_auto_await_max_seconds=0,
+    )
+
+    result = await runtime.call_tool("Bash", {"command": "slow-build"})
+
+    assert result.content is not None
+    assert isinstance(result.content[0], TextContent)
+    assert "effective_lifecycle" not in result.content[0].text
+    assert "session-scoped and will be stopped when the agent finishes" in (result.content[0].text)
+    assert "relaunch with run_in_background=true" in result.content[0].text
+    metadata = (result.meta or {})[FAST_AGENT_SHELL_PROCESS_METADATA]
+    assert metadata["lifecycle"] == "session"
+    await runtime.close()
+    assert environment.cancelled is True
+
+
+@pytest.mark.asyncio
+async def test_runtime_close_prints_running_process_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = _ManagedShellEnvironment()
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        shell_environment=environment,
+    )
+    print_calls: list[str] = []
+
+    def record_print(*messages: object, **kwargs: object) -> None:
+        del kwargs
+        print_calls.append(" ".join(str(message) for message in messages))
+
+    monkeypatch.setattr(console.console, "print", record_print)
+    await runtime.execute({"command": "server", "background": True})
+
+    await runtime.close()
+
+    rendered = "\n".join(print_calls)
+    assert "background process is still running" in rendered
+    assert "process-1" in rendered
+    assert "lifecycle=persistent" in rendered
+
+
+@pytest.mark.asyncio
+async def test_terminate_process_overrides_persistent_lifecycle() -> None:
+    environment = _ManagedShellEnvironment()
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        shell_environment=environment,
+    )
+
+    await runtime.execute(
+        {
+            "command": "server",
+            "background": True,
+            "lifecycle": "persistent",
+        }
+    )
+    await runtime.terminate_process({"process_id": "process-1"})
+
+    assert environment.cancelled is True
+    assert environment.requests[0].terminate_on_cancel is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(platform.system() == "Windows", reason="Unix process persistence")
+async def test_local_persistent_process_survives_runtime_close(tmp_path: Path) -> None:
+    pid_path = tmp_path / "server.pid"
+    script_path = tmp_path / "server.py"
+    script_path.write_text(
+        "import os, pathlib, time\n"
+        f"pathlib.Path({str(pid_path)!r}).write_text(str(os.getpid()))\n"
+        "time.sleep(60)\n",
+        encoding="utf-8",
+    )
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        working_directory=tmp_path,
+    )
+
+    try:
+        await runtime.execute(
+            {
+                "command": f'"{sys.executable}" "{script_path}"',
+                "background": True,
+                "lifecycle": "persistent",
+            }
+        )
+        for _ in range(100):
+            if pid_path.exists():
+                break
+            await asyncio.sleep(0.01)
+        await runtime.close()
+
+        assert pid_path.exists()
+        pid = int(pid_path.read_text(encoding="utf-8"))
+        os.kill(pid, 0)
+    finally:
+        _terminate_pid(pid_path)
+
+
+@pytest.mark.asyncio
+async def test_execute_rejects_invalid_argument_payloads() -> None:
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+    )
+
+    invalid_results = [
+        await runtime.execute(None),
+        await runtime.execute({}),
+        await runtime.execute({"command": "   "}),
+        await runtime.execute({"command": 123}),  # type: ignore[dict-item]
+    ]
+
+    assert [result.is_error for result in invalid_results] == [True, True, True, True]
+    messages: list[str] = []
+    for result in invalid_results:
+        assert result.content is not None
+        assert isinstance(result.content[0], TextContent)
+        messages.append(result.content[0].text)
+
+    assert messages == [
+        "Error: arguments must be a dict",
+        "Error: 'command' argument is required and must be a string",
+        "Error: 'command' argument is required and must be a string",
+        "Error: 'command' argument is required and must be a string",
+    ]
+
+    invalid_lifecycle = await runtime.execute(
+        {"command": "server", "background": True, "lifecycle": "forever"}
+    )
+    persistent_foreground = await runtime.execute({"command": "server", "lifecycle": "persistent"})
+    assert invalid_lifecycle.content is not None
+    assert persistent_foreground.content is not None
+    assert isinstance(invalid_lifecycle.content[0], TextContent)
+    assert isinstance(persistent_foreground.content[0], TextContent)
+    assert invalid_lifecycle.content[0].text == (
+        "Error: 'lifecycle' argument must be 'session' or 'persistent'"
+    )
+    assert persistent_foreground.content[0].text == (
+        "Error: lifecycle='persistent' requires background=true"
+    )
+
+
+@pytest.mark.asyncio
+async def test_execute_reports_informative_truncation_summary() -> None:
+    logger = logging.getLogger("shell-runtime-test")
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logger,
+        timeout_seconds=10,
+        output_byte_limit=120,
+    )
+
+    long_echo = "echo " + ("x" * 2000)
+    result = await runtime.execute({"command": long_echo})
+
+    assert result.content is not None
+    assert isinstance(result.content[0], TextContent)
+    text = result.content[0].text
+    assert "[Output truncated: showing first" in text
+    assert "Increase shell_execution.output_byte_limit to retain more." in text
+    assert "omitted" in text
+
+
+@pytest.mark.asyncio
+async def test_execute_retains_truncated_output_until_runtime_close(
+    tmp_path: Path,
+) -> None:
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        timeout_seconds=10,
+        output_byte_limit=80,
+        config=Settings(
+            shell_execution=ShellSettings(
+                show_bash=False,
+                retain_truncated_output=True,
+                retained_output_max_bytes=4096,
+                retained_output_temp_directory=tmp_path,
+            )
+        ),
+    )
+
+    result = await runtime.execute({"command": f"{sys.executable} -c \"print('x' * 2000)\""})
+
+    assert result.content is not None
+    assert isinstance(result.content[0], TextContent)
+    text = result.content[0].text
+    assert "Use read_text_file for selected line ranges" in text
+    retained_directory = runtime._retained_output_directory
+    assert retained_directory is not None
+    retained_files = list(retained_directory.glob("*.log"))
+    assert len(retained_files) == 1
+    assert retained_files[0].read_text().strip() == "x" * 2000
+
+    await runtime.close()
+    assert not retained_directory.exists()
+
+
+@pytest.mark.asyncio
+async def test_execute_retained_output_reports_quota(
+    tmp_path: Path,
+) -> None:
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        timeout_seconds=10,
+        output_byte_limit=80,
+        config=Settings(
+            shell_execution=ShellSettings(
+                show_bash=False,
+                retain_truncated_output=True,
+                retained_output_max_bytes=128,
+                retained_output_temp_directory=tmp_path,
+            )
+        ),
+    )
+
+    result = await runtime.execute({"command": f"{sys.executable} -c \"print('x' * 2000)\""})
+
+    assert result.content is not None
+    assert isinstance(result.content[0], TextContent)
+    text = result.content[0].text
+    assert "temporary-file quota was reached" in text
+    retained_directory = runtime._retained_output_directory
+    assert retained_directory is not None
+    retained_files = list(retained_directory.glob("*.log"))
+    assert len(retained_files) == 1
+    assert retained_files[0].stat().st_size == 128
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_remote_execute_routes_retained_output_through_process(
+    tmp_path: Path,
+) -> None:
+    environment = _DirectShellEnvironment(
+        stream_output=True,
+        stdout="x" * 2000,
+    )
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        timeout_seconds=10,
+        output_byte_limit=80,
+        shell_environment=environment,
+        config=Settings(
+            shell_execution=ShellSettings(
+                show_bash=False,
+                retain_truncated_output=True,
+                retained_output_max_bytes=4096,
+                retained_output_temp_directory=tmp_path,
+            )
+        ),
+    )
+
+    result = await runtime.execute({"command": "produce-output"})
+
+    assert result.content is not None
+    assert isinstance(result.content[0], TextContent)
+    assert "action='read_output'" in result.content[0].text
+    assert str(tmp_path) not in result.content[0].text
+    assert "Use read_text_file for selected line ranges" not in result.content[0].text
+    assert runtime._retained_output_directory is not None
+    metadata = shell_runtime_module.process_result_metadata(result)
+    assert metadata is not None
+
+    readback = await runtime.call_tool(
+        "process",
+        {
+            "process_id": metadata["process_id"],
+            "action": "read_output",
+            "limit": 80,
+        },
+    )
+    assert readback.is_error is False
+    assert readback.content
+    assert isinstance(readback.content[0], TextContent)
+    payload = json.loads(readback.content[0].text)
+    assert payload["content"] == "x" * 80
+
+    await runtime.close()
+
+
+def test_shell_output_retention_continues_after_result_consumption(
+    tmp_path: Path,
+) -> None:
+    retained_path = tmp_path / "output.log"
+    output = ShellOutputBuffer(
+        output_byte_limit=8,
+        retained_output_path=retained_path,
+        retained_output_max_bytes=1024,
+    )
+
+    output.append("first-window\n")
+    assert output.output_truncated is True
+    output.consume()
+    output.append("later-output\n")
+
+    assert retained_path.read_text() == "first-window\nlater-output\n"
+
+
+def test_shell_output_does_not_create_file_without_truncation(
+    tmp_path: Path,
+) -> None:
+    retained_path = tmp_path / "output.log"
+    output = ShellOutputBuffer(
+        output_byte_limit=80,
+        retained_output_path=retained_path,
+        retained_output_max_bytes=1024,
+    )
+
+    output.append("short output\n")
+
+    assert retained_path.exists() is False
+
+
+def test_shell_output_tracks_raw_stdout_and_stderr_bytes() -> None:
+    output = ShellOutputBuffer(output_byte_limit=80)
+
+    output.append_stream("hello\n", is_stderr=False)
+    output.append_stream("warning\n", is_stderr=True)
+
+    assert output.lifetime_stdout_bytes == len("hello\n")
+    assert output.lifetime_stderr_bytes == len("warning\n")
+
+
+def test_shell_output_accepts_raw_byte_counts_from_spool_reader() -> None:
+    output = ShellOutputBuffer(output_byte_limit=80)
+
+    output.record_stream_bytes(4, is_stderr=False)
+    output.append_stream("�", is_stderr=False, count_bytes=False)
+
+    assert output.lifetime_stdout_bytes == 4
+
+
+@pytest.mark.asyncio
+async def test_execute_truncated_result_includes_tail() -> None:
+    logger = logging.getLogger("shell-runtime-test")
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logger,
+        timeout_seconds=10,
+        output_byte_limit=80,
+        config=Settings(shell_execution=ShellSettings(show_bash=False)),
+    )
+
+    script = "for i in range(30): print(f'line-{i:02d}')"
+    result = await runtime.execute({"command": f"{sys.executable} -c {script!r}"})
+
+    assert result.content is not None
+    assert isinstance(result.content[0], TextContent)
+    text = result.content[0].text
+    assert "line-00" in text
+    assert "line-29" in text
+    assert "last" in text
+    assert "omitted" in text
+    assert "process exit code was 0" in text
+
+
+@pytest.mark.asyncio
+async def test_execute_honors_per_call_output_byte_limit() -> None:
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        timeout_seconds=10,
+        output_byte_limit=1000,
+        config=Settings(shell_execution=ShellSettings(show_bash=False)),
+    )
+
+    result = await runtime.execute(
+        {
+            "command": f"{sys.executable} -c \"print('x' * 2000)\"",
+            "output_byte_limit": 80,
+        }
+    )
+
+    assert result.is_error is False
+    assert result.content is not None
+    assert isinstance(result.content[0], TextContent)
+    text = result.content[0].text
+    assert "[Output truncated:" in text
+    assert "showing first 40 bytes and last 40 bytes" in text
+    assert "process exit code was 0" in text
+
+
+@pytest.mark.asyncio
+async def test_execute_clamps_oversized_per_call_output_byte_limit() -> None:
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        timeout_seconds=10,
+        config=Settings(shell_execution=ShellSettings(show_bash=False)),
+    )
+
+    result = await runtime.execute(
+        {
+            "command": f"{sys.executable} -c \"print('x' * 40000)\"",
+            "output_byte_limit": 50_000,
+        }
+    )
+
+    assert result.is_error is False
+    assert result.content is not None
+    assert isinstance(result.content[0], TextContent)
+    text = result.content[0].text
+    assert "[Output truncated:" in text
+    assert "showing first 16500 bytes and last 16500 bytes" in text
+    assert "process exit code was 0" in text
+
+
+@pytest.mark.asyncio
+async def test_execute_handles_overlong_output_lines_without_timeout() -> None:
+    logger = logging.getLogger("shell-runtime-test")
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logger,
+        timeout_seconds=5,
+        output_byte_limit=256,
+        config=Settings(shell_execution=ShellSettings(show_bash=False)),
+    )
+
+    command = f'"{sys.executable}" -c "print(\'x\' * 70000)"'
+    result = await runtime.execute({"command": command})
+
+    assert result.is_error is False
+    assert result.content is not None
+    assert isinstance(result.content[0], TextContent)
+    text = result.content[0].text
+    assert "timeout after" not in text
+    assert "process exit code was 0" in text
+    assert "[Output truncated: showing first" in text
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(platform.system() == "Windows", reason="Unix inherited-pipe behavior")
+async def test_execute_returns_when_descendant_keeps_pipe_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(local_shell_executor, "_IO_DRAIN_TIMEOUT_SECONDS", 0.1)
+    monkeypatch.setattr(shell_runtime_module, "_IO_DRAIN_TIMEOUT_SECONDS", 0.1)
+    logger = logging.getLogger("shell-runtime-test")
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logger,
+        timeout_seconds=10,
+        config=Settings(shell_execution=ShellSettings(show_bash=False)),
+    )
+    pid_path = tmp_path / "descendant.pid"
+    script_path = tmp_path / "hold_pipe.py"
+    script_path.write_text(
+        "\n".join(
+            [
+                "import subprocess, sys",
+                "child = subprocess.Popen(",
+                "    [sys.executable, '-c', 'import time; time.sleep(30)'],",
+                "    stdout=sys.stdout,",
+                "    stderr=sys.stderr,",
+                "    start_new_session=True,",
+                ")",
+                f"open({str(pid_path)!r}, 'w', encoding='utf-8').write(str(child.pid))",
+                "print('parent exiting', flush=True)",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    started = time.monotonic()
+    try:
+        result = await runtime.execute({"command": f'"{sys.executable}" "{script_path}"'})
+    finally:
+        _terminate_pid(pid_path)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1
+    assert result.is_error is False
+    assert result.content is not None
+    assert isinstance(result.content[0], TextContent)
+    text = result.content[0].text
+    assert "parent exiting" in text
+    assert "Output collection stopped after" in text
+    assert "process exit code was 0" in text
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(platform.system() == "Windows", reason="Unix inherited-pipe behavior")
+async def test_direct_executor_timeout_with_inherited_pipe_does_not_hang(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(local_shell_executor, "_IO_DRAIN_TIMEOUT_SECONDS", 0.1)
+    monkeypatch.setattr(local_shell_executor, "_WATCHDOG_POLL_SECONDS", 0.05)
+    monkeypatch.setattr(shell_runtime_module, "_IO_DRAIN_TIMEOUT_SECONDS", 0.1)
+
+    async def terminate_unix_process(self: LocalShellExecutor, process: Any) -> None:
+        os.killpg(process.pid, signal.SIGTERM)
+
+    monkeypatch.setattr(
+        LocalShellExecutor,
+        "_terminate_unix_process",
+        terminate_unix_process,
+    )
+    logger = logging.getLogger("shell-runtime-test")
+    executor = LocalShellExecutor(
+        logger=logger,
+        timeout_seconds=0.1,
+        warning_interval_seconds=10,
+        working_directory=tmp_path,
+        config=Settings(shell_execution=ShellSettings(show_bash=False)),
+    )
+    pid_path = tmp_path / "descendant.pid"
+    script_path = tmp_path / "timeout_hold_pipe.py"
+    script_path.write_text(
+        "\n".join(
+            [
+                "import subprocess, sys, time",
+                "print('before idle timeout', flush=True)",
+                "child = subprocess.Popen(",
+                "    [sys.executable, '-c', 'import time; time.sleep(30)'],",
+                "    stdout=sys.stdout,",
+                "    stderr=sys.stderr,",
+                "    start_new_session=True,",
+                ")",
+                f"open({str(pid_path)!r}, 'w', encoding='utf-8').write(str(child.pid))",
+                "time.sleep(30)",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    started = time.monotonic()
+    try:
+        execution = await executor.execute(
+            ShellExecutionRequest(command=f'"{sys.executable}" "{script_path}"')
+        )
+    finally:
+        _terminate_pid(pid_path)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1
+    assert execution.timed_out is True
+    assert execution.io_drain_timed_out is True
+    assert "before idle timeout" in execution.result.stdout
+
+
+@pytest.mark.asyncio
+async def test_execute_huge_output_exits_cleanly_with_low_byte_limit() -> None:
+    logger = logging.getLogger("shell-runtime-test")
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logger,
+        timeout_seconds=10,
+        output_byte_limit=1024,
+        config=Settings(shell_execution=ShellSettings(show_bash=False)),
+    )
+
+    command = f'"{sys.executable}" -c "import sys; sys.stdout.buffer.write(b\'x\' * 5_000_000)"'
+    result = await runtime.execute({"command": command})
+
+    assert result.is_error is False
+    assert result.content is not None
+    assert isinstance(result.content[0], TextContent)
+    text = result.content[0].text
+    assert "process exit code was 0" in text
+    assert "[Output truncated: showing first" in text
+    assert len(text.encode("utf-8")) < 5_000
+
+
+@pytest.mark.asyncio
+async def test_execute_with_missing_working_directory_returns_actionable_error(
+    tmp_path: Path,
+) -> None:
+    logger = logging.getLogger("shell-runtime-test")
+    missing_dir = tmp_path / "missing-dir"
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logger,
+        timeout_seconds=10,
+        working_directory=missing_dir,
+    )
+
+    result = await runtime.execute({"command": "pwd"})
+
+    assert result.is_error is True
+    assert result.content is not None
+    assert isinstance(result.content[0], TextContent)
+    assert "Shell working directory does not exist" in result.content[0].text
+    assert str(missing_dir.resolve()) in result.content[0].text
+
+
+@pytest.mark.asyncio
+async def test_execute_with_file_working_directory_returns_actionable_error(
+    tmp_path: Path,
+) -> None:
+    logger = logging.getLogger("shell-runtime-test")
+    file_path = tmp_path / "not-a-directory.txt"
+    file_path.write_text("x", encoding="utf-8")
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logger,
+        timeout_seconds=10,
+        working_directory=file_path,
+    )
+
+    result = await runtime.execute({"command": "pwd"})
+
+    assert result.is_error is True
+    assert result.content is not None
+    assert isinstance(result.content[0], TextContent)
+    assert "Shell working directory is not a directory" in result.content[0].text
+    assert str(file_path.resolve()) in result.content[0].text
+
+
+@pytest.mark.asyncio
+async def test_timeout_returns_when_ctrl_break_exits_pwsh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(platform, "system", lambda: "Windows")
+    runtime, process, captured = _setup_runtime(
+        monkeypatch,
+        {"name": "pwsh", "path": r"C:\Program Files\PowerShell\7\pwsh.exe"},
+        timeout_seconds=0,
+        warning_interval_seconds=0,
+    )
+
+    async def fast_sleep(_):
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", fast_sleep)
+
+    execution = await runtime._environment.execute(
+        ShellExecutionRequest(command="Start-Sleep -Seconds 5", timeout=0)
+    )
+
+    ctrl_break = getattr(signal, "CTRL_BREAK_EVENT", None)
+    assert ctrl_break is not None
+    assert ctrl_break in process.sent_signals
+    assert process.terminated is False
+    assert captured["exec_args"][0].endswith("pwsh.exe")
+    assert execution.timed_out is True
+
+
+@pytest.mark.asyncio
+async def test_windows_termination_escalates_after_ctrl_break_grace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        local_shell_executor,
+        "_PROCESS_TERMINATION_GRACE_SECONDS",
+        0.01,
+    )
+    ctrl_break_event = object()
+    monkeypatch.setattr(signal, "CTRL_BREAK_EVENT", ctrl_break_event, raising=False)
+    executor = LocalShellExecutor(logger=logging.getLogger("shell-runtime-test"))
+    process = StagedTerminationProcess()
+
+    await executor._terminate_windows_process(cast("asyncio.subprocess.Process", process))
+
+    assert ctrl_break_event in process.sent_signals
+    assert process.terminated is True
+    assert process.killed is False
+
+
+@pytest.mark.asyncio
+async def test_execute_no_output_shows_compact_exit_banner_detail() -> None:
+    """No-output commands should include compact '(no output)' + id detail."""
+    logger = logging.getLogger("shell-runtime-test")
+    runtime = ShellRuntime(activation_reason="test", logger=logger, timeout_seconds=10)
+
+    command = "exit 0" if platform.system() == "Windows" else "true"
+
+    with console.console.capture() as capture:
+        result = await runtime.execute(
+            {"command": command},
+            tool_use_id="call_abcdef0123456789",
+            show_tool_call_id=True,
+        )
+
+    assert result.is_error is False
+    rendered = capture.get()
+    assert "exit code 0" in rendered
+    assert "(no output)" in rendered
+    assert "id: call_" in rendered
+
+
+@pytest.mark.asyncio
+async def test_compact_tool_shell_defers_live_output_to_result_summary() -> None:
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        config=Settings(),
+        shell_environment=_DirectShellEnvironment(
+            stream_output=True,
+            stdout="hidden compact output\n",
+        ),
+    )
+
+    with console.console.capture() as capture:
+        result = await runtime.execute({"command": "compact-output"})
+
+    assert "hidden compact output" not in capture.get()
+    assert tool_result_display_metadata(result).get("suppress_display") is False
+    assert isinstance(result.content[0], TextContent)
+    assert "hidden compact output" in result.content[0].text
+
+
+@pytest.mark.asyncio
+async def test_execute_direct_shell_displays_streamed_output_once() -> None:
+    logger = logging.getLogger("shell-runtime-test")
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logger,
+        shell_environment=_DirectShellEnvironment(stream_output=True),
+    )
+
+    with console.console.capture() as capture:
+        result = await runtime.execute_direct_shell("print-streamed")
+
+    rendered = capture.get()
+    assert result.stdout == "streamed\n"
+    assert rendered.count("streamed") == 1
+    assert "exit code" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_execute_direct_shell_displays_buffered_output_when_adapter_does_not_stream() -> None:
+    logger = logging.getLogger("shell-runtime-test")
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logger,
+        shell_environment=_DirectShellEnvironment(stream_output=False),
+    )
+
+    with console.console.capture() as capture:
+        result = await runtime.execute_direct_shell("print-buffered")
+
+    rendered = capture.get()
+    assert result.stdout == "buffered\n"
+    assert rendered.count("buffered") == 1
+    assert "exit code" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_execute_direct_shell_ignores_configured_display_line_limit() -> None:
+    logger = logging.getLogger("shell-runtime-test")
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logger,
+        config=Settings(shell_execution=ShellSettings(output_display_lines=5, show_bash=True)),
+        shell_environment=_DirectShellEnvironment(
+            stream_output=True,
+            stdout="0\n1\n2\n3\n4\n5\n6\n",
+        ),
+    )
+
+    with console.console.capture() as capture:
+        result = await runtime.execute_direct_shell("seven-lines")
+
+    rendered = capture.get()
+    assert result.stdout == "0\n1\n2\n3\n4\n5\n6\n"
+    for line in ("0", "1", "2", "3", "4", "5", "6"):
+        assert line in rendered
+    assert SHELL_OUTPUT_TRUNCATION_MARKER not in rendered
+
+
+@pytest.mark.asyncio
+async def test_execute_direct_shell_displays_final_timeout_notice() -> None:
+    logger = logging.getLogger("shell-runtime-test")
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logger,
+        shell_environment=_DirectShellEnvironment(stream_output=False, timed_out=True),
+    )
+
+    with console.console.capture() as capture:
+        result = await runtime.execute_direct_shell("sleep-too-long", timeout=5)
+
+    rendered = capture.get()
+    assert result.stdout == "buffered\n"
+    assert "buffered" in rendered
+    assert "Timeout after 5s - process terminated" in rendered
+
+
+@pytest.mark.asyncio
+async def test_execute_direct_shell_does_not_duplicate_callback_timeout_notice() -> None:
+    logger = logging.getLogger("shell-runtime-test")
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logger,
+        shell_environment=_DirectShellEnvironment(stream_output=True, timed_out=True),
+    )
+
+    with console.console.capture() as capture:
+        result = await runtime.execute_direct_shell("sleep-too-long", timeout=5)
+
+    rendered = capture.get()
+    assert result.stdout == "streamed\n"
+    assert rendered.count("Timeout") == 1
+
+
+@pytest.mark.asyncio
+async def test_execute_live_display_truncates_with_head_and_tail_windows() -> None:
+    """Live shell display should show head + marker + tail when line-limited."""
+    logger = logging.getLogger("shell-runtime-test")
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logger,
+        timeout_seconds=10,
+        config=Settings(
+            logger=LoggerSettings(tool_display=ToolDisplaySettings(results="all")),
+            shell_execution=ShellSettings(output_display_lines=6, show_bash=True),
+        ),
+    )
+
+    command = f'"{sys.executable}" -c "for i in range(1, 11): print(\'out-{{0:02d}}\'.format(i))"'
+
+    with console.console.capture() as capture:
+        result = await runtime.execute({"command": command})
+
+    assert result.is_error is False
+    rendered = capture.get()
+    assert "out-01" in rendered
+    assert "out-02" in rendered
+    assert "out-03" in rendered
+    assert "out-08" in rendered
+    assert "out-09" in rendered
+    assert "out-10" in rendered
+    assert "out-04" not in rendered
+    assert "out-05" not in rendered
+    assert "out-06" not in rendered
+    assert "out-07" not in rendered
+    assert SHELL_OUTPUT_TRUNCATION_MARKER in rendered
+    assert "10 lines" in rendered
+
+
+@pytest.mark.asyncio
+async def test_execute_deferred_display_suppresses_live_console_output() -> None:
+    """When display is deferred, shell runtime should not stream output directly."""
+    logger = logging.getLogger("shell-runtime-test")
+    runtime = ShellRuntime(activation_reason="test", logger=logger, timeout_seconds=10)
+
+    with console.console.capture() as capture:
+        result = await runtime.execute(
+            {"command": "echo hello"},
+            tool_use_id="call_abcdef0123456789",
+            show_tool_call_id=True,
+            defer_display_to_tool_result=True,
+        )
+
+    assert result.is_error is False
+    assert result.content is not None
+    assert isinstance(result.content[0], TextContent)
+    assert "hello" in result.content[0].text
+    assert "process exit code was 0" in result.content[0].text
+    metadata = tool_result_display_metadata(result)
+    assert metadata.get("suppress_display") is False
+    assert metadata.get("output_line_count") == 1
+    rendered = capture.get()
+    assert "hello" not in rendered
+    assert "exit code" not in rendered
+
+
+@pytest.mark.parametrize("mode", ["progress_only", "monitor_only"])
+@pytest.mark.asyncio
+async def test_suppressed_display_mode_hides_live_console_output(
+    mode: InteractiveDisplayMode,
+) -> None:
+    """Nested display modes should suppress streamed shell output."""
+    logger = logging.getLogger("shell-runtime-test")
+    runtime = ShellRuntime(activation_reason="test", logger=logger, timeout_seconds=10)
+
+    with suppress_interactive_display(mode):
+        with console.console.capture() as capture:
+            result = await runtime.execute({"command": "echo hello"})
+
+    assert result.is_error is False
+    assert result.content is not None
+    assert isinstance(result.content[0], TextContent)
+    assert "hello" in result.content[0].text
+    assert "process exit code was 0" in result.content[0].text
+    rendered = capture.get()
+    assert "hello" not in rendered
+    assert "exit code" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_execute_emits_shell_lifecycle_progress_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logger = RecordingFastLogger()
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logger,
+        timeout_seconds=10,
+        agent_name="assistant",
+        shell_environment=_TestLocalShellExecutor(
+            logger=logger,
+            runtime_info={"name": "bash", "path": "/bin/bash"},
+            timeout_seconds=10,
+            warning_interval_seconds=30,
+        ),
+    )
+
+    process = DummyProcess()
+    process.returncode = 0
+    process.stdout = DummyStream([b"hello\n"])
+    process.stderr = DummyStream([])
+
+    async def fake_shell(*args, **kwargs):
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_shell", fake_shell)
+    monkeypatch.setattr(console.console, "print", lambda *a, **k: None)
+    monkeypatch.setattr(progress_display, "paused", _no_progress)
+
+    result = await runtime.execute({"command": "echo hello"}, tool_use_id="call-123")
+    assert result.is_error is False
+
+    progress_payloads = _extract_progress_payloads(logger)
+    assert len(progress_payloads) == 2
+
+    start_payload = progress_payloads[0]
+    assert start_payload == {
+        "progress_action": ProgressAction.CALLING_TOOL,
+        "tool_name": "execute",
+        "server_name": "local",
+        "agent_name": "assistant",
+        "tool_use_id": "call-123",
+        "tool_call_id": "call-123",
+        "tool_event": "start",
+    }
+
+    end_payload = progress_payloads[1]
+    assert end_payload["progress_action"] == ProgressAction.TOOL_PROGRESS
+    assert end_payload["tool_name"] == "execute"
+    assert end_payload["server_name"] == "local"
+    assert end_payload["agent_name"] == "assistant"
+    assert end_payload["tool_use_id"] == "call-123"
+    assert end_payload["tool_call_id"] == "call-123"
+    assert end_payload["details"] == "completed (exit 0)"
+    assert end_payload["tool_state"] == "completed"
+    assert end_payload["tool_terminal"] is True
+
+
+@pytest.mark.asyncio
+async def test_execute_emits_terminal_failed_progress_when_subprocess_start_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logger = RecordingFastLogger()
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logger,
+        timeout_seconds=10,
+        agent_name="assistant",
+    )
+
+    async def fail_shell(*args, **kwargs):
+        raise RuntimeError("spawn failed")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_shell", fail_shell)
+    monkeypatch.setattr(progress_display, "paused", _no_progress)
+
+    result = await runtime.execute({"command": "echo hello"}, tool_use_id="call-456")
+
+    assert result.is_error is True
+    assert result.content is not None
+    assert isinstance(result.content[0], TextContent)
+    assert "Command execution failed" in result.content[0].text
+
+    progress_payloads = _extract_progress_payloads(logger)
+    assert len(progress_payloads) == 2
+    assert progress_payloads[0]["progress_action"] == ProgressAction.CALLING_TOOL
+    assert progress_payloads[0]["tool_event"] == "start"
+    assert progress_payloads[1]["progress_action"] == ProgressAction.TOOL_PROGRESS
+    assert progress_payloads[1]["details"] == "failed: spawn failed"
+    assert progress_payloads[1]["tool_state"] == "failed"
+    assert progress_payloads[1]["tool_terminal"] is True

@@ -1,0 +1,84 @@
+"""Shared type definitions and helpers for fast-agent.
+
+Goals:
+- Provide a stable import path for commonly used public types and helpers
+- Keep dependencies minimal to reduce import-time cycles
+"""
+
+# Re-export common enums/types
+# Public request parameters used to configure LLM calls
+# Re-export ResourceLink from MCP for convenience
+from mcp_types import ResourceLink
+
+from fast_agent.llm.request_params import (
+    RequestParams,
+    ResponseMode,
+    SamplingToolChoicePolicy,
+    StructuredToolPolicy,
+    ToolResultMode,
+)
+
+# Content helpers commonly used by users to build messages
+from fast_agent.mcp.helpers.content_helpers import (
+    audio_link,
+    ensure_multipart_messages,
+    image_link,
+    normalize_to_extended_list,
+    resource_link,
+    text_content,
+    video_link,
+)
+
+# Public message model used across providers and MCP integration
+from fast_agent.mcp.prompt_message_extended import PromptMessageExtended
+
+# Stop reason enum - imported directly to avoid circular dependency
+from .agent_io import AgentAuth, AgentRequest, AgentResponse, ProgressReporter
+from .assistant_message_phase import (
+    COMMENTARY_PHASE,
+    FINAL_ANSWER_PHASE,
+    AssistantMessagePhase,
+)
+
+# Conversation analysis utilities
+from .conversation_summary import ConversationSummary, split_into_turns
+from .llm_stop_reason import LlmStopReason
+
+# Message search utilities
+from .message_search import extract_first, extract_last, find_matches, search_messages
+
+# Tool timing metadata
+from .tool_timing import ToolTimingInfo, ToolTimings
+
+__all__ = [
+    "COMMENTARY_PHASE",
+    "FINAL_ANSWER_PHASE",
+    "AssistantMessagePhase",
+    "AgentAuth",
+    "AgentRequest",
+    "AgentResponse",
+    "ConversationSummary",
+    "LlmStopReason",
+    "PromptMessageExtended",
+    "ProgressReporter",
+    "RequestParams",
+    "ResourceLink",
+    "ResponseMode",
+    "SamplingToolChoicePolicy",
+    "StructuredToolPolicy",
+    "ToolResultMode",
+    "ToolTimingInfo",
+    "ToolTimings",
+    "audio_link",
+    "ensure_multipart_messages",
+    "extract_first",
+    "extract_last",
+    "find_matches",
+    "image_link",
+    "normalize_to_extended_list",
+    "resource_link",
+    "search_messages",
+    "split_into_turns",
+    "text_content",
+    "video_link",
+]

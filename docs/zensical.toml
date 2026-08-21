@@ -1,0 +1,216 @@
+[project]
+site_name = "fast-agent documentation"
+site_url = "https://fast-agent.ai/"
+site_description = "MCP-native agents, workflows, and servers"
+repo_url = "https://github.com/evalstate/fast-agent"
+repo_name = "evalstate/fast-agent"
+edit_uri = "edit/main/docs/docs"
+copyright = "© 2025-2026 llmindset.co.uk"
+extra_css = [
+  "stylesheets/fast-agent.css",
+  "assets/vendor/asciinema-player/asciinema-player.css",
+  "assets/vendor/asciinema-player/catppuccin.css",
+]
+extra_javascript = [
+  "assets/vendor/asciinema-player/asciinema-player.min.js",
+  "javascripts/asciinema-demos.js",
+  "javascripts/homepage-benchmark-data.js",
+  "javascripts/homepage-benchmark.js",
+  "javascripts/migration-command-converter.js",
+]
+nav = [
+  { "fast-agent" = "index.md" },
+  { "Guides" = [
+    { "Core Concepts" = "guides/core-concepts.md" },
+    { "Migrating to 0.10" = "guides/migrating-to-0-10.md" },
+    "guides/subagents.md",
+    "guides/tui.md",
+    "guides/codex.md",
+    "guides/hf-dev.md",
+    { "Migrate Automations" = "guides/migrate-automations.md" },
+    { "Agent Skills" = "guides/skills.md" },
+    "guides/batch-processing.md",
+    { "GEPA Optimization" = "guides/gepa.md" },
+    "guides/structured-outputs.md",
+    { "Privacy Filter" = "guides/privacy_filter.md" },
+    { "Compaction" = "guides/compaction.md" },
+  ] },
+  { "Agents" = [
+    { "Defining Agents" = [
+      { "Overview" = "agents/defining/index.md" },
+      { "Harness API" = "agents/defining/harness-api.md" },
+      { "Python API" = "agents/defining/python_api.md" },
+      { "Agent Cards" = "agents/defining/agent_cards.md" },
+    ] },
+    { "Execution Environments" = "agents/environments.md" },
+    { "Workflows" = "agents/workflows.md" },
+    "agents/running.md",
+    "agents/prompting.md",
+    "agents/tool_runner.md",
+    { "System Prompts" = "agents/instructions.md" },
+    { "Command Plugins" = "agents/plugins.md" },
+  ] },
+  { "Models" = [
+    { "Getting Started" = "models/index.md" },
+    { "Providers" = [
+      { "Provider Configuration" = "models/llm_providers.md" },
+      { "OpenAI" = "models/providers/openai.md" },
+      { "Anthropic" = "models/providers/anthropic.md" },
+      { "xAI" = "models/providers/xai.md" },
+      { "MetaAI" = "models/providers/metaai.md" },
+      { "DeepSeek" = "models/providers/deepseek.md" },
+      { "Moonshot" = "models/providers/moonshot.md" },
+      { "Z.ai" = "models/providers/zai.md" },
+      { "Hugging Face" = "models/providers/huggingface.md" },
+      { "Google" = "models/providers/google.md" },
+      { "llama.cpp" = "models/providers/llamacpp.md" },
+      { "Azure" = "models/providers/azure.md" },
+      { "Bedrock" = "models/providers/bedrock.md" },
+      { "Additional Providers" = "models/providers/additional.md" },
+    ] },
+    { "Reference" = [
+    { "Model Overlays" = "models/model_overlays.md" },
+    { "Models Reference" = "models/models_reference.md" },
+    { "Internal Models" = "models/internal_models.md" },
+    ]}
+  ] },
+  { "ACP" = [
+    {"Agent Client Protocol"  = [
+    { "Using as an Agent" = "acp/index.md" },
+    { "Customizing Agents" = "acp/customizing_agents.md" },
+  ]}
+  ] 
+  
+  
+  },
+  { "A2A" = [
+    { "Getting Started" = "a2a/getting-started.md" },
+    { "Use as Client" = "a2a/client.md" },
+    { "Serve as A2A Server" = "a2a/server.md" },
+    { "Host on HF" = "a2a/host-on-hf.md" },
+    { "API Usage" = "a2a/api.md" },
+    { "Protocol Compliance" = "a2a/protocol-compliance.md" },
+  ] },
+  { "MCP" = [
+    { "Overview" = "mcp/index.md" },
+    { "Migrate MCP Configuration" = "mcp/migration.md" },
+    { "Client" = [
+      { "Connect to Servers" = "mcp/client-servers.md" },
+      { "Connect with OAuth" = "mcp/mcp-oauth.md" },
+      { "Inspect MCP Transports" = "mcp/mcp-inspect-transport.md" },
+    ] },
+    { "Apps" = [
+      { "MCP Apps" = "mcp/mcp-apps.md" },
+      { "OpenAI Apps SDK" = "mcp/openai-apps-sdk.md" },
+      { "FastMCP Apps Adapter" = "mcp/fastmcp-apps.md" },
+    ] },
+    { "Server" = [
+      { "Run an MCP Server" = "mcp/mcp-server.md" },
+      { "Custom MCP Servers" = "mcp/harness-adapter.md" },
+      { "Host on Hugging Face Spaces" = "mcp/huggingface-spaces.md" },
+    ] },
+    { "Features" = [
+      { "Skills over MCP" = "mcp/skills-over-mcp.md" },
+      { "Elicitations" = "mcp/elicitations.md" },
+      "mcp/resources.md",
+    ] },
+  ] },
+  { "Reference" = [
+    { "fast-agent go" = "ref/go_command.md" },
+    { "Export Command" = "ref/export_command.md" },
+    { "Batch Processing" = "ref/batch.md" },
+    { "Config File" = "ref/config_file.md" },
+    { "Command Line" = "ref/cmd_switches.md" },
+    { "Class Reference" = "ref/class_reference.md" },
+    { "Extension Reference" = "ref/extension_reference.md" },
+    { "Open Telemetry" = "ref/open_telemetry.md" },
+    { "Articles & Blog Posts" = "ref/fast_agent_ai_articles.md" },
+    { "Generated Docs" = "ref/generated_docs.md" },
+    { "Docs Automation" = "ref/docs_automation.md" },
+    { "Azure Configuration" = "ref/azure-config.md" },
+    { "About" = "ref/about.md" },
+  ] },
+]
+
+[project.theme]
+features = [
+  "navigation.instant",
+  "navigation.tracking",
+  "navigation.tabs",
+  "navigation.expand",
+  "navigation.path",
+  "navigation.sections",
+  "navigation.top",
+  "navigation.footer",
+  "content.action.edit",
+  "content.action.view",
+  "content.code.annotate",
+  "content.code.copy",
+  "content.code.select",
+  "announce.dismiss",
+  "search.highlight",
+  "search.suggest",
+  "content.tabs.link",
+]
+custom_dir = "overrides"
+logo = "assets/brand/fast-agent-icon.svg"
+favicon = "assets/brand/fast-agent-icon.svg"
+
+[project.theme.icon]
+repo = "fontawesome/brands/github"
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme)"
+primary = "custom"
+accent = "custom"
+toggle.icon = "lucide/sun-moon"
+toggle.name = "Switch to light mode"
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme: light)"
+scheme = "default"
+primary = "custom"
+accent = "custom"
+toggle.icon = "lucide/sun"
+toggle.name = "Switch to dark mode"
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme: dark)"
+scheme = "slate"
+primary = "custom"
+accent = "custom"
+toggle.icon = "lucide/moon"
+toggle.name = "Switch to system preference"
+
+[[project.extra.social]]
+icon = "fontawesome/brands/discord"
+link = "https://discord.gg/xg5cJ7ndN6"
+
+[[project.extra.social]]
+icon = "fontawesome/brands/x-twitter"
+link = "https://x.com/llmindsetuk"
+
+[[project.extra.social]]
+icon = "fontawesome/brands/github"
+link = "https://github.com/evalstate"
+
+[project.markdown_extensions.attr_list]
+[project.markdown_extensions.admonition]
+[project.markdown_extensions.pymdownx.inlinehilite]
+[project.markdown_extensions.pymdownx.keys]
+[project.markdown_extensions.pymdownx.snippets]
+base_path = ["docs", ".."]
+check_paths = true
+[project.markdown_extensions.pymdownx.superfences]
+[project.markdown_extensions.md_in_html]
+[project.markdown_extensions.pymdownx.highlight]
+anchor_linenums = true
+line_spans = "__span"
+pygments_lang_class = true
+[project.markdown_extensions.pymdownx.emoji]
+emoji_index = "zensical.extensions.emoji.twemoji"
+emoji_generator = "zensical.extensions.emoji.to_svg"
+[project.markdown_extensions.pymdownx.tabbed]
+alternate_style = true
+
+[project.plugins.search]

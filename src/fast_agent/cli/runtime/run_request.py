@@ -1,0 +1,203 @@
+"""Typed request model for CLI runtime execution."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Literal
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from fast_agent.config import MCPServerSettings
+    from fast_agent.llm.request_params import StructuredToolPolicy
+
+Mode = Literal["interactive", "serve"]
+ExecutionMode = Literal["repl", "one_shot_message", "one_shot_prompt_file"]
+
+
+def resolve_execution_mode(
+    *,
+    message: str | None,
+    prompt_file: str | None,
+) -> ExecutionMode:
+    if message is not None and prompt_file is not None:
+        raise ValueError("Cannot combine --message with --prompt-file")
+    if message is not None:
+        return "one_shot_message"
+    if prompt_file is not None:
+        return "one_shot_prompt_file"
+    return "repl"
+
+
+@dataclass(slots=True)
+class AgentRunRequest:
+    """Normalized request used by the CLI runtime."""
+
+    name: str
+    instruction: str | None
+    config_path: str | None
+    server_list: list[str] | None
+    agent_cards: list[str] | None
+    card_tools: list[str] | None
+    model: str | None
+    message: str | None
+    prompt_file: str | None
+    result_file: str | None
+    resume: str | None
+    startup_mcp_servers: dict[str, MCPServerSettings] | None
+    mcp_startup_notices: tuple[str, ...]
+    agent_name: str | None
+    target_agent_name: str | None
+    skills_directory: Path | None
+    home: Path | None
+    no_home: bool
+    shell_runtime: bool
+    no_shell: bool
+    mode: Mode
+    transport: str
+    host: str
+    port: int
+    tool_description: str | None
+    tool_name_template: str | None
+    instance_scope: str
+    permissions_enabled: bool
+    reload: bool
+    watch: bool
+    json_schema: str | None = None
+    schema_model: str | None = None
+    structured_tool_policy: StructuredToolPolicy | None = None
+    execution_mode: ExecutionMode | None = None
+    quiet: bool = False
+    timeout_seconds: int | None = None
+    missing_shell_cwd_policy: Literal["ask", "create", "warn", "error"] | None = None
+    prefer_local_shell: bool = False
+    attachments: list[str] | None = None
+    managed_mcp_agent_names: list[str] | None = None
+    environment: str | None = None
+    workspace: Path | None = None
+    trajectory_output: Path | None = None
+    trajectory_format: Literal["atif"] = "atif"
+    subagents: bool | None = None
+    subagent_model: str | None = None
+
+    def __post_init__(self) -> None:
+        self._validate_environment_options()
+        self._validate_timeout()
+        self._resolve_execution_mode()
+        self._validate_structured_options()
+
+    def _validate_environment_options(self) -> None:
+        if self.no_home and self.home is not None:
+            raise ValueError("--no-home cannot be combined with --home")
+        if self.no_home and self.resume is not None:
+            raise ValueError("--no-home cannot be combined with --resume")
+        if self.shell_runtime and self.no_shell:
+            raise ValueError("--shell cannot be combined with --no-shell")
+        if self.subagents is False and self.subagent_model is not None:
+            raise ValueError("--subagent-model cannot be combined with --no-subagents")
+        if self.subagent_model is not None:
+            self.subagents = True
+
+    def _validate_timeout(self) -> None:
+        if self.timeout_seconds is not None and self.timeout_seconds < 1:
+            raise ValueError("--timeout must be a positive integer")
+
+    def _resolve_execution_mode(self) -> None:
+        resolved_execution_mode = resolve_execution_mode(
+            message=self.message,
+            prompt_file=self.prompt_file,
+        )
+        if self.execution_mode is None:
+            self.execution_mode = resolved_execution_mode
+        elif self.execution_mode != resolved_execution_mode:
+            raise ValueError(
+                f"execution_mode {self.execution_mode!r} does not match request inputs"
+            )
+
+    def _validate_structured_options(self) -> None:
+        if self.json_schema is not None and self.schema_model is not None:
+            raise ValueError("--json-schema cannot be combined with --schema-model")
+        if self.attachments and self.execution_mode == "repl":
+            raise ValueError("--attach requires --message or --prompt-file")
+        if self.structured_tool_policy is not None:
+            self._validate_structured_tool_policy()
+        if self.json_schema is not None or self.schema_model is not None:
+            self._validate_structured_output_mode()
+
+    def _validate_structured_tool_policy(self) -> None:
+        from fast_agent.llm.request_params import is_structured_tool_policy
+
+        if not is_structured_tool_policy(self.structured_tool_policy):
+            raise ValueError(
+                "structured tool policy must be 'auto', 'always', 'defer', or 'no_tools'"
+            )
+        if self.json_schema is None:
+            raise ValueError("--structured-tool-policy requires --json-schema")
+        if self.schema_model is not None:
+            raise ValueError("--structured-tool-policy cannot be combined with --schema-model")
+
+    def _validate_structured_output_mode(self) -> None:
+        if self.execution_mode == "repl":
+            raise ValueError("--json-schema/--schema-model requires --message or --prompt-file")
+        if self.model is not None and "," in self.model:
+            raise ValueError("structured output options cannot be combined with multiple models")
+        self.quiet = True
+
+    @property
+    def allow_sessions(self) -> bool:
+        return not self.no_home
+
+    @property
+    def is_repl(self) -> bool:
+        return self.execution_mode == "repl"
+
+    def to_agent_setup_kwargs(self) -> dict[str, Any]:
+        """Convert to the legacy kwargs shape used by `_run_agent` wrappers."""
+        return {
+            "name": self.name,
+            "instruction": self.instruction,
+            "config_path": self.config_path,
+            "server_list": self.server_list,
+            "agent_cards": self.agent_cards,
+            "card_tools": self.card_tools,
+            "model": self.model,
+            "message": self.message,
+            "prompt_file": self.prompt_file,
+            "attachments": self.attachments,
+            "json_schema": self.json_schema,
+            "schema_model": self.schema_model,
+            "structured_tool_policy": self.structured_tool_policy,
+            "result_file": self.result_file,
+            "trajectory_output": self.trajectory_output,
+            "trajectory_format": self.trajectory_format,
+            "resume": self.resume,
+            "startup_mcp_servers": self.startup_mcp_servers,
+            "mcp_startup_notices": self.mcp_startup_notices,
+            "agent_name": self.agent_name,
+            "target_agent_name": self.target_agent_name,
+            "environment": self.environment,
+            "skills_directory": self.skills_directory,
+            "home": self.home,
+            "workspace": self.workspace,
+            "no_home": self.no_home,
+            "shell_runtime": self.shell_runtime,
+            "no_shell": self.no_shell,
+            "subagents": self.subagents,
+            "subagent_model": self.subagent_model,
+            "prefer_local_shell": self.prefer_local_shell,
+            "mode": self.mode,
+            "transport": self.transport,
+            "host": self.host,
+            "port": self.port,
+            "tool_description": self.tool_description,
+            "tool_name_template": self.tool_name_template,
+            "instance_scope": self.instance_scope,
+            "permissions_enabled": self.permissions_enabled,
+            "reload": self.reload,
+            "watch": self.watch,
+            "execution_mode": self.execution_mode,
+            "quiet": self.quiet,
+            "timeout_seconds": self.timeout_seconds,
+            "missing_shell_cwd_policy": self.missing_shell_cwd_policy,
+            "managed_mcp_agent_names": self.managed_mcp_agent_names,
+        }

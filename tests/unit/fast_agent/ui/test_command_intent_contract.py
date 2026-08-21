@@ -1,0 +1,472 @@
+from __future__ import annotations
+
+import pytest
+
+from fast_agent.commands.shared_command_intents import (
+    SESSION_COMMAND_COMPLETION_DESCRIPTIONS,
+)
+from fast_agent.ui.command_payloads import (
+    AgentCommand,
+    AttachCommand,
+    CardCommand,
+    CheckCommand,
+    ClearSessionsCommand,
+    CommandError,
+    CommandPayload,
+    CreateSessionCommand,
+    ForkSessionCommand,
+    HashAgentCommand,
+    HistoryReviewCommand,
+    HistoryViewCommand,
+    ListPromptsCommand,
+    ListToolsCommand,
+    LoadHistoryCommand,
+    LoadPromptCommand,
+    McpConnectCommand,
+    McpListCommand,
+    PacksCommand,
+    ResumeSessionCommand,
+    SaveHistoryCommand,
+    ShellCommand,
+    TitleSessionCommand,
+    UnknownCommand,
+)
+from fast_agent.ui.prompt import parse_special_input
+from fast_agent.ui.prompt import parser as prompt_parser
+
+type ExpectedParseResult = str | CommandPayload | dict[str, object]
+
+
+def test_session_payload_factory_table_matches_shared_simple_actions() -> None:
+    assert frozenset(prompt_parser._SESSION_PAYLOAD_FACTORIES) == {
+        "list",
+        "new",
+        "resume",
+        "title",
+        "fork",
+        "delete",
+    }
+
+
+def test_history_turn_error_formatters_cover_shared_error_codes() -> None:
+    assert frozenset(prompt_parser._HISTORY_TURN_ERROR_FORMATTERS) == {"missing", "invalid"}
+
+
+def test_session_completion_descriptions_cover_parser_actions() -> None:
+    assert set(SESSION_COMMAND_COMPLETION_DESCRIPTIONS) == {
+        "list",
+        "new",
+        "resume",
+        "title",
+        "fork",
+        "delete",
+        "clear",
+        "pin",
+        "unpin",
+        "export",
+    }
+
+
+def test_slash_parser_static_dispatch_tables_cover_expected_commands() -> None:
+    assert frozenset(prompt_parser._SIMPLE_SLASH_FACTORIES) == {
+        "system",
+        "usage",
+        "markdown",
+        "reload",
+        "environment",
+        "prompts",
+        "exit",
+        "stop",
+    }
+    assert frozenset(prompt_parser._COMMAND_PARSERS) == {
+        "help",
+        "compact",
+        "history",
+        "session",
+        "card",
+        "agent",
+        "subagents",
+        "a2a",
+        "tasks",
+        "mcp",
+        "connect",
+        "prompt",
+        "model",
+        "attach",
+        "check",
+        "commands",
+        "tool",
+        "tools",
+        "process",
+        "processes",
+    }
+    assert frozenset(prompt_parser._SLASH_ACTION_FACTORIES) == {
+        "skills",
+        "packs",
+        "plugins",
+    }
+    assert frozenset(prompt_parser._SLASH_ALIAS_PARSERS) == {
+        "save_history",
+        "save",
+        "load_history",
+        "load",
+        "resume",
+        "fast",
+    }
+    assert frozenset(prompt_parser._PROMPT_SUBCOMMAND_PARSERS) == {
+        "load",
+    }
+
+
+@pytest.mark.parametrize(
+    ("raw_input", "expected"),
+    [
+        pytest.param(
+            "/attach",
+            AttachCommand(paths=(), clear=False, error=None),
+            id="attach-open-prompt",
+        ),
+        pytest.param(
+            '/attach "./report one.pdf" ../two.png',
+            AttachCommand(paths=("./report one.pdf", "../two.png"), clear=False, error=None),
+            id="attach-paths",
+        ),
+        pytest.param(
+            "/attach CLEAR",
+            AttachCommand(paths=(), clear=True, error=None),
+            id="attach-clear",
+        ),
+        pytest.param(
+            "/history analyst",
+            HistoryViewCommand(agent="analyst"),
+            id="history-bare-target",
+        ),
+        pytest.param(
+            '/history "show"',
+            HistoryViewCommand(agent="show"),
+            id="history-quoted-subcommand-collision",
+        ),
+        pytest.param(
+            "/history show analyst",
+            HistoryViewCommand(agent="analyst", view="table"),
+            id="history-show-target",
+        ),
+        pytest.param(
+            "/history 3",
+            HistoryReviewCommand(turn_index=3, error=None),
+            id="history-bare-turn-detail",
+        ),
+        pytest.param(
+            "/history load",
+            LoadHistoryCommand(
+                filename=None,
+                error="Filename required for /history load",
+            ),
+            id="history-load-missing-filename",
+        ),
+        pytest.param(
+            '/prompt load "my prompt.md"',
+            LoadPromptCommand(filename="my prompt.md", error=None),
+            id="prompt-load-quoted-path",
+        ),
+        pytest.param(
+            "/prompt Example.JSON",
+            LoadPromptCommand(filename="Example.JSON", error=None),
+            id="prompt-bare-uppercase-json-path",
+        ),
+        pytest.param(
+            '/prompt load "unterminated',
+            CommandError(message="Invalid /prompt arguments: No closing quotation"),
+            id="prompt-load-unterminated-quote",
+        ),
+        pytest.param(
+            "/mcp list",
+            McpListCommand(),
+            id="mcp-list",
+        ),
+        pytest.param(
+            '/card load "card.yml" --as-tool',
+            CardCommand(
+                action="load",
+                source="card.yml",
+                agent_name=None,
+                as_tool=True,
+                error=None,
+            ),
+            id="card-load-as-tool",
+        ),
+        pytest.param(
+            "/agent tool remove alpha",
+            AgentCommand(
+                action="tool_remove",
+                agent_name="alpha",
+                error=None,
+            ),
+            id="agent-tool-remove",
+        ),
+        pytest.param(
+            "/session new review",
+            CreateSessionCommand(session_name="review"),
+            id="session-new",
+        ),
+        pytest.param(
+            "/session resume sess-123",
+            ResumeSessionCommand(session_id="sess-123"),
+            id="session-resume",
+        ),
+        pytest.param(
+            '/session "resume" sess-123',
+            ResumeSessionCommand(session_id="sess-123"),
+            id="session-quoted-resume",
+        ),
+        pytest.param(
+            '/resume "sess 123"',
+            ResumeSessionCommand(session_id="sess 123"),
+            id="resume-alias-quoted-id",
+        ),
+        pytest.param(
+            "/resume sess 123",
+            ResumeSessionCommand(session_id="sess 123"),
+            id="resume-alias-unquoted-multi-token-id",
+        ),
+        pytest.param(
+            "/session title Sprint Notes",
+            TitleSessionCommand(title="Sprint Notes"),
+            id="session-title",
+        ),
+        pytest.param(
+            '/session title "unterminated',
+            CommandError(message="Invalid /session arguments: No closing quotation"),
+            id="session-title-unterminated",
+        ),
+        pytest.param(
+            "/session fork forked run",
+            ForkSessionCommand(title="forked run"),
+            id="session-fork",
+        ),
+        pytest.param(
+            "/session delete all",
+            ClearSessionsCommand(target="all"),
+            id="session-delete",
+        ),
+        pytest.param(
+            "/save notes.md",
+            SaveHistoryCommand(filename="notes.md"),
+            id="save-alias",
+        ),
+        pytest.param(
+            "/load",
+            LoadHistoryCommand(filename=None, error="Filename required for /history load"),
+            id="load-alias-missing-filename",
+        ),
+        pytest.param(
+            "/packs registry",
+            PacksCommand(action="registry", argument=None),
+            id="packs-action",
+        ),
+        pytest.param(
+            "/prompts",
+            ListPromptsCommand(),
+            id="prompts-list-alias",
+        ),
+        pytest.param(
+            "/tools extra",
+            ListToolsCommand(argument="extra"),
+            id="tools-selects-named-schema",
+        ),
+        pytest.param(
+            "/tool extra",
+            ListToolsCommand(argument="extra"),
+            id="tool-selects-named-schema",
+        ),
+        pytest.param(
+            "/tool",
+            CommandError(message="Tool name required: /tool <tool-name>"),
+            id="tool-requires-name",
+        ),
+        pytest.param(
+            "/tools summary",
+            ListToolsCommand(argument="summary"),
+            id="tools-explicit-summary",
+        ),
+        pytest.param(
+            "/check models --for-model gpt-5",
+            CheckCommand(argument="models --for-model gpt-5"),
+            id="check-command",
+        ),
+        pytest.param(
+            "/connect https://example.com/mcp",
+            {
+                "kind": "mcp_connect",
+                "target_text": "https://example.com/mcp",
+                "parsed_mode": "url",
+                "server_name": None,
+                "error": None,
+            },
+            id="connect-alias-url",
+        ),
+        pytest.param(
+            "/connect @modelcontextprotocol/server-everything",
+            {
+                "kind": "mcp_connect",
+                "target_text": "@modelcontextprotocol/server-everything",
+                "parsed_mode": "npx",
+                "server_name": None,
+                "error": None,
+            },
+            id="connect-alias-npx-scoped-package",
+        ),
+        pytest.param(
+            "/connect uvx demo-server",
+            {
+                "kind": "mcp_connect",
+                "target_text": "uvx demo-server",
+                "parsed_mode": "uvx",
+                "server_name": None,
+                "error": None,
+            },
+            id="connect-alias-uvx",
+        ),
+        pytest.param(
+            "/connect python demo_server.py",
+            {
+                "kind": "mcp_connect",
+                "target_text": "python demo_server.py",
+                "parsed_mode": "stdio",
+                "server_name": None,
+                "error": None,
+            },
+            id="connect-alias-stdio",
+        ),
+        pytest.param(
+            "#review hello world",
+            HashAgentCommand(agent_name="review", message="hello world", quiet=False),
+            id="hash-agent-with-message",
+        ),
+        pytest.param(
+            "#review",
+            HashAgentCommand(agent_name="review", message="", quiet=False),
+            id="hash-agent-without-message",
+        ),
+        pytest.param(
+            "##review hello world",
+            HashAgentCommand(agent_name="review", message="hello world", quiet=True),
+            id="hash-agent-quiet",
+        ),
+        pytest.param(
+            "/does-not-exist",
+            UnknownCommand(command="/does-not-exist"),
+            id="unknown-command-fallback",
+        ),
+        pytest.param(
+            "/   ",
+            "",
+            id="whitespace-only-slash",
+        ),
+        pytest.param(
+            "   /   ",
+            "",
+            id="leading-whitespace-slash",
+        ),
+        pytest.param(
+            "! pwd",
+            ShellCommand(command="pwd", local=False, interactive=False),
+            id="environment-shell-command",
+        ),
+        pytest.param(
+            "!",
+            ShellCommand(
+                command=prompt_parser.default_shell_command(), local=False, interactive=True
+            ),
+            id="environment-interactive-shell",
+        ),
+        pytest.param(
+            "!!",
+            ShellCommand(
+                command=prompt_parser.default_shell_command(), local=True, interactive=True
+            ),
+            id="local-interactive-shell",
+        ),
+        pytest.param(
+            "!! pwd",
+            ShellCommand(command="pwd", local=True, interactive=False),
+            id="local-shell-command",
+        ),
+    ],
+)
+def test_parse_special_input_intent_contract(
+    raw_input: str,
+    expected: ExpectedParseResult,
+) -> None:
+    actual = parse_special_input(raw_input)
+    if isinstance(expected, dict):
+        assert isinstance(actual, McpConnectCommand)
+        assert actual.kind == expected["kind"]
+        assert actual.target_text == expected["target_text"]
+        assert actual.parsed_mode == expected["parsed_mode"]
+        assert actual.server_name == expected["server_name"]
+        assert actual.error == expected["error"]
+        return
+    assert actual == expected
+
+
+def test_parse_special_input_environment_command() -> None:
+    from fast_agent.ui.command_payloads import EnvironmentCommand
+
+    actual = parse_special_input("/environment")
+
+    assert isinstance(actual, EnvironmentCommand)
+
+
+@pytest.mark.parametrize("command", ["/process", "/processes"])
+def test_parse_special_input_process_command(command: str) -> None:
+    from fast_agent.ui.command_payloads import ProcessCommand
+
+    actual = parse_special_input(command)
+
+    assert isinstance(actual, ProcessCommand)
+    assert actual.show_history is False
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["/process --history", "/process history", "/processes --history"],
+)
+def test_parse_special_input_process_history_command(command: str) -> None:
+    from fast_agent.ui.command_payloads import ProcessCommand
+
+    actual = parse_special_input(command)
+
+    assert isinstance(actual, ProcessCommand)
+    assert actual.show_history is True
+
+
+def test_parse_special_input_process_rejects_unknown_option() -> None:
+    from fast_agent.ui.command_payloads import CommandError
+
+    actual = parse_special_input("/process --all")
+
+    assert isinstance(actual, CommandError)
+    assert actual.message == "Usage: /process [--history]"
+
+
+def test_parse_attach_uses_windows_aware_tokenization(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("fast_agent.utils.commandline.os.name", "nt")
+
+    actual = parse_special_input(r'/attach C:\tmp\foo.txt "C:\Program Files\bar.txt"')
+
+    assert actual == AttachCommand(
+        paths=(r"C:\tmp\foo.txt", r"C:\Program Files\bar.txt"),
+        clear=False,
+        error=None,
+    )
+
+
+def test_parse_hash_agent_command_ignores_leading_whitespace() -> None:
+    actual = parse_special_input("  ##review please check this")
+
+    assert actual == HashAgentCommand(
+        agent_name="review",
+        message="please check this",
+        quiet=True,
+    )

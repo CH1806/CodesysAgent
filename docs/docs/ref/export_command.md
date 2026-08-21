@@ -1,0 +1,135 @@
+---
+title: fast-agent export command
+description: Export persisted fast-agent session traces locally or to Hugging Face
+  Hub storage.
+social:
+  title: Export Sessions
+  tagline: Export persisted session traces locally or to Hugging Face Hub storage.
+  description: Export persisted session traces locally or to Hugging Face Hub storage.
+  alt: fast-agent social card — Export Sessions
+---
+
+
+# `fast-agent export` command
+
+Use `fast-agent export` to export a persisted session as Codex-style JSONL or
+an [ATIF v1.7](https://github.com/harbor-framework/harbor/blob/main/rfcs/0001-trajectory-format.md)
+JSON trajectory. You can write the trace locally, upload it to a Hugging Face
+URL, or do both in one step.
+
+## Usage
+
+```bash
+fast-agent export [OPTIONS] [TARGET]
+```
+
+## Targets
+
+`TARGET` can be any of:
+
+- `latest`
+- a session id
+- a session directory
+- a `session.json` snapshot path
+
+If omitted, `fast-agent export` uses the latest persisted session.
+
+## Options
+
+| Option | Description |
+| --- | --- |
+| `--list` | List recent sessions instead of exporting. Cannot be combined with export options. |
+| `--agent`, `-a <name>` | Export a specific agent history from the session. |
+| `--output`, `-o <path>` | Write the trace to this file path. Parent directories are created as needed. |
+| `--format`, `--export-format codex\|atif` | Select Codex JSONL or ATIF v1.7 JSON. Defaults to `codex`. |
+| `--hf-url <hf://...>` | Upload the exported trace to a Hugging Face URL. Supports `hf://buckets/...` and `hf://datasets/...`. |
+| `--hf-dataset <owner/name>` | Compatibility option for uploading to a Hugging Face dataset repo. Prefer `--hf-url` for new workflows. |
+| `--hf-dataset-path <path>` | Target file or folder path inside the dataset repo. Requires `--hf-dataset`. |
+| `--privacy-filter` | Redact exported text content with the local privacy filter. |
+| `--privacy-filter-path <path>` | Use a local OpenAI Privacy Filter model directory. Requires `--privacy-filter`. |
+| `--download-privacy-filter` | Download the default privacy-filter model if it is not cached. Requires `--privacy-filter`. |
+| `--privacy-filter-device auto\|cpu\|cuda` | Choose the ONNX Runtime device. Defaults to `auto`. Requires `--privacy-filter`. |
+| `--privacy-filter-variant q4\|q4f16\|q8\|fp16` | Choose the privacy-filter model variant. Defaults to `q8`. Requires `--privacy-filter`. |
+| `--privacy-filter-quant ...` | Alias for `--privacy-filter-variant`. |
+| `--show-redactions` | Print detected labels and original snippets to stderr for local review. Requires `--privacy-filter`. |
+
+## Examples
+
+```bash
+# List recent persisted sessions
+fast-agent export --list
+
+# Export the latest session to a local file
+fast-agent export latest --output trace.jsonl
+
+# Export a specific agent from a multi-agent session
+fast-agent export 2604201303-x5MNlH --agent dev --output dev-trace.jsonl
+
+# Export one Harbor-compatible ATIF document, including embedded subagents
+fast-agent export latest --format atif --output trajectory.json
+
+# Upload the latest session trace to a Hugging Face URL
+fast-agent export latest --hf-url hf://buckets/your-name/fast-agent-traces/
+
+# Upload to a Hugging Face dataset URL
+fast-agent export latest --hf-url hf://datasets/your-name/fast-agent-traces/trace.jsonl
+
+# Compatibility: upload into a folder in a dataset repo
+fast-agent export latest \
+  --hf-dataset your-name/fast-agent-traces \
+  --hf-dataset-path evals/
+
+# Export a privacy-filtered trace
+fast-agent export latest --privacy-filter --output sanitized-trace.jsonl
+
+# First privacy-filter run: allow the model download explicitly
+fast-agent export latest --privacy-filter --download-privacy-filter
+```
+
+## Behavior
+
+- The default export format is `codex` JSONL. `atif` writes a single ATIF-v1.7
+  JSON document and embeds recorded subagent trajectories with resolvable IDs.
+- `--format atif` is pinned to ATIF v1.7. Future schema versions require an
+  explicit format implementation; existing ATIF output will not silently
+  change versions.
+- If `--output` is omitted, fast-agent writes
+  `{session_id}__{agent_name}__codex.jsonl` in the current working directory.
+- The corresponding default ATIF filename is
+  `{session_id}__{agent_name}__atif.json`.
+- If `--privacy-filter` is enabled and `--output` is omitted, fast-agent writes
+  `{session_id}__{agent_name}__codex-privacy.jsonl`.
+- If the session has multiple exportable agent histories, pass `--agent`.
+- If `git_aware: true` was enabled while the session was saved, the
+  `session_meta` record includes a `git` block with the repository state
+  captured at the start of the session and at the latest save. This includes
+  the repo root, commit, capture time, branch, dirty state, GitHub `owner/repo`
+  when available, and a sanitized `origin` remote URL.
+- `--hf-url` is the preferred Hugging Face upload option. If the URL ends with
+  `/`, fast-agent appends the local filename.
+- `--hf-dataset-path` requires `--hf-dataset`.
+- If `--hf-dataset-path` ends with `/`, it is treated as a folder and fast-agent
+  appends the local filename.
+- Uploads require `huggingface_hub`.
+- Dataset repos are created automatically when needed.
+- `--privacy-filter` requires the optional `privacy` extra and applies before
+  local write/upload. See the [privacy filter guide](../guides/privacy_filter/).
+- Privacy filtering redacts trace text content, not structured provenance fields
+  such as `session_meta.git`; review git-aware exports before sharing if paths,
+  branch names, or repository names are sensitive.
+- By default, privacy filtering uses a cached model only. Add
+  `--download-privacy-filter` to allow the initial model download.
+- `--no-home` runs do not persist sessions, so there is nothing to export later.
+
+## Interactive equivalent
+
+Inside the interactive prompt, use `/session export`:
+
+```text
+/session export latest --output trace.jsonl
+/session export latest --format atif --output trajectory.json
+/session export latest --hf-url hf://buckets/your-name/fast-agent-traces/
+/session export latest --hf-url hf://datasets/your-name/fast-agent-traces/trace.jsonl
+/session export latest --privacy-filter
+/session export latest --privacy-filter --download-privacy-filter
+```

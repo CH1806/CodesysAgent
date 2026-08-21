@@ -1,0 +1,4 @@
+[submodule "skills-repo"]
+	path = skills-repo
+	url = https://github.com/fast-agent-ai/skills
+	branch = main

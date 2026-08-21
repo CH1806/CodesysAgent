@@ -1,0 +1,91 @@
+from fast_agent.ui.command_payloads import (
+    CommandError,
+    ModelFastCommand,
+    ModelManagerCommand,
+    ModelReasoningCommand,
+    ModelStatusCommand,
+    ModelSwitchCommand,
+    ModelTaskBudgetCommand,
+    ModelVerbosityCommand,
+    ModelWebFetchCommand,
+    ModelWebSearchCommand,
+    ModelXSearchCommand,
+)
+from fast_agent.ui.enhanced_prompt import parse_special_input
+
+
+def test_parse_model_defaults_to_status() -> None:
+    result = parse_special_input("/model")
+    assert isinstance(result, ModelStatusCommand)
+
+
+def test_parse_model_status_rejects_arguments() -> None:
+    result = parse_special_input("/model status typo")
+    assert result == CommandError(message="Invalid /model arguments: Usage: /model status")
+
+
+def test_parse_model_reasoning_command() -> None:
+    result = parse_special_input("/model reasoning high")
+    assert isinstance(result, ModelReasoningCommand)
+    assert result.value == "high"
+
+
+def test_parse_model_verbosity_command() -> None:
+    result = parse_special_input("/model verbosity low")
+    assert isinstance(result, ModelVerbosityCommand)
+    assert result.value == "low"
+
+
+def test_parse_model_task_budget_command() -> None:
+    result = parse_special_input("/model task_budget 128k")
+    assert isinstance(result, ModelTaskBudgetCommand)
+    assert result.value == "128k"
+
+
+def test_parse_model_fast_command() -> None:
+    result = parse_special_input("/model fast on")
+    assert isinstance(result, ModelFastCommand)
+    assert result.value == "on"
+
+
+def test_parse_model_fast_flex_command() -> None:
+    result = parse_special_input("/model fast flex")
+    assert isinstance(result, ModelFastCommand)
+    assert result.value == "flex"
+
+
+def test_parse_hidden_fast_alias_command() -> None:
+    result = parse_special_input("/fast status")
+    assert isinstance(result, ModelFastCommand)
+    assert result.value == "status"
+
+
+def test_parse_model_web_search_command() -> None:
+    result = parse_special_input("/model web_search on")
+    assert isinstance(result, ModelWebSearchCommand)
+    assert result.value == "on"
+
+
+def test_parse_model_x_search_command() -> None:
+    result = parse_special_input("/model x_search on")
+    assert isinstance(result, ModelXSearchCommand)
+    assert result.value == "on"
+
+
+def test_parse_model_web_fetch_command() -> None:
+    result = parse_special_input("/model web_fetch default")
+    assert isinstance(result, ModelWebFetchCommand)
+    assert result.value == "default"
+
+
+def test_parse_model_switch_command() -> None:
+    result = parse_special_input("/model switch gpt-5-mini")
+    assert isinstance(result, ModelSwitchCommand)
+    assert result.value == "gpt-5-mini"
+
+
+def test_parse_model_doctor_command() -> None:
+    result = parse_special_input("/model doctor")
+    assert isinstance(result, ModelManagerCommand)
+    assert result.action == "doctor"
+    assert result.argument is None

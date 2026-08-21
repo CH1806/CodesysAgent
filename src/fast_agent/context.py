@@ -1,0 +1,282 @@
+from __future__ import annotations
+
+import logging
+import uuid
+import warnings
+from importlib.metadata import PackageNotFoundError, version
+from os import PathLike
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+from opentelemetry import trace
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.propagate import set_global_textmap
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
+from opentelemetry.sdk.trace.sampling import ParentBased, TraceIdRatioBased
+from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+from pydantic import BaseModel, ConfigDict, Field
+
+from fast_agent.config import Settings, get_settings
+from fast_agent.core.executor.executor import AsyncioExecutor, Executor
+from fast_agent.core.logging.events import EventFilter, StreamingExclusionFilter
+from fast_agent.core.logging.logger import LoggingConfig, get_logger
+from fast_agent.core.logging.transport import create_transport
+from fast_agent.mcp_server_registry import ServerRegistry
+from fast_agent.paths import resolve_log_file_path
+from fast_agent.skills import SkillRegistry
+from fast_agent.utils.async_utils import run_sync
+
+if TYPE_CHECKING:
+    from fast_agent.acp.acp_context import ACPContext
+    from fast_agent.core.executor.workflow_signal import SignalWaitCallback
+    from fast_agent.mcp.mcp_connection_manager import MCPConnectionManager
+    from fast_agent.session.session_manager import SessionManager
+else:
+    # Runtime placeholders for the types
+    ACPContext = Any
+    SignalWaitCallback = Any
+    MCPConnectionManager = Any
+    SessionManager = Any
+
+logger = get_logger(__name__)
+
+_otel_tracer_provider: TracerProvider | None = None
+
+"""
+A central context object to store global state that is shared across the application.
+"""
+
+
+class Context(BaseModel):
+    """
+    Context that is passed around through the application.
+    This is a global context that is shared across the application.
+    """
+
+    config: Settings | None = None
+    executor: Executor | None = None
+    signal_notification: SignalWaitCallback | None = None
+
+    # Registries
+    server_registry: ServerRegistry | None = None
+    skill_registry: SkillRegistry | None = None
+    runtime_mcp_server_names: dict[str, tuple[str, ...]] = Field(default_factory=dict)
+    no_shell: bool = False
+
+    tracer: trace.Tracer | None = None
+    _connection_manager: "MCPConnectionManager | None" = None
+
+    # ACP context - set when running in ACP mode
+    # Provides agents access to ACP capabilities (mode switching, commands, etc.)
+    acp: "ACPContext | None" = None
+    session_manager: "SessionManager | None" = None
+
+    model_config = ConfigDict(
+        extra="allow",
+        arbitrary_types_allowed=True,  # Tell Pydantic to defer type evaluation
+    )
+
+
+async def configure_otel(config: "Settings") -> None:
+    """
+    Configure OpenTelemetry based on the application config.
+    """
+    if not config.otel or not config.otel.enabled:
+        return
+
+    global _otel_tracer_provider
+    if _otel_tracer_provider is not None:
+        return
+
+    # Set up global textmap propagator first
+    set_global_textmap(TraceContextTextMapPropagator())
+
+    service_name = config.otel.service_name
+    try:
+        app_version = version("fast-agent-mcp")
+    except PackageNotFoundError:
+        app_version = "unknown"
+
+    resource = Resource.create(
+        attributes={
+            key: value
+            for key, value in {
+                "service.name": service_name,
+                "service.instance.id": str(uuid.uuid4())[:6],
+                "service.version": app_version,
+            }.items()
+            if value is not None
+        }
+    )
+
+    # Create provider with resource
+    tracer_provider = TracerProvider(
+        resource=resource,
+        sampler=ParentBased(TraceIdRatioBased(config.otel.sample_rate)),
+    )
+
+    # Add exporters based on config
+    otlp_endpoint = config.otel.otlp_endpoint
+    if otlp_endpoint:
+        exporter = OTLPSpanExporter(endpoint=otlp_endpoint)
+        tracer_provider.add_span_processor(BatchSpanProcessor(exporter))
+
+        if config.otel.console_debug:
+            tracer_provider.add_span_processor(BatchSpanProcessor(ConsoleSpanExporter()))
+    else:
+        # Default to console exporter in development
+        tracer_provider.add_span_processor(BatchSpanProcessor(ConsoleSpanExporter()))
+
+    # Set as global tracer provider
+    trace.set_tracer_provider(tracer_provider)
+    _otel_tracer_provider = tracer_provider
+
+    # OpenLLMetry through 0.62.1 still uses asyncio.iscoroutinefunction while
+    # importing its instrumentations. Keep that Python 3.14 deprecation local to
+    # the third-party import; importing fast-agent with telemetry disabled stays clean.
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="'asyncio.iscoroutinefunction' is deprecated.*",
+            category=DeprecationWarning,
+            module=r"opentelemetry\.instrumentation\..*\.utils",
+        )
+        warnings.filterwarnings(
+            "ignore",
+            message="Support for class-based `config` is deprecated.*",
+            category=DeprecationWarning,
+            module=r"opentelemetry\.instrumentation\.openai\..*",
+        )
+        from opentelemetry.instrumentation.anthropic import AnthropicInstrumentor
+        from opentelemetry.instrumentation.google_genai import GoogleGenAiSdkInstrumentor
+        from opentelemetry.instrumentation.openai import OpenAIInstrumentor
+
+        OpenAIInstrumentor().instrument(tracer_provider=tracer_provider)
+        GoogleGenAiSdkInstrumentor().instrument(tracer_provider=tracer_provider)
+        AnthropicInstrumentor().instrument(tracer_provider=tracer_provider)
+
+
+async def configure_logger(config: "Settings") -> None:
+    """
+    Configure logging and tracing based on the application config.
+    """
+    settings = config.logger
+    if settings.type == "file":
+        settings = settings.model_copy(update={"path": str(resolve_log_file_path(config))})
+
+    # Configure the standard Python logger used by LoggingListener so it respects settings.
+    python_logger = logging.getLogger("fast_agent")
+    python_logger.handlers.clear()
+    python_logger.setLevel(settings.level.upper())
+    python_logger.propagate = False
+
+    transport = None
+    if settings.type == "console":
+        # Console mode: use the Python logger to emit to stdout and skip additional transport output
+        handler = logging.StreamHandler()
+        handler.setLevel(settings.level.upper())
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        python_logger.addHandler(handler)
+    else:
+        # For all other modes, rely on transports (file/http/none) and keep the Python logger quiet
+        python_logger.addHandler(logging.NullHandler())
+
+    # Use StreamingExclusionFilter to prevent streaming events from flooding logs
+    event_filter: EventFilter = StreamingExclusionFilter(min_level=settings.level)
+    logger.info(f"Configuring logger with level: {settings.level}")
+    if settings.type == "console":
+        from fast_agent.core.logging.transport import NoOpTransport
+
+        transport = NoOpTransport(event_filter=event_filter)
+    else:
+        transport = create_transport(settings=settings, event_filter=event_filter)
+    await LoggingConfig.configure(
+        event_filter=event_filter,
+        transport=transport,
+        batch_size=settings.batch_size,
+        flush_interval=settings.flush_interval,
+        progress_display=settings.progress_display,
+    )
+
+
+async def configure_executor():
+    """
+    Configure the application executor.
+    """
+    return AsyncioExecutor()
+
+
+async def initialize_context(
+    config: Settings | str | PathLike[str] | None = None, store_globally: bool = False
+):
+    """
+    Initialize the global application context.
+    """
+    if config is None:
+        config = get_settings()
+    elif isinstance(config, (str, PathLike)):
+        # Accept pathlib.Path and other path-like objects for convenience in tests
+        config = get_settings(config_path=str(config))
+
+    context = Context()
+    context.config = config
+    context.server_registry = ServerRegistry(config=config)
+    if config.session_history and not config._fast_agent_no_home:
+        from fast_agent.session.session_manager import SessionManager, set_session_manager
+
+        context.session_manager = SessionManager(home_override=config.home)
+        set_session_manager(context.session_manager)
+
+    override_directories = None
+    if config.skills.directories:
+        override_directories = [Path(entry).expanduser() for entry in config.skills.directories]
+    context.skill_registry = SkillRegistry(
+        base_dir=Path.cwd(),
+        directories=override_directories,
+    )
+
+    # Configure logging and telemetry
+    await configure_otel(config)
+    await configure_logger(config)
+
+    # Configure the executor
+    context.executor = await configure_executor()
+
+    # Store the tracer in context if needed
+    if config.otel:
+        context.tracer = trace.get_tracer(config.otel.service_name)
+
+    if store_globally:
+        global _global_context
+        _global_context = context
+
+    return context
+
+
+async def cleanup_context() -> None:
+    """
+    Cleanup the global application context.
+    """
+
+    # Shutdown logging and telemetry
+    await LoggingConfig.shutdown()
+    if _otel_tracer_provider is not None:
+        _otel_tracer_provider.force_flush()
+
+
+_global_context: Context | None = None
+
+
+def get_current_context() -> Context:
+    """
+    Synchronous initializer/getter for global application context.
+    """
+    global _global_context
+    if _global_context is None:
+        result = run_sync(initialize_context)
+        if result is None:
+            raise RuntimeError("Failed to initialize global context")
+        _global_context = result
+    return _global_context

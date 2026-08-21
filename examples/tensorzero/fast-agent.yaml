@@ -1,0 +1,19 @@
+default_model: haiku
+
+tensorzero:
+  base_url: http://localhost:3000
+  api_key: verysecret
+
+logger:
+  level: "info"
+  progress_display: true
+  show_chat: true
+  show_tools: true
+  truncate_tools: true
+
+mcp:
+  servers:
+    tester:
+      target: "http://localhost:8000/t0-example-server/mcp"
+      protocol_mode: modern
+      read_transport_sse_timeout_seconds: 300

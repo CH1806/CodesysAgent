@@ -1,0 +1,55 @@
+import pytest
+
+from fast_agent.llm.stream_types import StreamChunk
+from fast_agent.ui.streaming.segments import StreamSegmentAssembler
+
+
+def test_table_rows_do_not_duplicate_when_streaming_in_parts() -> None:
+    assembler = StreamSegmentAssembler(base_kind="markdown", tool_prefix="->")
+    chunks = ["| Mission | ", "Landing Date |", "\n"]
+    for chunk in chunks:
+        assembler.handle_text(chunk)
+
+    text = "".join(segment.text for segment in assembler.segments)
+    assert text == "".join(chunks)
+
+
+def test_table_rows_do_not_duplicate_when_reasoning_interrupts() -> None:
+    assembler = StreamSegmentAssembler(base_kind="markdown", tool_prefix="->")
+
+    assembler.handle_text("| Mission ")
+    assembler.handle_stream_chunk(StreamChunk("thinking", is_reasoning=True))
+    assembler.handle_stream_chunk(StreamChunk(" done", is_reasoning=False))
+    assembler.handle_text("Mission | | Landing Date |\n")
+
+    text = "".join(segment.text for segment in assembler.segments)
+    assert text.count("| Mission Mission |") == 0
+    assert text.count("| Mission ") == 1
+
+
+def test_table_pending_row_not_duplicated_after_reasoning() -> None:
+    assembler = StreamSegmentAssembler(base_kind="markdown", tool_prefix="->")
+
+    assembler.handle_stream_chunk(StreamChunk("thinking", is_reasoning=True))
+    assembler.handle_stream_chunk(StreamChunk(" |", is_reasoning=False))
+    assert assembler.pending_table_row == " |"
+
+    assembler.handle_stream_chunk(StreamChunk(" Fact |\n", is_reasoning=False))
+    text = "".join(segment.text for segment in assembler.segments)
+    assert text.endswith(" | Fact |\n")
+
+
+@pytest.mark.parametrize("chunk_size", [1, 2, 3, 5, 7, 11])
+def test_markdown_segmentation_is_stable_across_small_chunks(chunk_size: int) -> None:
+    text = "Intro\n\n  | Mission | Landing |\n| --- | --- |\n| Apollo | Moon |\n\nOutro"
+
+    whole = StreamSegmentAssembler(base_kind="markdown", tool_prefix="->")
+    whole.handle_text(text)
+    streamed = StreamSegmentAssembler(base_kind="markdown", tool_prefix="->")
+    for offset in range(0, len(text), chunk_size):
+        streamed.handle_text(text[offset : offset + chunk_size])
+
+    assert [(segment.text, segment.frozen) for segment in streamed.segments] == [
+        (segment.text, segment.frozen) for segment in whole.segments
+    ]
+    assert streamed.pending_table_row == whole.pending_table_row

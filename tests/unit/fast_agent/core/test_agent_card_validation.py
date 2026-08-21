@@ -1,0 +1,701 @@
+from pathlib import Path
+
+import pytest
+
+from fast_agent.core.agent_card_rules import normalize_card_type
+from fast_agent.core.agent_card_validation import (
+    _instruction_texts,
+    _iter_file_placeholders,
+    _markdown_has_frontmatter,
+    scan_agent_card_directory,
+    scan_agent_card_path,
+)
+
+
+def test_scan_agent_cards_reports_invalid_history_json(tmp_path: Path) -> None:
+    history_path = tmp_path / "history.json"
+    history_path.write_text('{"messages": ["bad\x00"]}', encoding="utf-8")
+
+    card_path = tmp_path / "agent.yaml"
+    card_path.write_text(
+        "\n".join(
+            [
+                "name: test_agent",
+                "messages:",
+                "  - history.json",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    results = scan_agent_card_directory(tmp_path)
+    assert len(results) == 1
+
+    errors = results[0].errors
+    assert any("History file failed to load" in err for err in errors)
+    assert any("Failed to parse JSON prompt file" in err for err in errors)
+
+
+def test_normalize_card_type_handles_padded_mixed_case_values() -> None:
+    assert normalize_card_type("  MaKeR  ") == "MAKER"
+    assert normalize_card_type("   ") == "agent"
+
+
+def test_instruction_texts_normalizes_instruction_and_body() -> None:
+    assert _instruction_texts("  {{file: docs/a.md }}  ", "   ") == ["{{file: docs/a.md }}"]
+    assert _instruction_texts(None, "  Use {{file: docs/b.md }}  ") == ["Use {{file: docs/b.md }}"]
+
+
+def test_iter_file_placeholders_normalizes_values() -> None:
+    assert list(_iter_file_placeholders("{{file: docs/a.md }} {{file:   }}")) == ["docs/a.md"]
+
+
+def test_markdown_has_frontmatter_normalizes_first_non_empty_line(tmp_path: Path) -> None:
+    card_path = tmp_path / "agent.md"
+    card_path.write_text("\n \t\n  ---  \nname: assistant\n", encoding="utf-8")
+
+    assert _markdown_has_frontmatter(card_path) is True
+
+
+def test_scan_agent_card_path_for_file(tmp_path: Path) -> None:
+    card_path = tmp_path / "agent.yaml"
+    card_path.write_text(
+        "\n".join(
+            [
+                "name: solo_agent",
+                "model: gpt-4.1",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    results = scan_agent_card_path(card_path)
+    assert len(results) == 1
+    assert results[0].name == "solo_agent"
+    assert results[0].path == card_path
+
+
+def test_scan_agent_card_path_for_directory(tmp_path: Path) -> None:
+    card_path = tmp_path / "agent.yaml"
+    card_path.write_text(
+        "\n".join(
+            [
+                "name: dir_agent",
+                "model: gpt-4.1",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    results = scan_agent_card_path(tmp_path)
+    assert len(results) == 1
+    assert results[0].name == "dir_agent"
+
+
+def test_scan_agent_cards_reports_boolean_schema_version(tmp_path: Path) -> None:
+    card_path = tmp_path / "agent.yaml"
+    card_path.write_text(
+        "\n".join(
+            [
+                "schema_version: true",
+                "name: bool_schema_agent",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    results = scan_agent_card_directory(tmp_path)
+
+    assert len(results) == 1
+    assert "'schema_version' must be an integer" in results[0].errors
+
+
+def test_scan_agent_cards_reports_dependency_cycle(tmp_path: Path) -> None:
+    agent_a = tmp_path / "agent_a.yaml"
+    agent_a.write_text(
+        "\n".join(
+            [
+                "name: agent_a",
+                "agents:",
+                "  - agent_b",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    agent_b = tmp_path / "agent_b.yaml"
+    agent_b.write_text(
+        "\n".join(
+            [
+                "name: agent_b",
+                "agents:",
+                "  - agent_a",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    results = scan_agent_card_directory(tmp_path)
+    errors_by_name = {entry.name: entry.errors for entry in results}
+
+    assert any("Circular dependency detected" in err for err in errors_by_name.get("agent_a", []))
+    assert any("Circular dependency detected" in err for err in errors_by_name.get("agent_b", []))
+
+
+def test_scan_agent_cards_allows_acyclic_dependencies(tmp_path: Path) -> None:
+    agent_a = tmp_path / "agent_a.yaml"
+    agent_a.write_text(
+        "\n".join(
+            [
+                "name: agent_a",
+                "agents:",
+                "  - agent_b",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    agent_b = tmp_path / "agent_b.yaml"
+    agent_b.write_text("name: agent_b\n", encoding="utf-8")
+
+    results = scan_agent_card_directory(tmp_path)
+
+    for entry in results:
+        assert not any("Circular dependency detected" in err for err in entry.errors)
+
+
+def test_scan_agent_cards_reports_invalid_mcp_connect_target(tmp_path: Path) -> None:
+    card_path = tmp_path / "agent.yaml"
+    card_path.write_text(
+        "\n".join(
+            [
+                "name: mcp_agent",
+                "mcp_connect:",
+                "  - target: ''",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    results = scan_agent_card_directory(tmp_path)
+    assert len(results) == 1
+    assert any("mcp_connect[0].target" in err for err in results[0].errors)
+
+
+def test_scan_agent_cards_accepts_named_mcp_connect_mapping(tmp_path: Path) -> None:
+    card_path = tmp_path / "agent.yaml"
+    card_path.write_text(
+        "\n".join(
+            [
+                "name: mcp_agent",
+                "mcp_connect:",
+                "  docs:",
+                "    target: '@foo/bar'",
+                "    protocol_mode: auto",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    results = scan_agent_card_directory(tmp_path)
+
+    assert len(results) == 1
+    assert results[0].errors == []
+
+
+def test_scan_agent_cards_rejects_invalid_mcp_connect_protocol_mode(tmp_path: Path) -> None:
+    card_path = tmp_path / "agent.yaml"
+    card_path.write_text(
+        "\n".join(
+            [
+                "name: mcp_agent",
+                "mcp_connect:",
+                "  docs:",
+                "    target: '@foo/bar'",
+                "    protocol_mode: newest",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    results = scan_agent_card_directory(tmp_path)
+
+    assert len(results) == 1
+    assert any(
+        "protocol_mode' must be one of auto, modern, legacy" in error for error in results[0].errors
+    )
+
+
+def test_scan_agent_cards_rejects_mcp_connect_process_fields(tmp_path: Path) -> None:
+    card_path = tmp_path / "agent.yaml"
+    card_path.write_text(
+        "\n".join(
+            [
+                "name: mcp_agent",
+                "mcp_connect:",
+                "  docs:",
+                "    target: '@foo/bar'",
+                "    command: sh",
+                "    args: ['-c', unsafe]",
+                "    env: {TOKEN: unsafe}",
+                "    cwd: /tmp",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    results = scan_agent_card_directory(tmp_path)
+
+    assert len(results) == 1
+    assert any("unsupported keys: args, command, cwd, env" in error for error in results[0].errors)
+
+
+def test_scan_agent_cards_reports_unparseable_mcp_connect_entry(tmp_path: Path) -> None:
+    card_path = tmp_path / "agent.yaml"
+    card_path.write_text(
+        "\n".join(
+            [
+                "name: mcp_agent",
+                "mcp_connect:",
+                '  - target: "npx \'unterminated"',
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    results = scan_agent_card_directory(tmp_path)
+    assert len(results) == 1
+    assert any("Invalid mcp_connect target" in err for err in results[0].errors)
+
+
+def test_scan_agent_cards_rejects_mcp_connect_url_with_embedded_auth_flag(tmp_path: Path) -> None:
+    card_path = tmp_path / "agent.yaml"
+    card_path.write_text(
+        "\n".join(
+            [
+                "name: mcp_agent",
+                "mcp_connect:",
+                '  - target: "https://demo.hf.space --auth token"',
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    results = scan_agent_card_directory(tmp_path)
+    assert len(results) == 1
+    assert any("pure target string" in err for err in results[0].errors)
+    assert any("--auth" in err for err in results[0].errors)
+
+
+def test_scan_agent_cards_reports_invalid_provider_mcp_connect_settings(tmp_path: Path) -> None:
+    card_path = tmp_path / "agent.yaml"
+    card_path.write_text(
+        "\n".join(
+            [
+                "name: mcp_agent",
+                "mcp_connect:",
+                "  - target: https://mcp.stripe.com",
+                "    management: provider",
+                "    headers:",
+                "      Authorization: Bearer token",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    results = scan_agent_card_directory(tmp_path)
+    assert len(results) == 1
+    assert any("unsupported settings" in err for err in results[0].errors)
+
+
+def test_scan_agent_cards_accepts_provider_connector_mcp_connect_entry(tmp_path: Path) -> None:
+    card_path = tmp_path / "agent.yaml"
+    card_path.write_text(
+        "\n".join(
+            [
+                "name: connector_agent",
+                "mcp_connect:",
+                "  - name: dropbox",
+                "    management: provider",
+                "    connector_id: connector_dropbox",
+                "    access_token: token-123",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    results = scan_agent_card_directory(tmp_path)
+    assert len(results) == 1
+    assert results[0].errors == []
+
+
+def test_scan_agent_cards_normalizes_padded_name_and_mcp_connect_strings(
+    tmp_path: Path,
+) -> None:
+    card_path = tmp_path / "agent.yaml"
+    card_path.write_text(
+        "\n".join(
+            [
+                "name: '  connector agent  '",
+                "mcp_connect:",
+                "  - name: '  dropbox  '",
+                "    management: '  provider  '",
+                "    connector_id: '  connector_dropbox  '",
+                "    access_token: '  token-123  '",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    results = scan_agent_card_directory(tmp_path)
+
+    assert len(results) == 1
+    assert results[0].name == "connector_agent"
+    assert results[0].errors == []
+
+
+def test_scan_agent_cards_rejects_provider_connector_without_name(tmp_path: Path) -> None:
+    card_path = tmp_path / "agent.yaml"
+    card_path.write_text(
+        "\n".join(
+            [
+                "name: connector_agent",
+                "mcp_connect:",
+                "  - management: provider",
+                "    connector_id: connector_dropbox",
+                "    access_token: token-123",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    results = scan_agent_card_directory(tmp_path)
+    assert len(results) == 1
+    assert any("name" in err and "connector_id" in err for err in results[0].errors)
+
+
+def test_scan_agent_cards_reports_missing_shell_cwd(tmp_path: Path) -> None:
+    missing_cwd = tmp_path / "missing-shell-cwd"
+    card_path = tmp_path / "agent.yaml"
+    card_path.write_text(
+        "\n".join(
+            [
+                "name: shell_agent",
+                f"cwd: {missing_cwd}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    results = scan_agent_card_directory(tmp_path)
+    assert len(results) == 1
+    assert any("Shell cwd does not exist" in err for err in results[0].errors)
+
+
+def test_scan_agent_cards_reports_shell_cwd_when_path_is_file(tmp_path: Path) -> None:
+    shell_file = tmp_path / "not-a-directory.txt"
+    shell_file.write_text("x", encoding="utf-8")
+    card_path = tmp_path / "agent.yaml"
+    card_path.write_text(
+        "\n".join(
+            [
+                "name: shell_agent",
+                f"cwd: {shell_file}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    results = scan_agent_card_directory(tmp_path)
+    assert len(results) == 1
+    assert any("Shell cwd is not a directory" in err for err in results[0].errors)
+
+
+def test_scan_agent_cards_reports_invalid_shell_cwd_type(tmp_path: Path) -> None:
+    card_path = tmp_path / "agent.yaml"
+    card_path.write_text(
+        "\n".join(
+            [
+                "name: shell_agent",
+                "cwd:",
+                "  nested: value",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    results = scan_agent_card_directory(tmp_path)
+    assert len(results) == 1
+    assert "'cwd' must be a string" in results[0].errors
+
+
+def test_scan_agent_cards_reports_invalid_tool_input_schema(tmp_path: Path) -> None:
+    card_path = tmp_path / "agent.yaml"
+    card_path.write_text(
+        "\n".join(
+            [
+                "name: schema_agent",
+                "tool_input_schema:",
+                "  type: array",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    results = scan_agent_card_directory(tmp_path)
+    assert len(results) == 1
+    assert any("tool_input_schema" in err and "type" in err for err in results[0].errors)
+
+
+def test_scan_agent_cards_validates_function_tool_entrypoints(tmp_path: Path) -> None:
+    tool_path = tmp_path / "tools.PY"
+    tool_path.write_text(
+        "\n".join(
+            [
+                "def available_tool():",
+                "    return 'ok'",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    card_path = tmp_path / "agent.yaml"
+    card_path.write_text(
+        "\n".join(
+            [
+                "name: tool_agent",
+                "function_tools:",
+                "  - tools.PY:available_tool",
+                "  - tools.PY:missing_tool",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    results = scan_agent_card_directory(tmp_path)
+
+    assert len(results) == 1
+    assert results[0].errors == ["Function 'missing_tool' not found in tools.PY"]
+
+
+def test_scan_agent_cards_reports_invalid_function_tool_python(tmp_path: Path) -> None:
+    tool_path = tmp_path / "tools.py"
+    tool_path.write_text("def broken(:\n", encoding="utf-8")
+    card_path = tmp_path / "agent.yaml"
+    card_path.write_text(
+        "\n".join(
+            [
+                "name: tool_agent",
+                "function_tools:",
+                "  - tools.py:available_tool",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    results = scan_agent_card_directory(tmp_path)
+
+    assert len(results) == 1
+    assert len(results[0].errors) == 1
+    assert results[0].errors[0].startswith(f"Failed to parse tool module ({tool_path}):")
+
+
+def test_scan_agent_cards_rejects_blank_scalar_function_tool(tmp_path: Path) -> None:
+    card_path = tmp_path / "agent.yaml"
+    card_path.write_text(
+        "\n".join(
+            [
+                "name: tool_agent",
+                "function_tools: '   '",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    results = scan_agent_card_directory(tmp_path)
+
+    assert len(results) == 1
+    assert results[0].errors == ["'function_tools' entries must be non-empty strings"]
+
+
+def test_scan_agent_cards_accepts_function_tool_path_with_colon(tmp_path: Path) -> None:
+    tool_dir = tmp_path / "tool:bundle"
+    tool_dir.mkdir()
+    tool_path = tool_dir / "tools.py"
+    tool_path.write_text(
+        "\n".join(
+            [
+                "def available_tool():",
+                "    return 'ok'",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    card_path = tmp_path / "agent.yaml"
+    card_path.write_text(
+        "\n".join(
+            [
+                "name: tool_agent",
+                "function_tools:",
+                "  - tool:bundle/tools.py:available_tool",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    results = scan_agent_card_directory(tmp_path)
+
+    assert len(results) == 1
+    assert results[0].errors == []
+
+
+def test_scan_agent_cards_reports_unsupported_fields_by_type(tmp_path: Path) -> None:
+    card_path = tmp_path / "router.yaml"
+    card_path.write_text(
+        "\n".join(
+            [
+                "name: router_agent",
+                "type: router",
+                "agents:",
+                "  - child_agent",
+                "mcp_connect:",
+                '  - target: "https://demo.hf.space"',
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    child_path = tmp_path / "child.yaml"
+    child_path.write_text("name: child_agent\n", encoding="utf-8")
+
+    results = scan_agent_card_directory(tmp_path)
+    assert len(results) == 2
+
+    router_result = next(result for result in results if result.name == "router_agent")
+    assert any("Unsupported fields for type 'router'" in err for err in router_result.errors)
+    assert any("mcp_connect" in err for err in router_result.errors)
+
+
+@pytest.mark.parametrize(
+    "card_type",
+    [
+        "chain",
+        "parallel",
+        "evaluator_optimizer",
+        "router",
+        "orchestrator",
+        "iterative_planner",
+        "MAKER",
+        "a2a",
+    ],
+)
+def test_scan_agent_cards_rejects_subagent_fields_for_unsupported_types(
+    tmp_path: Path,
+    card_type: str,
+) -> None:
+    card_path = tmp_path / "unsupported.yaml"
+    card_path.write_text(
+        "\n".join(
+            [
+                "name: unsupported",
+                f"type: {card_type}",
+                "subagents: true",
+                "subagent_model: passthrough",
+                "harness_tools: true",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = scan_agent_card_directory(tmp_path)[0]
+    unsupported = next(error for error in result.errors if error.startswith("Unsupported fields"))
+
+    assert "subagents" in unsupported
+    assert "subagent_model" in unsupported
+    assert "harness_tools" in unsupported
+
+
+def test_scan_agent_cards_accepts_subagent_fields_for_basic_agents(tmp_path: Path) -> None:
+    card_path = tmp_path / "agent.yaml"
+    card_path.write_text(
+        "\n".join(
+            [
+                "name: supported",
+                "type: agent",
+                "subagents: true",
+                "subagent_model: passthrough",
+                "harness_tools: true",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = scan_agent_card_directory(tmp_path)[0]
+
+    assert result.errors == []
+
+
+def test_scan_agent_cards_normalizes_deprecated_smart_type(tmp_path: Path) -> None:
+    card_path = tmp_path / "smart.yaml"
+    card_path.write_text("name: legacy\ntype: smart\n", encoding="utf-8")
+
+    with pytest.warns(UserWarning, match="type 'smart' is deprecated"):
+        result = scan_agent_card_directory(tmp_path)[0]
+
+    assert result.type == "agent"
+    assert result.errors == []
+
+
+def test_scan_agent_cards_accepts_agent_variables_metadata(tmp_path: Path) -> None:
+    card_path = tmp_path / "classifier.md"
+    card_path.write_text(
+        "\n".join(
+            [
+                "---",
+                "name: classifier",
+                "variables:",
+                "  policy: ''",
+                "---",
+                "",
+                "{{policy}}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    results = scan_agent_card_directory(tmp_path)
+
+    assert len(results) == 1
+    assert results[0].errors == []
+
+
+def test_scan_agent_cards_normalizes_maker_type_casing(tmp_path: Path) -> None:
+    card_path = tmp_path / "maker.yaml"
+    card_path.write_text(
+        "\n".join(
+            [
+                "name: maker_agent",
+                "type: maker",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    results = scan_agent_card_directory(tmp_path)
+    assert len(results) == 1
+    assert any("Missing required field 'worker'" in err for err in results[0].errors)
+
+
+def test_scan_agent_cards_reports_missing_maker_worker_dependency(tmp_path: Path) -> None:
+    card_path = tmp_path / "maker.yaml"
+    card_path.write_text(
+        "\n".join(
+            [
+                "name: maker_agent",
+                "type: maker",
+                "worker: missing_worker",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    results = scan_agent_card_directory(tmp_path)
+    assert len(results) == 1
+    assert any("References missing agents: missing_worker" in err for err in results[0].errors)

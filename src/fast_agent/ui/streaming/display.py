@@ -1,0 +1,1826 @@
+from __future__ import annotations
+
+import asyncio
+import os
+import sys
+import time
+from contextlib import suppress
+from dataclasses import dataclass
+from typing import IO, TYPE_CHECKING, Any, Protocol, TextIO, cast, runtime_checkable
+
+from rich.console import Console, Group, RenderHook
+from rich.control import Control
+from rich.file_proxy import FileProxy
+from rich.live import Live
+from rich.markdown import Markdown
+from rich.segment import ControlType, Segment
+from rich.style import Style
+from rich.syntax import Syntax
+from rich.text import Text
+
+from fast_agent.core.logging.logger import get_logger
+from fast_agent.llm.stream_types import StreamChunk
+from fast_agent.tool_activity_presentation import tool_activity_family_uses_status_body
+from fast_agent.ui import console
+from fast_agent.ui.apply_patch_preview import style_apply_patch_preview_text
+from fast_agent.ui.markdown.content import prepare_markdown_content
+from fast_agent.ui.markdown.renderables import (
+    build_markdown_renderable,
+    close_incomplete_code_blocks,
+)
+from fast_agent.ui.markdown.truncation import MarkdownTruncator
+from fast_agent.ui.streaming.plain_text import PlainTextTruncator
+from fast_agent.ui.streaming.segments import StreamSegmentAssembler
+from fast_agent.ui.streaming.viewport import StreamViewport
+from fast_agent.ui.syntax_highlighting import shell_syntax_blocks
+from fast_agent.utils.env import env_flag
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Mapping
+
+    from rich.console import ConsoleOptions, ConsoleRenderable, RenderableType, RenderResult
+
+    from fast_agent.mcp.prompt_message_extended import PromptMessageExtended
+    from fast_agent.ui.console_display import ConsoleDisplay
+    from fast_agent.ui.streaming.segments import StreamSegment
+
+
+logger = get_logger(__name__)
+
+MARKDOWN_STREAM_TARGET_RATIO = 1.0
+MARKDOWN_STREAM_REFRESH_PER_SECOND = 16
+MARKDOWN_STREAM_PRE_SCROLL_THROTTLE_RATIO = 0.7
+STREAM_RENDER_WIDTH_GUTTER = 1
+# Keep only a small anti-flicker pad now that scroll-indicator churn is debounced.
+MARKDOWN_STREAM_HEIGHT_FUDGE = 1
+PLAIN_STREAM_TARGET_RATIO = 0.95
+PLAIN_STREAM_REFRESH_PER_SECOND = 20
+PLAIN_STREAM_HEIGHT_FUDGE = 1
+STREAM_BATCH_PERIOD = 1 / 100
+STREAM_BATCH_MAX_DURATION = 1 / 60
+STREAM_CURSOR_BLOCK = "●"
+STREAM_CURSOR_IDLE_DELAY_SECONDS = 0.5
+STREAM_CURSOR_BLINK_HZ = 1.0
+STREAM_CURSOR_HALF_CYCLE_SECONDS = 1 / (STREAM_CURSOR_BLINK_HZ * 2)
+STREAM_CURSOR_STYLE = Style(color="bright_green", bold=True, dim=False)
+SCROLL_INDICATOR_DEBOUNCE_SECONDS = 0.2
+# Lines reserved for the stream header (header text + spacing newline) plus a
+# safety margin that absorbs rendering differences (e.g. inter-paragraph spacing
+# introduced when consecutive markdown segments are coalesced into a single
+# Markdown renderable).
+_STREAM_HEADER_AND_MARGIN_LINES = 3
+_MISSING_CONSOLE_WIDTH = object()
+
+
+@runtime_checkable
+class _ConsoleWithAttributes(Protocol):
+    __dict__: dict[str, object]
+
+
+def _apply_console_width_override(target_console: object, width_override: int | None) -> object:
+    if not isinstance(target_console, _ConsoleWithAttributes):
+        raise TypeError("Console width overrides require an attribute dictionary")
+    attributes = target_console.__dict__
+    original_width = attributes.get("_width", _MISSING_CONSOLE_WIDTH)
+    if width_override is not None:
+        attributes["_width"] = width_override
+    return original_width
+
+
+def _restore_console_width_override(
+    target_console: object,
+    *,
+    original_width: object,
+    width_override: int | None,
+) -> None:
+    if width_override is None:
+        return
+    if not isinstance(target_console, _ConsoleWithAttributes):
+        raise TypeError("Console width overrides require an attribute dictionary")
+    attributes = target_console.__dict__
+    if original_width is not _MISSING_CONSOLE_WIDTH:
+        attributes["_width"] = original_width
+        return
+    attributes.pop("_width", None)
+
+
+def _resolve_progress_resume_debounce_seconds() -> float:
+    """Return debounce duration for progress resume after streaming closes."""
+    raw_value = os.getenv("FAST_AGENT_PROGRESS_RESUME_DEBOUNCE_SECONDS", "0.12").strip()
+    try:
+        parsed = float(raw_value)
+    except ValueError:
+        return 0.12
+    return max(0.0, parsed)
+
+
+STREAM_PROGRESS_RESUME_DEBOUNCE_SECONDS = _resolve_progress_resume_debounce_seconds()
+
+
+@dataclass(frozen=True)
+class _ToolStreamEvent:
+    event_type: str
+    info: dict[str, Any] | None
+
+
+@dataclass(frozen=True)
+class _QueuedItem:
+    payload: object
+    enqueued_at: float
+
+
+@dataclass(frozen=True)
+class _RenderedLine:
+    text: str
+    cell_length: int
+
+
+@dataclass(frozen=True)
+class _StreamBatch:
+    chunks: list[object]
+    batch_start: float
+    stop_requested: bool
+
+
+@dataclass(frozen=True)
+class _AppliedStreamBatch:
+    should_render: bool
+    queued_items: list[_QueuedItem]
+    batch_chars: int
+
+
+@dataclass(slots=True)
+class _StreamCursorBlink:
+    last_activity_at: float | None = None
+    idle_delay: float = STREAM_CURSOR_IDLE_DELAY_SECONDS
+    half_cycle: float = STREAM_CURSOR_HALF_CYCLE_SECONDS
+
+    def visible_at(self, now: float) -> bool:
+        if self.last_activity_at is None:
+            return True
+        idle_elapsed = now - self.last_activity_at - self.idle_delay
+        if idle_elapsed < 0:
+            return True
+        phase = int(idle_elapsed / self.half_cycle)
+        return phase % 2 == 1
+
+    def next_transition_at(self, now: float) -> float | None:
+        if self.last_activity_at is None:
+            return None
+        idle_at = self.last_activity_at + self.idle_delay
+        if now < idle_at:
+            return idle_at
+        elapsed = now - idle_at
+        return idle_at + (int(elapsed / self.half_cycle) + 1) * self.half_cycle
+
+    def reset(self, now: float) -> None:
+        self.last_activity_at = now
+
+
+@dataclass(frozen=True)
+class _CursorStyledRenderable:
+    renderable: "RenderableType"
+
+    def __rich_console__(
+        self,
+        console: Console,
+        options: "ConsoleOptions",
+    ) -> "RenderResult":
+        segments = tuple(console.render(self.renderable, options))
+        yield from _style_terminal_stream_cursor(segments)
+
+
+class _CursorSyntax(Syntax):
+    """Append the stream cursor after lexing so it cannot become an error token."""
+
+    def __init__(
+        self,
+        code: str,
+        lexer: str,
+        *,
+        theme: str,
+        word_wrap: bool,
+        cursor_suffix: str,
+    ) -> None:
+        self._cursor_suffix = cursor_suffix
+        super().__init__(
+            code,
+            lexer,
+            theme=theme,
+            line_numbers=False,
+            word_wrap=word_wrap,
+        )
+
+    def highlight(
+        self,
+        code: str,
+        line_range: tuple[int | None, int | None] | None = None,
+    ) -> Text:
+        highlighted = super().highlight(code, line_range)
+        if self._cursor_suffix and code.endswith("\n") and not self.code.endswith("\n"):
+            highlighted.remove_suffix("\n")
+            highlighted.append(self._cursor_suffix)
+            highlighted.append("\n")
+        else:
+            highlighted.append(self._cursor_suffix)
+        return highlighted
+
+
+def _style_terminal_stream_cursor(segments: tuple[Segment, ...]) -> tuple[Segment, ...]:
+    visible = "".join(segment.text for segment in segments if not segment.control)
+    terminal = visible.rstrip()
+    has_cursor = terminal.endswith(STREAM_CURSOR_BLOCK)
+    cursor_offset = len(terminal) - len(STREAM_CURSOR_BLOCK) if has_cursor else len(terminal)
+    output: list[Segment] = []
+    offset = 0
+    inserted = False
+    for segment in segments:
+        if segment.control or not segment.text:
+            output.append(segment)
+            continue
+
+        start = offset
+        end = start + len(segment.text)
+        offset = end
+        if inserted or not start <= cursor_offset < end:
+            output.append(segment)
+            continue
+
+        split_at = cursor_offset - start
+        before = segment.text[:split_at]
+        cursor_end = split_at + len(STREAM_CURSOR_BLOCK) if has_cursor else split_at
+        after = segment.text[cursor_end:]
+        if before:
+            output.append(Segment(before, segment.style))
+        cursor_style = (segment.style or Style()) + STREAM_CURSOR_STYLE
+        output.append(Segment(STREAM_CURSOR_BLOCK, cursor_style))
+        inserted = True
+        if after:
+            output.append(Segment(after, segment.style))
+
+    if not inserted:
+        output.append(Segment(STREAM_CURSOR_BLOCK, STREAM_CURSOR_STYLE))
+    return tuple(output)
+
+
+def _coalesce_tool_delta_payloads(payloads: list[object]) -> list[object]:
+    coalesced: list[object] = []
+    index = 0
+    while index < len(payloads):
+        payload = payloads[index]
+        identity = _tool_delta_identity(payload)
+        if identity is None:
+            coalesced.append(payload)
+            index += 1
+            continue
+
+        assert isinstance(payload, _ToolStreamEvent)
+        info = payload.info
+        assert info is not None
+        chunks = [str(info["chunk"])]
+        next_index = index + 1
+        while next_index < len(payloads):
+            candidate = payloads[next_index]
+            if _tool_delta_identity(candidate) != identity:
+                break
+            assert isinstance(candidate, _ToolStreamEvent)
+            assert candidate.info is not None
+            chunks.append(str(candidate.info["chunk"]))
+            next_index += 1
+
+        if len(chunks) == 1:
+            coalesced.append(payload)
+        else:
+            merged_info = dict(info)
+            merged_info["chunk"] = "".join(chunks)
+            coalesced.append(_ToolStreamEvent(event_type="delta", info=merged_info))
+        index = next_index
+    return coalesced
+
+
+def _tool_delta_identity(payload: object) -> dict[str, Any] | None:
+    if not isinstance(payload, _ToolStreamEvent):
+        return None
+    if payload.event_type != "delta":
+        return None
+    info = payload.info
+    if not info or not info.get("tool_use_id") or not isinstance(info.get("chunk"), str):
+        return None
+    return {key: value for key, value in info.items() if key != "chunk"}
+
+
+def _first_different_line(
+    old_lines: list[_RenderedLine],
+    lines: list[_RenderedLine],
+) -> int:
+    first_diff = 0
+    shared = min(len(old_lines), len(lines))
+    while first_diff < shared and old_lines[first_diff] == lines[first_diff]:
+        first_diff += 1
+    return first_diff
+
+
+def _should_rewrite_growing_last_line(
+    old_lines: list[_RenderedLine],
+    lines: list[_RenderedLine],
+    first_diff: int,
+) -> bool:
+    return bool(old_lines and len(lines) > len(old_lines) and first_diff == len(old_lines) - 1)
+
+
+def _elapsed_ms(newer: object, older: object) -> float | None:
+    if isinstance(newer, (int, float)) and isinstance(older, (int, float)):
+        return (newer - older) * 1000
+    return None
+
+
+class _DiffLive(RenderHook):
+    """Minimal live-region renderer that updates changed lines in place."""
+
+    def __init__(
+        self,
+        renderable: RenderableType | None = None,
+        *,
+        console: Console,
+        screen: bool = False,
+        auto_refresh: bool = True,
+        refresh_per_second: float = 4,
+        transient: bool = False,
+        redirect_stdout: bool = True,
+        redirect_stderr: bool = True,
+        vertical_overflow: str = "ellipsis",
+        get_renderable: Callable[[], RenderableType] | None = None,
+    ) -> None:
+        del screen, auto_refresh, refresh_per_second, vertical_overflow
+        self.console = console
+        self.transient = transient
+        self._renderable = renderable
+        self._get_renderable = get_renderable
+        self._started = False
+        self._lines: list[_RenderedLine] = []
+        self._is_interactive = self.console.is_terminal
+        self._nested = False
+        self._redirect_stdout = redirect_stdout
+        self._redirect_stderr = redirect_stderr
+        self._restore_stdout: IO[str] | None = None
+        self._restore_stderr: IO[str] | None = None
+        self._console_state_active = False
+        self._cursor_below_frame = False
+        self._frame_truncated = False
+
+    def __enter__(self) -> "_DiffLive":
+        if not self._started:
+            self._started = True
+            if self._is_interactive:
+                if not self.console.set_live(self):
+                    self._nested = True
+                    return self
+                console.ensure_blocking_console()
+                self.console.show_cursor(False)
+                self._enable_redirect_io()
+                self.console.push_render_hook(self)
+                self._console_state_active = True
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.stop()
+
+    def update(self, renderable: RenderableType, *, refresh: bool = False) -> None:
+        self._renderable = renderable
+        if refresh:
+            self.refresh()
+
+    def refresh(self) -> None:
+        if not self._started:
+            self.__enter__()
+        renderable = self.get_renderable()
+        if renderable is None:
+            return
+        if not self._is_interactive or self._nested:
+            return
+        lines = self._render_lines(renderable)
+
+        # Safety: clamp both the new frame and the stored old frame to the
+        # visible terminal height.  When a frame exceeds the visible area,
+        # _scroll_newline() at the bottom row triggers implicit terminal
+        # scrolls that shift all content upward.  Our relative-cursor
+        # bookkeeping cannot detect these shifts, so subsequent diffs would
+        # mis-position the cursor and duplicate or overwrite rows.  Keeping
+        # both old and new within bounds guarantees that cursor-up commands
+        # can always reach the first stored line.
+        max_visible = self.console.size.height
+        self._frame_truncated = False
+        if max_visible > 0:
+            if len(lines) > max_visible:
+                self._frame_truncated = True
+                lines = lines[-max_visible:]
+            if len(self._lines) > max_visible:
+                self._lines = self._lines[-max_visible:]
+
+        if not self._lines:
+            self._write_initial(lines)
+        else:
+            self._write_diff(lines)
+        self._lines = lines
+
+    def stop(self) -> None:
+        if not self._started:
+            return
+        try:
+            self._started = False
+            if self._is_interactive:
+                self._stop_interactive()
+            else:
+                self._print_current_renderable()
+        finally:
+            self._restore_console_state()
+            self._nested = False
+            self._frame_truncated = False
+
+    def _print_current_renderable(self) -> None:
+        renderable = self.get_renderable()
+        if renderable is not None:
+            self.console.print(renderable)
+
+    def _stop_interactive(self) -> None:
+        if self._nested:
+            self.console.clear_live()
+            if not self.transient:
+                self._print_current_renderable()
+            return
+        try:
+            try:
+                if self._lines:
+                    self._stop_drawn_frame()
+            finally:
+                self._restore_console_state()
+        finally:
+            self.console.clear_live()
+
+    def _stop_drawn_frame(self) -> None:
+        if self.transient:
+            self._clear_region()
+            return
+        if self._frame_truncated:
+            self._clear_region()
+            renderable = self.get_renderable()
+            if renderable is not None:
+                self.console.print(renderable)
+            else:
+                self._write("\n")
+            return
+        if not self._cursor_below_frame:
+            self._write("\n")
+
+    def _restore_console_state(self) -> None:
+        if not self._is_interactive or not self._console_state_active:
+            return
+        self._disable_redirect_io()
+        self.console.pop_render_hook()
+        self.console.show_cursor(True)
+        self._console_state_active = False
+
+    def get_renderable(self) -> RenderableType | None:
+        if self._get_renderable is not None:
+            return self._get_renderable()
+        return self._renderable
+
+    def process_renderables(
+        self,
+        renderables: list["ConsoleRenderable"],
+    ) -> list["ConsoleRenderable"]:
+        if not self._is_interactive or not self._started or self._nested:
+            return renderables
+        renderable = self.get_renderable()
+        if renderable is None:
+            return renderables
+        if isinstance(renderable, str):
+            current_renderable: ConsoleRenderable = self.console.render_str(renderable)
+        else:
+            current_renderable = cast("ConsoleRenderable", renderable)
+        # Rich prints a trailing newline for console output, so once we re-render
+        # the live frame as part of that output the cursor ends one line below it.
+        self._cursor_below_frame = True
+        return [self._position_cursor_control(), *renderables, current_renderable]
+
+    def _render_lines(self, renderable: RenderableType) -> list[_RenderedLine]:
+        options = self.console.options.update(width=self.console.size.width)
+        rendered_lines = self.console.render_lines(renderable, options=options, pad=False)
+        return [
+            _RenderedLine(
+                text=self.console._render_buffer(line),
+                cell_length=Segment.get_line_length(line),
+            )
+            for line in rendered_lines
+        ]
+
+    def _write_initial(self, lines: list[_RenderedLine]) -> None:
+        if not lines:
+            return
+        payload_parts: list[str] = []
+        for index, line in enumerate(lines):
+            if index:
+                payload_parts.append(self._scroll_newline())
+            payload_parts.append(line.text)
+        payload_parts.append(str(Control.move_to_column(0)))
+        payload = "".join(payload_parts)
+        self._write(payload)
+        self._cursor_below_frame = False
+
+    def _write_diff(self, lines: list[_RenderedLine]) -> None:
+        old_lines = self._lines
+        first_diff = _first_different_line(old_lines, lines)
+        if first_diff == len(old_lines) == len(lines):
+            return
+        if first_diff == len(old_lines) and len(lines) > len(old_lines):
+            self._write_appended_lines(lines[first_diff:])
+            return
+        if _should_rewrite_growing_last_line(old_lines, lines, first_diff):
+            self._rewrite_growing_last_line(old_lines[-1], lines[first_diff:])
+            return
+
+        max_height = max(len(old_lines), len(lines))
+        current_row = self._current_diff_cursor_row(old_lines)
+        payload: list[str] = [self._move_to_line_start(first_diff - current_row)]
+        last_old_row = len(old_lines) - 1
+
+        for row in range(first_diff, max_height):
+            new_line = lines[row] if row < len(lines) else None
+            old_line = old_lines[row] if row < len(old_lines) else None
+            self._append_diff_row(payload, new_line, old_line)
+
+            if row < max_height - 1:
+                self._append_diff_row_transition(payload, row, last_old_row)
+
+        target_row = len(lines) - 1
+        payload.append(self._move_to_line_start(target_row - (max_height - 1)))
+        self._write("".join(payload))
+        self._cursor_below_frame = False
+
+    def _current_diff_cursor_row(self, old_lines: list[_RenderedLine]) -> int:
+        current_row = len(old_lines) - 1
+        if self._cursor_below_frame:
+            return current_row + 1
+        return current_row
+
+    @staticmethod
+    def _append_diff_row(
+        payload: list[str],
+        new_line: _RenderedLine | None,
+        old_line: _RenderedLine | None,
+    ) -> None:
+        if new_line is None:
+            payload.append(str(Control((ControlType.ERASE_IN_LINE, 2))))
+            return
+        payload.append(new_line.text)
+        if old_line is not None and old_line.cell_length > new_line.cell_length:
+            payload.append(str(Control((ControlType.ERASE_IN_LINE, 0))))
+
+    def _append_diff_row_transition(
+        self,
+        payload: list[str],
+        row: int,
+        last_old_row: int,
+    ) -> None:
+        next_row = row + 1
+        if row >= last_old_row or next_row > last_old_row:
+            payload.append(self._scroll_newline())
+            return
+        payload.append(self._move_to_line_start(1))
+
+    def _write_appended_lines(self, lines: list[_RenderedLine]) -> None:
+        if not lines:
+            return
+        payload_parts: list[str] = []
+        if self._cursor_below_frame:
+            payload_parts.append(str(Control.move_to_column(0)))
+            payload_parts.append(lines[0].text)
+            remaining_lines = lines[1:]
+        else:
+            remaining_lines = lines
+        for line in remaining_lines:
+            payload_parts.append(self._scroll_newline())
+            payload_parts.append(line.text)
+        payload_parts.append(str(Control.move_to_column(0)))
+        payload = "".join(payload_parts)
+        self._write(payload)
+        self._cursor_below_frame = False
+
+    def _rewrite_growing_last_line(
+        self,
+        old_last_line: _RenderedLine,
+        new_lines: list[_RenderedLine],
+    ) -> None:
+        if not new_lines:
+            return
+        row_delta = -1 if self._cursor_below_frame else 0
+        payload = [self._move_to_line_start(row_delta), new_lines[0].text]
+        if old_last_line.cell_length > new_lines[0].cell_length:
+            payload.append(str(Control((ControlType.ERASE_IN_LINE, 0))))
+        for line in new_lines[1:]:
+            payload.append(self._scroll_newline())
+            payload.append(line.text)
+        payload.append(str(Control.move_to_column(0)))
+        self._write("".join(payload))
+        self._cursor_below_frame = False
+
+    def _clear_region(self) -> None:
+        height = len(self._lines)
+        if height <= 0:
+            return
+        cursor_row = height - 1
+        if self._cursor_below_frame:
+            cursor_row += 1
+        payload = [self._move_to_line_start(-cursor_row)]
+        for row in range(height):
+            payload.append(str(Control((ControlType.ERASE_IN_LINE, 2))))
+            if row < height - 1:
+                payload.append(self._move_to_line_start(1))
+        payload.append(self._move_to_line_start(-(height - 1)))
+        self._write("".join(payload))
+        self._lines = []
+        self._cursor_below_frame = False
+
+    def _move_to_line_start(self, row_delta: int) -> str:
+        return str(Control.move_to_column(0, y=row_delta))
+
+    def _scroll_newline(self) -> str:
+        """Advance to the next physical row in a way that is safe after right-edge writes."""
+        return f"{Control.move_to_column(0)}\n"
+
+    def _position_cursor_control(self) -> Control:
+        height = len(self._lines)
+        if height <= 0:
+            return Control()
+        lines_to_rewind = height - 1
+        if self._cursor_below_frame:
+            lines_to_rewind += 1
+        return Control(
+            ControlType.CARRIAGE_RETURN,
+            (ControlType.ERASE_IN_LINE, 2),
+            *(((ControlType.CURSOR_UP, 1), (ControlType.ERASE_IN_LINE, 2)) * lines_to_rewind),
+        )
+
+    def _write(self, text: str) -> None:
+        if not text:
+            return
+        with self.console._lock:
+            self.console.file.write(text)
+            self.console.file.flush()
+
+    def _enable_redirect_io(self) -> None:
+        if not self._is_interactive:
+            return
+        if self._redirect_stdout and not isinstance(sys.stdout, FileProxy):
+            self._restore_stdout = sys.stdout
+            sys.stdout = cast("TextIO", FileProxy(self.console, sys.stdout))
+        if self._redirect_stderr and not isinstance(sys.stderr, FileProxy):
+            self._restore_stderr = sys.stderr
+            sys.stderr = cast("TextIO", FileProxy(self.console, sys.stderr))
+
+    def _disable_redirect_io(self) -> None:
+        if self._restore_stdout:
+            sys.stdout = cast("TextIO", self._restore_stdout)
+            self._restore_stdout = None
+        if self._restore_stderr:
+            sys.stderr = cast("TextIO", self._restore_stderr)
+            self._restore_stderr = None
+
+
+class NullStreamingHandle:
+    """No-op streaming handle used when streaming is disabled."""
+
+    def update(self, chunk: str) -> None:
+        del chunk
+
+    def update_chunk(self, chunk: StreamChunk) -> None:
+        del chunk
+
+    def finalize(self, message: "PromptMessageExtended | str") -> None:
+        del message
+
+    def close(self) -> None:
+        return
+
+    def handle_tool_event(self, event_type: str, info: dict[str, Any] | None = None) -> None:
+        del event_type, info
+
+    def has_scrolled(self) -> bool:
+        return False
+
+    def preserve_final_frame(self) -> bool:
+        return False
+
+    async def wait_for_drain(self) -> None:
+        return
+
+
+class StreamingMessageHandle:
+    """Helper that manages live rendering for streaming assistant responses."""
+
+    def __init__(
+        self,
+        *,
+        display: "ConsoleDisplay",
+        use_plain_text: bool = False,
+        header_left: str = "",
+        header_right: str = "",
+        tool_header_name: str | None = None,
+        tool_metadata_resolver: Callable[[str], Mapping[str, Any] | None] | None = None,
+        stream_edit_previews: bool = True,
+        progress_display: Any = None,
+        performance_hook: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
+        self._display = display
+        self._use_plain_text = use_plain_text
+        self._header_left = header_left
+        self._header_right = header_right
+        self._tool_header_prefix: Text | None = None
+        self._tool_header_prefix_plain = ""
+        self._tool_header_color: str | None = None
+        self._progress_display = progress_display
+        self._progress_paused = False
+        self._render_reasoning_markdown = not use_plain_text
+        self._set_tool_header_prefix(tool_header_name)
+        self._setup_segment_rendering(
+            tool_metadata_resolver=tool_metadata_resolver,
+            use_plain_text=use_plain_text,
+            stream_edit_previews=stream_edit_previews,
+        )
+        refresh_rate = self._stream_refresh_rate()
+        self._setup_render_timing(
+            refresh_rate=refresh_rate,
+            performance_hook=performance_hook,
+        )
+        self._setup_scroll_state()
+        self._alt_screen_streaming = env_flag("FAST_AGENT_STREAM_ALT_SCREEN")
+        self._setup_async_worker()
+        self._live = self._build_live_renderer(refresh_rate=refresh_rate)
+        self._setup_lifecycle_state()
+
+        if self._async_mode and self._loop and self._queue is not None:
+            self._worker_task = self._loop.create_task(self._render_worker())
+
+    def _setup_segment_rendering(
+        self,
+        *,
+        tool_metadata_resolver: Callable[[str], Mapping[str, Any] | None] | None,
+        use_plain_text: bool,
+        stream_edit_previews: bool,
+    ) -> None:
+        self._segment_assembler = StreamSegmentAssembler(
+            base_kind="plain" if use_plain_text else "markdown",
+            tool_prefix=self._tool_header_prefix_plain,
+            tool_metadata_resolver=tool_metadata_resolver,
+            apply_patch_preview_max_lines=self._display.apply_patch_preview_max_lines,
+            stream_edit_previews=stream_edit_previews,
+        )
+        self._markdown_truncator = MarkdownTruncator(
+            target_height_ratio=1.0,
+            code_word_wrap=self._display.code_word_wrap,
+            render_fences_with_syntax=self._display.render_fences_with_syntax,
+        )
+        self._plain_truncator = PlainTextTruncator(target_height_ratio=1.0)
+        self._viewport = StreamViewport(
+            markdown_truncator=self._markdown_truncator,
+            plain_truncator=self._plain_truncator,
+            code_theme=self._display.code_style,
+        )
+        self._stream_target_ratio = (
+            PLAIN_STREAM_TARGET_RATIO if use_plain_text else MARKDOWN_STREAM_TARGET_RATIO
+        )
+        self._height_fudge = (
+            PLAIN_STREAM_HEIGHT_FUDGE if use_plain_text else MARKDOWN_STREAM_HEIGHT_FUDGE
+        )
+
+    def _stream_refresh_rate(self) -> int:
+        if self._use_plain_text:
+            return PLAIN_STREAM_REFRESH_PER_SECOND
+        return MARKDOWN_STREAM_REFRESH_PER_SECOND
+
+    def _setup_render_timing(
+        self,
+        *,
+        refresh_rate: int,
+        performance_hook: Callable[[dict[str, Any]], None] | None,
+    ) -> None:
+        self._min_render_interval = 1.0 / refresh_rate if refresh_rate else None
+        self._last_render_time = 0.0
+        self._performance_hook = performance_hook
+        self._batch_period = STREAM_BATCH_PERIOD
+        self._batch_max_duration = STREAM_BATCH_MAX_DURATION
+        self._pending_batch_meta: dict[str, Any] | None = None
+
+    def _setup_scroll_state(self) -> None:
+        self._scrolling_started = False
+        self._scroll_start_time: float | None = None
+        self._pre_scroll_throttle_started = False
+        self._scroll_indicator_visible = False
+        self._scroll_indicator_pending_since: float | None = None
+        self._header_cache: dict[tuple[int, bool], Text] = {}
+        self._next_render_deadline: float | None = None
+
+    def _setup_async_worker(self) -> None:
+        try:
+            self._loop: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
+        except RuntimeError:
+            self._loop = None
+        self._async_mode = self._loop is not None
+        self._queue: asyncio.Queue[object] | None = asyncio.Queue() if self._async_mode else None
+        self._stop_sentinel: object = object()
+        self._worker_task: asyncio.Task[None] | None = None
+
+    def _build_live_renderer(self, *, refresh_rate: int) -> Any:
+        if self._alt_screen_streaming:
+            return Live(
+                None,
+                console=console.console,
+                screen=True,
+                vertical_overflow="ellipsis",
+                refresh_per_second=refresh_rate,
+                auto_refresh=False,
+                transient=True,
+                redirect_stdout=True,
+                redirect_stderr=True,
+            )
+        return _DiffLive(
+            None,
+            console=console.console,
+            vertical_overflow="ellipsis",
+            refresh_per_second=refresh_rate,
+            auto_refresh=False,
+            transient=True,
+        )
+
+    def _setup_lifecycle_state(self) -> None:
+        self._live_started = False
+        self._active = True
+        self._finalized = False
+        self._show_stream_cursor = True
+        self._stream_cursor_visible = True
+        self._stream_cursor_blink = _StreamCursorBlink()
+        self._max_render_height = 0
+        self._preserve_final_frame = False
+        self._suppress_tail_padding_for_final_frame = False
+
+    def _set_tool_header_prefix(self, tool_header_name: str | None) -> None:
+        from fast_agent.ui.message_primitives import MESSAGE_CONFIGS, MessageType
+
+        config = MESSAGE_CONFIGS[MessageType.TOOL_CALL]
+        self._tool_header_color = config["block_color"]
+
+        header_markup = self._display.build_header_left(
+            block_color=config["block_color"],
+            arrow=config["arrow"],
+            arrow_style=config["arrow_style"],
+            name=tool_header_name,
+            is_error=False,
+            show_hook_indicator=False,
+        )
+        header_text = Text.from_markup(header_markup)
+        self._tool_header_prefix = header_text
+        self._tool_header_prefix_plain = header_text.plain
+
+    def update(self, chunk: str) -> None:
+        if not self._active or not chunk:
+            return
+
+        if self._async_mode and self._queue is not None:
+            self._enqueue_chunk(chunk)
+            return
+
+        if self._handle_chunk(chunk):
+            now = time.perf_counter()
+            self._pending_batch_meta = {
+                "batch_size": 1,
+                "queue_depth": 0,
+                "oldest_enqueued_at": now,
+                "newest_enqueued_at": now,
+                "batch_chars": len(chunk),
+            }
+            self._render_sync_if_due()
+
+    def update_chunk(self, chunk: StreamChunk) -> None:
+        """Structured streaming update with an explicit reasoning flag."""
+        if not self._active or (chunk.event == "delta" and not chunk.text):
+            return
+
+        if self._async_mode and self._queue is not None:
+            self._enqueue_chunk(chunk)
+            return
+
+        if self._handle_stream_chunk(chunk):
+            now = time.perf_counter()
+            self._pending_batch_meta = {
+                "batch_size": 1,
+                "queue_depth": 0,
+                "oldest_enqueued_at": now,
+                "newest_enqueued_at": now,
+                "batch_chars": len(chunk.text),
+            }
+            self._render_sync_if_due()
+
+    def _build_header(self) -> Text:
+        width = console.console.size.width
+        cache_key = (width, self._scroll_indicator_visible)
+        cached = self._header_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        right_content = self._header_right.strip()
+        if self._scroll_indicator_visible:
+            indicator = "[black on blue]scrolling[/black on blue]"
+            right_content = f"{right_content} {indicator}" if right_content else indicator
+
+        combined = self._display._format_header_line(self._header_left, right_content)
+        self._header_cache[cache_key] = combined
+        if len(self._header_cache) > 8:
+            self._header_cache.clear()
+        return combined
+
+    def _pause_progress_display(self) -> None:
+        if self._progress_display and not self._progress_paused:
+            try:
+                self._progress_display.pause()
+                self._progress_paused = True
+            except Exception:
+                self._progress_paused = False
+
+    def _resume_progress_display(self) -> None:
+        if self._progress_display and self._progress_paused:
+            try:
+                self._progress_display.resume(
+                    debounce_seconds=STREAM_PROGRESS_RESUME_DEBOUNCE_SECONDS
+                )
+            except TypeError:
+                # Backward compatibility for non-standard displays in tests/experiments.
+                self._progress_display.resume()
+            except Exception:
+                pass
+            finally:
+                self._progress_paused = False
+
+    def _ensure_started(self) -> None:
+        if not self._live or self._live_started:
+            return
+
+        self._pause_progress_display()
+
+        if self._live and not self._live_started:
+            self._live.__enter__()
+            self._live_started = True
+
+    def _set_scroll_indicator_visible(self, visible: bool) -> None:
+        if self._scroll_indicator_visible == visible:
+            return
+        self._scroll_indicator_visible = visible
+        self._header_cache.clear()
+
+    def _reset_scroll_indicator(self) -> None:
+        self._scroll_indicator_pending_since = None
+        self._set_scroll_indicator_visible(False)
+
+    def _update_scroll_status(self, *, is_truncated: bool, now: float) -> None:
+        if is_truncated and not self._scrolling_started:
+            self._scrolling_started = True
+            self._scroll_start_time = now
+
+        if not is_truncated:
+            self._scroll_indicator_pending_since = None
+            return
+
+        if self._scroll_indicator_visible:
+            return
+
+        if self._scroll_indicator_pending_since is None:
+            self._scroll_indicator_pending_since = now
+            return
+
+        if now - self._scroll_indicator_pending_since >= SCROLL_INDICATOR_DEBOUNCE_SECONDS:
+            self._set_scroll_indicator_visible(True)
+
+    def finalize(self, message: "PromptMessageExtended | str") -> None:
+        del message
+        if not self._active or self._finalized:
+            return
+
+        # Remove the transient cursor in the final frame before closing Live rendering.
+        self._show_stream_cursor = False
+        if not self._preserve_final_frame:
+            self._reset_scroll_indicator()
+
+        # Flush any buffered reasoning content before closing the live view
+        if self._segment_assembler.flush() or self._segment_assembler.segments:
+            self._suppress_tail_padding_for_final_frame = self._preserve_final_frame
+            self._render_current_buffer()
+
+        self._finalized = True
+        self.close()
+
+    def close(self) -> None:
+        if not self._active:
+            return
+
+        self._active = False
+        if self._async_mode:
+            if self._queue and self._loop:
+                try:
+                    current_loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    current_loop = None
+
+                try:
+                    if current_loop is self._loop:
+                        self._queue.put_nowait(self._stop_sentinel)
+                    else:
+                        self._loop.call_soon_threadsafe(self._queue.put_nowait, self._stop_sentinel)
+                except RuntimeError as exc:
+                    logger.debug(
+                        "RuntimeError while closing streaming display (expected during shutdown)",
+                        data={"error": str(exc)},
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Unexpected error while closing streaming display",
+                        exc_info=True,
+                        data={"error": str(exc)},
+                    )
+            if self._worker_task:
+                self._worker_task.cancel()
+                self._worker_task = None
+        self._shutdown_live_resources()
+        self._max_render_height = 0
+        self._next_render_deadline = None
+
+    async def _wait_for_render_slot(self) -> bool:
+        """Sleep until the next render deadline to keep frame cadence steady."""
+        interval = self._min_render_interval
+        if not interval:
+            return True
+
+        if not self._render_throttle_active:
+            # Keep markdown updates immediate while content still fits the viewport.
+            self._next_render_deadline = None
+            return True
+
+        now = time.monotonic()
+        deadline = self._next_render_deadline
+        if deadline is None:
+            self._next_render_deadline = now
+            return True
+
+        delay = deadline - now
+        if delay <= 0:
+            return True
+
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return False
+        return True
+
+    def _advance_render_deadline(self) -> None:
+        """Advance render deadline without drifting under variable render cost."""
+        interval = self._min_render_interval
+        if not interval:
+            return
+
+        if not self._render_throttle_active:
+            self._next_render_deadline = None
+            return
+
+        now = time.monotonic()
+        deadline = self._next_render_deadline
+        if deadline is None:
+            self._next_render_deadline = now + interval
+            return
+
+        next_deadline = deadline + interval
+        if next_deadline <= now:
+            skipped_slots = int((now - deadline) // interval) + 1
+            next_deadline = deadline + (skipped_slots * interval)
+        self._next_render_deadline = next_deadline
+
+    def _sync_render_due(self) -> bool:
+        """Return True when sync mode is allowed to render the next frame."""
+        interval = self._min_render_interval
+        if not interval:
+            return True
+
+        if not self._render_throttle_active:
+            self._next_render_deadline = None
+            return True
+
+        now = time.monotonic()
+        deadline = self._next_render_deadline
+        if deadline is None:
+            self._next_render_deadline = now
+            return True
+        return now >= deadline
+
+    @property
+    def _render_throttle_active(self) -> bool:
+        """Whether frame pacing should currently throttle renders.
+
+        Plain-text mode keeps its fixed cadence. Markdown starts unthrottled,
+        but once content begins truncating or grows tall enough to be highly
+        reflow-sensitive in the current viewport, we switch to the configured
+        cadence for the rest of the stream.
+        """
+        if self._use_plain_text:
+            return True
+        return self._scrolling_started or self._pre_scroll_throttle_started
+
+    def _update_pre_scroll_throttle(self, *, content_height: int, max_allowed_height: int) -> None:
+        if self._use_plain_text or self._pre_scroll_throttle_started:
+            return
+        if max_allowed_height <= 0:
+            return
+        threshold = max(6, int(max_allowed_height * MARKDOWN_STREAM_PRE_SCROLL_THROTTLE_RATIO))
+        if content_height >= threshold:
+            self._pre_scroll_throttle_started = True
+
+    def _render_sync_if_due(self) -> None:
+        """Render in sync mode while respecting frame-rate limits."""
+        if not self._sync_render_due():
+            return
+        self._render_current_buffer()
+        self._advance_render_deadline()
+
+    def _enqueue_chunk(self, chunk: object) -> None:
+        if not self._queue or not self._loop:
+            return
+
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+
+        queued = (
+            chunk
+            if isinstance(chunk, _QueuedItem)
+            else _QueuedItem(payload=chunk, enqueued_at=time.perf_counter())
+        )
+        if current_loop is self._loop:
+            with suppress(asyncio.QueueFull):
+                self._queue.put_nowait(queued)
+        else:
+            try:
+                self._loop.call_soon_threadsafe(self._queue.put_nowait, queued)
+            except RuntimeError as exc:
+                logger.debug(
+                    "RuntimeError while enqueuing chunk (expected during shutdown)",
+                    data={"error": str(exc), "chunk_repr": repr(chunk)},
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Unexpected error while enqueuing chunk",
+                    exc_info=True,
+                    data={"error": str(exc), "chunk_repr": repr(chunk)},
+                )
+
+    def _handle_stream_chunk(self, chunk: StreamChunk) -> bool:
+        """Process a typed stream chunk with explicit reasoning flag."""
+        return self._segment_assembler.handle_stream_chunk(chunk)
+
+    def _handle_chunk(self, chunk: str) -> bool:
+        return self._segment_assembler.handle_text(chunk)
+
+    def _cursor_suffix(self, *, segment_index: int, total_segments: int) -> str:
+        if not self._show_stream_cursor:
+            return ""
+        if total_segments <= 0:
+            return ""
+        if segment_index != total_segments - 1:
+            return ""
+        return STREAM_CURSOR_BLOCK if self._stream_cursor_visible else " "
+
+    def _record_stream_cursor_activity(self, *, now: float) -> None:
+        self._stream_cursor_blink.reset(now)
+        self._stream_cursor_visible = True
+
+    def _refresh_stream_cursor_if_due(self, *, now: float) -> None:
+        if not self._show_stream_cursor:
+            return
+        visible = self._stream_cursor_blink.visible_at(now)
+        if visible == self._stream_cursor_visible:
+            return
+        self._stream_cursor_visible = visible
+        self._render_current_buffer()
+
+    def has_scrolled(self) -> bool:
+        """Return whether viewport truncation/scrolling has started."""
+        return self._scrolling_started
+
+    def preserve_final_frame(self) -> bool:
+        """Request that closing leaves the final streamed frame visible.
+
+        Returns True when the request can be honored for this stream.
+        """
+        if not self._live:
+            return False
+        if self._alt_screen_streaming:
+            return False
+        if (
+            not self._live_started
+            and not self._segment_assembler.segments
+            and not self._segment_assembler.has_pending_content()
+        ):
+            return False
+        self._preserve_final_frame = True
+        return True
+
+    async def wait_for_drain(self) -> None:
+        """Wait until all queued stream updates have been rendered."""
+        if not self._async_mode or self._queue is None:
+            return
+        if self._worker_task is None or self._worker_task.done():
+            return
+        await self._queue.join()
+
+    def _render_current_buffer(self) -> None:
+        if not self._active:
+            return
+
+        segments = self._segment_assembler.segments
+        if not segments:
+            return
+
+        self._ensure_started()
+
+        if not self._live:
+            return
+        width_override = self._effective_stream_width()
+        original_width_attr = _apply_console_width_override(console.console, width_override)
+        try:
+            header = self._build_header()
+            # Reserve lines for the header (text + spacing newline) and a
+            # safety margin that absorbs height differences introduced when
+            # consecutive markdown segments are coalesced into one Markdown
+            # renderable (Rich adds inter-paragraph spacing that the
+            # per-segment height estimates do not account for).
+            max_allowed_height = max(
+                1, console.console.size.height - _STREAM_HEADER_AND_MARGIN_LINES
+            )
+            viewport_window = self._viewport.slice_segments_with_heights(
+                segments,
+                terminal_height=max_allowed_height,
+                console=console.console,
+                target_ratio=self._stream_target_ratio,
+            )
+            window_segments = viewport_window.segments
+            if not window_segments:
+                return
+            is_truncated = len(window_segments) < len(segments) or (
+                bool(window_segments) and bool(segments) and window_segments[0] is not segments[0]
+            )
+            now = time.monotonic()
+            self._update_scroll_status(is_truncated=is_truncated, now=now)
+            self._segment_assembler.compact(window_segments)
+
+            content_height = sum(viewport_window.heights)
+            self._update_pre_scroll_throttle(
+                content_height=content_height,
+                max_allowed_height=max_allowed_height,
+            )
+            width = console.console.size.width
+            render_start = time.perf_counter()
+
+            display_segments = self._coalesce_display_segments(window_segments)
+            renderables = self._render_display_segments(display_segments)
+
+            self._max_render_height = min(self._max_render_height, max_allowed_height)
+            self._update_max_render_height(
+                content_height=content_height,
+                max_allowed_height=max_allowed_height,
+            )
+            self._append_tail_padding(
+                renderables,
+                content_height=content_height,
+                max_allowed_height=max_allowed_height,
+            )
+
+            content = (
+                Group(*renderables)
+                if len(renderables) > 1
+                else (renderables[0] if renderables else Text(""))
+            )
+
+            header_with_spacing = header.copy()
+            header_with_spacing.append("\n", style="default")
+
+            combined = Group(header_with_spacing, content)
+            render_interval_ms = (
+                (now - self._last_render_time) * 1000 if self._last_render_time else None
+            )
+            try:
+                self._live.update(combined, refresh=True)
+                self._last_render_time = time.monotonic()
+            except Exception as exc:
+                logger.warning(
+                    "Error updating live display during streaming",
+                    exc_info=True,
+                    data={"error": str(exc)},
+                )
+            finally:
+                self._emit_render_performance(
+                    render_start=render_start,
+                    now=now,
+                    content_height=content_height,
+                    max_allowed_height=max_allowed_height,
+                    segment_count=len(segments),
+                    window_segment_count=len(window_segments),
+                    width=width,
+                    render_interval_ms=render_interval_ms,
+                    is_truncated=is_truncated,
+                )
+        finally:
+            self._suppress_tail_padding_for_final_frame = False
+            _restore_console_width_override(
+                console.console,
+                original_width=original_width_attr,
+                width_override=width_override,
+            )
+
+    def _render_display_segments(
+        self,
+        display_segments: list["StreamSegment"],
+    ) -> list["RenderableType"]:
+        total_segments = len(display_segments)
+        return [
+            self._render_display_segment(
+                segment,
+                cursor_suffix=self._cursor_suffix(
+                    segment_index=segment_index,
+                    total_segments=total_segments,
+                ),
+            )
+            for segment_index, segment in enumerate(display_segments)
+        ]
+
+    def _render_display_segment(
+        self,
+        segment: "StreamSegment",
+        *,
+        cursor_suffix: str,
+    ) -> "RenderableType":
+        if segment.kind == "markdown":
+            renderable = build_markdown_renderable(
+                segment.text,
+                code_theme=self._display.code_style,
+                escape_xml=self._display._escape_xml,
+                cursor_suffix=cursor_suffix,
+                close_incomplete_fences=True,
+                render_fences_with_syntax=self._display.render_fences_with_syntax,
+                code_word_wrap=self._display.code_word_wrap,
+            )
+        elif segment.kind == "reasoning":
+            renderable = self._render_reasoning_segment(segment, cursor_suffix=cursor_suffix)
+        elif segment.kind == "tool":
+            renderable = self._render_tool_segment(segment, cursor_suffix=cursor_suffix)
+        else:
+            renderable = Text(f"{segment.text}{cursor_suffix}")
+
+        if cursor_suffix == STREAM_CURSOR_BLOCK:
+            return _CursorStyledRenderable(renderable)
+        return renderable
+
+    def _render_reasoning_segment(
+        self,
+        segment: "StreamSegment",
+        *,
+        cursor_suffix: str,
+    ) -> "RenderableType":
+        if not self._render_reasoning_markdown:
+            return Text(f"{segment.text}{cursor_suffix}", style="dim italic")
+
+        prepared = prepare_markdown_content(segment.text, self._display._escape_xml)
+        prepared_for_display = close_incomplete_code_blocks(prepared)
+        if cursor_suffix:
+            prepared_for_display += cursor_suffix
+        return Markdown(
+            prepared_for_display,
+            code_theme=self._display.code_style,
+            style="dim italic",
+        )
+
+    def _update_max_render_height(
+        self,
+        *,
+        content_height: int,
+        max_allowed_height: int,
+    ) -> None:
+        budget_height = min(content_height + self._height_fudge, max_allowed_height)
+        self._max_render_height = max(self._max_render_height, budget_height)
+
+    def _append_tail_padding(
+        self,
+        renderables: list["RenderableType"],
+        *,
+        content_height: int,
+        max_allowed_height: int,
+    ) -> None:
+        if self._suppress_tail_padding_for_final_frame:
+            return
+        padding_lines = max(0, self._max_render_height - content_height)
+        if content_height + padding_lines > max_allowed_height:
+            padding_lines = max(0, max_allowed_height - content_height)
+        if padding_lines:
+            # Text("\n" * n) renders n+1 lines, so subtract one for exact padding.
+            renderables.append(Text("\n" * max(0, padding_lines - 1)))
+
+    def _emit_render_performance(
+        self,
+        *,
+        render_start: float,
+        now: float,
+        content_height: int,
+        max_allowed_height: int,
+        segment_count: int,
+        window_segment_count: int,
+        width: int,
+        render_interval_ms: float | None,
+        is_truncated: bool,
+    ) -> None:
+        if not self._performance_hook:
+            self._pending_batch_meta = None
+            return
+
+        batch_meta = self._pending_batch_meta or {}
+        oldest_enqueued = batch_meta.get("oldest_enqueued_at")
+        newest_enqueued = batch_meta.get("newest_enqueued_at")
+        queue_age_ms = _elapsed_ms(render_start, oldest_enqueued)
+        batch_span_ms = _elapsed_ms(newest_enqueued, oldest_enqueued)
+        scroll_age_ms = (
+            (now - self._scroll_start_time) * 1000 if self._scroll_start_time is not None else None
+        )
+        with suppress(Exception):
+            self._performance_hook(
+                {
+                    "render_ms": (time.perf_counter() - render_start) * 1000,
+                    "content_height": content_height,
+                    "max_allowed_height": max_allowed_height,
+                    "max_render_height": self._max_render_height,
+                    "segment_count": segment_count,
+                    "window_segment_count": window_segment_count,
+                    "width": width,
+                    "height": console.console.size.height,
+                    "batch_size": batch_meta.get("batch_size"),
+                    "queue_depth": batch_meta.get("queue_depth"),
+                    "queue_age_ms": queue_age_ms,
+                    "batch_span_ms": batch_span_ms,
+                    "batch_window_ms": batch_meta.get("batch_window_ms"),
+                    "batch_chars": batch_meta.get("batch_chars"),
+                    "render_interval_ms": render_interval_ms,
+                    "phase": "scrolling" if self._scrolling_started else "pre_scroll",
+                    "is_truncated": is_truncated,
+                    "scroll_age_ms": scroll_age_ms,
+                }
+            )
+        self._pending_batch_meta = None
+
+    def _effective_stream_width(self) -> int | None:
+        """Return an optional live-render width override for normal-screen markdown."""
+        if self._use_plain_text or self._alt_screen_streaming:
+            return None
+        actual_width = console.console.size.width
+        if actual_width <= 20:
+            return None
+        return max(20, actual_width - STREAM_RENDER_WIDTH_GUTTER)
+
+    def _coalesce_display_segments(self, segments: list["StreamSegment"]) -> list["StreamSegment"]:
+        if not segments:
+            return []
+
+        merged: list["StreamSegment"] = []
+        for segment in segments:
+            if merged and segment.kind == "markdown" and merged[-1].kind == "markdown":
+                merged[-1] = merged[-1].copy_with_text(merged[-1].text + segment.text)
+                continue
+            merged.append(segment)
+        return merged
+
+    def _tool_header_text(self, segment: "StreamSegment") -> Text:
+        header_text = (
+            self._tool_header_prefix.copy() if self._tool_header_prefix is not None else Text()
+        )
+        tool_name = segment.tool_name or "tool"
+        if tool_name:
+            if header_text.plain:
+                header_text.append(" ")
+            header_text.append(tool_name, style=self._tool_header_color or "")
+        return header_text
+
+    def _render_tool_segment(
+        self,
+        segment: "StreamSegment",
+        *,
+        cursor_suffix: str,
+    ) -> "RenderableType":
+        preview = segment.code_preview
+        if preview is not None and preview.code.strip():
+            if preview.variant == "shell":
+                blocks = shell_syntax_blocks(
+                    preview.code,
+                    shell_language=preview.language,
+                    include_incomplete=not preview.complete,
+                )
+                renderables: list[RenderableType] = [self._tool_header_text(segment)]
+                for index, block in enumerate(blocks):
+                    renderables.append(
+                        _CursorSyntax(
+                            block.code,
+                            block.language,
+                            theme=self._display.code_style,
+                            word_wrap=self._display.code_word_wrap,
+                            cursor_suffix=cursor_suffix if index == len(blocks) - 1 else "",
+                        )
+                    )
+                return Group(*renderables)
+
+            return Group(
+                self._tool_header_text(segment),
+                _CursorSyntax(
+                    preview.code,
+                    preview.language,
+                    theme=self._display.code_style,
+                    word_wrap=self._display.code_word_wrap,
+                    cursor_suffix=cursor_suffix,
+                ),
+            )
+
+        header_text = self._tool_header_text(segment)
+        tool_text = header_text
+        if segment.text:
+            _, _, args_text = segment.text.partition("\n")
+            if args_text:
+                tool_text.append("\n")
+                if segment.apply_patch_preview or "apply_patch preview:" in args_text:
+                    tool_text.append_text(
+                        style_apply_patch_preview_text(args_text, default_style="dim")
+                    )
+                else:
+                    self._append_tool_body_text(tool_text, segment, args_text)
+        if cursor_suffix:
+            tool_text.append(cursor_suffix, style="dim")
+        return tool_text
+
+    @staticmethod
+    def _append_tool_body_text(tool_text: Text, segment: "StreamSegment", args_text: str) -> None:
+        if not segment.tool_completed:
+            tool_text.append(args_text)
+            return
+        if tool_activity_family_uses_status_body(segment.tool_family):
+            tool_text.append(args_text, style="dim")
+            return
+        if segment.tool_family != "remote_tool":
+            tool_text.append(args_text)
+            return
+
+        args_block, separator, result_block = args_text.partition("\n\n")
+        if separator and result_block:
+            if args_block:
+                tool_text.append(args_block)
+            tool_text.append(separator)
+            tool_text.append(result_block, style="dim")
+            return
+        if StreamingMessageHandle._looks_like_tool_args(args_text):
+            tool_text.append(args_text)
+            return
+        tool_text.append(args_text, style="dim")
+
+    @staticmethod
+    def _looks_like_tool_args(text: str) -> bool:
+        stripped = text.strip()
+        return stripped.startswith(("{", "["))
+
+    async def _render_worker(self) -> None:
+        assert self._queue is not None
+        try:
+            while True:
+                batch = await self._next_stream_batch()
+                if batch is None:
+                    break
+
+                keep_running = await self._process_stream_batch(batch)
+                self._mark_stream_batch_done(batch)
+                if not keep_running or batch.stop_requested:
+                    break
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self._shutdown_live_resources()
+
+    async def _next_stream_batch(self) -> _StreamBatch | None:
+        assert self._queue is not None
+        item = await self._wait_for_stream_item_or_blink()
+        if item is self._stop_sentinel:
+            self._queue.task_done()
+            return None
+
+        batch_start = time.monotonic()
+        chunks = [item]
+        stop_requested = await self._collect_stream_batch(chunks, batch_start=batch_start)
+        self._record_stream_cursor_activity(now=time.monotonic())
+        return _StreamBatch(
+            chunks=chunks,
+            batch_start=batch_start,
+            stop_requested=stop_requested,
+        )
+
+    async def _wait_for_stream_item_or_blink(self) -> object:
+        assert self._queue is not None
+        while True:
+            now = time.monotonic()
+            deadline = self._stream_cursor_blink.next_transition_at(now)
+            if deadline is None:
+                return await self._queue.get()
+
+            try:
+                return await asyncio.wait_for(
+                    self._queue.get(),
+                    timeout=max(0.0, deadline - now),
+                )
+            except asyncio.TimeoutError:
+                try:
+                    return self._queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    self._refresh_stream_cursor_if_due(now=time.monotonic())
+
+    async def _collect_stream_batch(
+        self,
+        chunks: list[object],
+        *,
+        batch_start: float,
+    ) -> bool:
+        assert self._queue is not None
+        while True:
+            next_item = await self._next_batch_item(batch_start=batch_start)
+            if next_item is None:
+                return False
+            chunks.append(next_item)
+            if next_item is self._stop_sentinel:
+                return True
+
+    async def _next_batch_item(self, *, batch_start: float) -> object | None:
+        assert self._queue is not None
+        try:
+            return self._queue.get_nowait()
+        except asyncio.QueueEmpty:
+            elapsed = time.monotonic() - batch_start
+            if elapsed >= self._batch_max_duration:
+                return None
+            timeout = min(self._batch_period, self._batch_max_duration - elapsed)
+            try:
+                return await asyncio.wait_for(self._queue.get(), timeout=timeout)
+            except asyncio.TimeoutError:
+                return None
+
+    async def _process_stream_batch(self, batch: _StreamBatch) -> bool:
+        applied = self._apply_stream_batch(batch.chunks)
+        if not applied.should_render:
+            return True
+        if not await self._wait_for_render_slot():
+            return False
+
+        self._pending_batch_meta = self._stream_batch_meta(batch, applied)
+        self._render_current_buffer()
+        self._advance_render_deadline()
+        return True
+
+    def _apply_stream_batch(self, chunks: list[object]) -> _AppliedStreamBatch:
+        should_render = False
+        queued_items: list[_QueuedItem] = []
+        batch_chars = 0
+        payloads: list[object] = []
+        for chunk in chunks:
+            if chunk is self._stop_sentinel:
+                continue
+            payload = chunk
+            if isinstance(chunk, _QueuedItem):
+                queued_items.append(chunk)
+                payload = chunk.payload
+            payloads.append(payload)
+        for payload in _coalesce_tool_delta_payloads(payloads):
+            rendered, char_count = self._apply_stream_payload(payload)
+            should_render = rendered or should_render
+            batch_chars += char_count
+        return _AppliedStreamBatch(
+            should_render=should_render,
+            queued_items=queued_items,
+            batch_chars=batch_chars,
+        )
+
+    def _apply_stream_payload(self, payload: object) -> tuple[bool, int]:
+        if isinstance(payload, StreamChunk):
+            char_count = len(payload.text) if payload.text else 0
+            return self._handle_stream_chunk(payload), char_count
+        if isinstance(payload, str):
+            return self._handle_chunk(payload), len(payload)
+        if isinstance(payload, _ToolStreamEvent):
+            return (
+                self._segment_assembler.handle_tool_event(
+                    payload.event_type,
+                    payload.info,
+                ),
+                0,
+            )
+        return False, 0
+
+    def _stream_batch_meta(
+        self,
+        batch: _StreamBatch,
+        applied: _AppliedStreamBatch,
+    ) -> dict[str, Any]:
+        oldest_enqueued_at = None
+        newest_enqueued_at = None
+        if applied.queued_items:
+            oldest_enqueued_at = min(item.enqueued_at for item in applied.queued_items)
+            newest_enqueued_at = max(item.enqueued_at for item in applied.queued_items)
+        return {
+            "batch_size": len(batch.chunks),
+            "queue_depth": self._queue.qsize() if self._queue else 0,
+            "oldest_enqueued_at": oldest_enqueued_at,
+            "newest_enqueued_at": newest_enqueued_at,
+            "batch_window_ms": (time.monotonic() - batch.batch_start) * 1000,
+            "batch_chars": applied.batch_chars,
+        }
+
+    def _mark_stream_batch_done(self, batch: _StreamBatch) -> None:
+        assert self._queue is not None
+        for _ in batch.chunks:
+            self._queue.task_done()
+
+    def _shutdown_live_resources(self) -> None:
+        if self._live and self._live_started:
+            if self._preserve_final_frame:
+                with suppress(Exception):
+                    self._live.transient = False
+            with suppress(Exception):
+                self._live.__exit__(None, None, None)
+            self._live = None
+            self._live_started = False
+        self._preserve_final_frame = False
+
+        self._resume_progress_display()
+        self._active = False
+
+    def handle_tool_event(self, event_type: str, info: dict[str, Any] | None = None) -> None:
+        try:
+            if not self._active:
+                return
+
+            event = _ToolStreamEvent(event_type=event_type, info=info)
+            if self._async_mode and self._queue is not None:
+                self._enqueue_chunk(event)
+                return
+
+            if self._segment_assembler.handle_tool_event(event_type, info):
+                now = time.perf_counter()
+                self._pending_batch_meta = {
+                    "batch_size": 1,
+                    "queue_depth": 0,
+                    "oldest_enqueued_at": now,
+                    "newest_enqueued_at": now,
+                    "batch_chars": 0,
+                }
+                self._render_sync_if_due()
+        except Exception as exc:
+            logger.warning(
+                "Error handling tool event",
+                exc_info=True,
+                data={
+                    "event_type": event_type,
+                    "error": str(exc),
+                },
+            )
+
+
+__all__ = [
+    "MARKDOWN_STREAM_HEIGHT_FUDGE",
+    "MARKDOWN_STREAM_REFRESH_PER_SECOND",
+    "MARKDOWN_STREAM_TARGET_RATIO",
+    "PLAIN_STREAM_HEIGHT_FUDGE",
+    "PLAIN_STREAM_REFRESH_PER_SECOND",
+    "PLAIN_STREAM_TARGET_RATIO",
+    "NullStreamingHandle",
+    "StreamingHandle",
+    "StreamingMessageHandle",
+]
+
+
+class StreamingHandle(Protocol):
+    def update(self, chunk: str) -> None: ...
+    def update_chunk(self, chunk: StreamChunk) -> None: ...
+
+    def finalize(self, message: "PromptMessageExtended | str") -> None: ...
+
+    def close(self) -> None: ...
+
+    def handle_tool_event(self, event_type: str, info: dict[str, Any] | None = None) -> None: ...
+
+    def has_scrolled(self) -> bool: ...
+
+    def preserve_final_frame(self) -> bool: ...
+
+    async def wait_for_drain(self) -> None: ...

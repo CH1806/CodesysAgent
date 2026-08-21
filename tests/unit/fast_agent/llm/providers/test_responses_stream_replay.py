@@ -1,0 +1,833 @@
+from __future__ import annotations
+
+import importlib
+import json
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+from openai import APIError
+from openai.types.responses import ResponseErrorEvent
+
+from fast_agent.core.logging.logger import get_logger
+from fast_agent.llm.provider.openai.openresponses_streaming import OpenResponsesStreamingMixin
+from fast_agent.llm.provider.openai.responses_streaming import ResponsesStreamingMixin
+
+REPO_ROOT = next(
+    parent for parent in Path(__file__).resolve().parents if (parent / "tests" / "support").is_dir()
+)
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+_replay = importlib.import_module("tests.support.llm_trace_replay")
+
+
+class _BaseStreamingHarness:
+    def __init__(self) -> None:
+        self.logger = get_logger("test.responses.replay")
+        self.name = "test"
+        self.stream_events: list[dict[str, Any]] = []
+        self.tool_events: list[dict[str, Any]] = []
+
+    def _notify_tool_stream_listeners(
+        self,
+        event_type: str,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        self.tool_events.append(
+            {
+                "event_type": event_type,
+                "payload": payload or {},
+            }
+        )
+
+    def _notify_stream_listeners(self, chunk: Any) -> None:
+        self.stream_events.append(
+            {
+                "text": getattr(chunk, "text", ""),
+                "is_reasoning": bool(getattr(chunk, "is_reasoning", False)),
+            }
+        )
+
+    def _update_streaming_progress(
+        self,
+        content: str,
+        model: str,
+        estimated_tokens: int,
+    ) -> int:
+        del content, model
+        return estimated_tokens
+
+    def chat_turn(self) -> int:
+        return 1
+
+    async def _emit_streaming_progress(
+        self,
+        model: str,
+        new_total: int,
+        type: Any,
+    ) -> None:
+        del model, new_total, type
+
+    def _emit_stream_text_delta(
+        self,
+        *,
+        text: str,
+        model: str,
+        estimated_tokens: int,
+    ) -> int:
+        self._notify_stream_listeners(SimpleNamespace(text=text, is_reasoning=False))
+        self._notify_tool_stream_listeners("text", {"chunk": text})
+        del model
+        return estimated_tokens
+
+
+class _ResponsesHarness(ResponsesStreamingMixin, _BaseStreamingHarness):
+    def __init__(self) -> None:
+        _BaseStreamingHarness.__init__(self)
+
+
+class _OpenResponsesHarness(OpenResponsesStreamingMixin, _BaseStreamingHarness):
+    def __init__(self) -> None:
+        _BaseStreamingHarness.__init__(self)
+
+
+class _FakeResponsesStream:
+    def __init__(self, events: list[Any], final_response: Any) -> None:
+        self._events = events
+        self._final_response = final_response
+
+    def __aiter__(self):
+        self._iterator = iter(self._events)
+        return self
+
+    async def __anext__(self) -> Any:
+        try:
+            return next(self._iterator)
+        except StopIteration as exc:
+            raise StopAsyncIteration from exc
+
+    async def get_final_response(self) -> Any:
+        return self._final_response
+
+
+def _load_sanitized_trace_stream(*, fixture_dir: str) -> Any:
+    trace_path = (
+        REPO_ROOT / "tests" / "fixtures" / "llm_traces" / "sanitized" / fixture_dir / "stream.jsonl"
+    )
+    payloads = [
+        json.loads(line)
+        for line in trace_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    return _replay.ResponsesReplayStream(payloads)
+
+
+def _fixture_params() -> list[Any]:
+    params: list[Any] = []
+    for case, fixture in _replay.load_replay_fixtures("responses", "openresponses"):
+        if case.family == "responses":
+            harness_factory = _ResponsesHarness
+        elif case.family == "openresponses":
+            harness_factory = _OpenResponsesHarness
+        else:  # pragma: no cover - family filter guards this
+            continue
+        params.append(pytest.param(case, fixture, harness_factory, id=case.id))
+    return params
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "fixture", "harness_factory"),
+    _fixture_params(),
+)
+async def test_responses_family_stream_replay(
+    case: Any,
+    fixture: Any,
+    harness_factory: Any,
+) -> None:
+    harness: Any = harness_factory()
+    final_response, _reasoning_segments = await harness._process_stream(
+        fixture.responses_stream(),
+        model=fixture.meta()["resolved_model"],
+        capture_filename=None,
+    )
+
+    summary = _replay.summarize_responses_replay(
+        final_response=final_response,
+        stream_events=harness.stream_events,
+        tool_events=harness.tool_events,
+    )
+    _replay.assert_replay_case(case, fixture, summary)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_openresponses_status_before_added_emits_single_start() -> None:
+    harness = _OpenResponsesHarness()
+    final_response = SimpleNamespace(output=[], usage=None)
+    stream = _FakeResponsesStream(
+        events=[
+            SimpleNamespace(
+                type="response.function_call.started",
+                output_index=0,
+                item_id="fc_123",
+            ),
+            SimpleNamespace(
+                type="response.output_item.added",
+                output_index=0,
+                item_id="fc_123",
+                item=SimpleNamespace(
+                    type="function_call",
+                    id="fc_123",
+                    call_id="call_123",
+                    name="weather",
+                ),
+            ),
+            SimpleNamespace(
+                type="response.output_item.done",
+                output_index=0,
+                item_id="fc_123",
+                item=SimpleNamespace(
+                    type="function_call",
+                    id="fc_123",
+                    call_id="call_123",
+                    name="weather",
+                ),
+            ),
+            SimpleNamespace(type="response.completed", response=final_response),
+        ],
+        final_response=final_response,
+    )
+
+    await harness._process_stream(stream, model="gpt-test", capture_filename=None)
+
+    start_events = [event for event in harness.tool_events if event["event_type"] == "start"]
+    assert len(start_events) == 1
+    assert start_events[0]["payload"]["tool_use_id"] == "call_123"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_openresponses_status_after_added_uses_registered_tool_state() -> None:
+    harness = _OpenResponsesHarness()
+    final_response = SimpleNamespace(output=[], usage=None)
+    stream = _FakeResponsesStream(
+        events=[
+            SimpleNamespace(
+                type="response.output_item.added",
+                output_index=0,
+                item_id="fc_123",
+                item=SimpleNamespace(
+                    type="function_call",
+                    id="fc_123",
+                    call_id="call_123",
+                    name="weather",
+                ),
+            ),
+            SimpleNamespace(
+                type="response.function_call.in_progress",
+                output_index=0,
+                item_id="fc_123",
+            ),
+            SimpleNamespace(
+                type="response.output_item.done",
+                output_index=0,
+                item_id="fc_123",
+                item=SimpleNamespace(
+                    type="function_call",
+                    id="fc_123",
+                    call_id="call_123",
+                    name="weather",
+                ),
+            ),
+            SimpleNamespace(type="response.completed", response=final_response),
+        ],
+        final_response=final_response,
+    )
+
+    await harness._process_stream(stream, model="gpt-test", capture_filename=None)
+
+    start_events = [event for event in harness.tool_events if event["event_type"] == "start"]
+    status_events = [event for event in harness.tool_events if event["event_type"] == "status"]
+    stop_events = [event for event in harness.tool_events if event["event_type"] == "stop"]
+    assert len(start_events) == 1
+    assert start_events[0]["payload"]["tool_use_id"] == "call_123"
+    assert len(status_events) == 1
+    assert status_events[0]["payload"]["tool_use_id"] == "call_123"
+    assert status_events[0]["payload"]["item_id"] == "fc_123"
+    assert len(stop_events) == 1
+    assert stop_events[0]["payload"]["tool_use_id"] == "call_123"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_responses_stream_trace_preserves_reasoning_summary_section_breaks() -> None:
+    harness = _ResponsesHarness()
+
+    _final_response, reasoning_segments = await harness._process_stream(
+        _load_sanitized_trace_stream(fixture_dir="responses/gpt-5-4/reasoning_summary_sections"),
+        model="gpt-5.4",
+        capture_filename=None,
+    )
+
+    reasoning_text = "".join(reasoning_segments)
+    assert (
+        "needing just one or two from them.\n\n"
+        "**Identifying key decisions**\n\n"
+        "I think I should emphasize that there are really only "
+        "three decisions to make; the others are already determined by the plan."
+    ) in reasoning_text
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_responses_stream_preserves_reasoning_summary_parts_for_fallback() -> None:
+    harness = _ResponsesHarness()
+    final_response = SimpleNamespace(output=[], usage=None)
+    stream = _FakeResponsesStream(
+        events=[
+            SimpleNamespace(
+                type="response.reasoning_summary_text.delta",
+                item_id="rs_1",
+                summary_index=0,
+                delta="**Plan**\n\ndone",
+            ),
+            SimpleNamespace(
+                type="response.reasoning_summary_text.delta",
+                item_id="rs_1",
+                summary_index=1,
+                delta="**Checking tests**\n\n<!--",
+            ),
+            SimpleNamespace(
+                type="response.reasoning_summary_text.delta",
+                item_id="rs_1",
+                summary_index=1,
+                delta=" -->",
+            ),
+            SimpleNamespace(type="response.completed", response=final_response),
+        ],
+        final_response=final_response,
+    )
+
+    _response, reasoning_parts = await harness._process_stream(
+        stream,
+        model="gpt-test",
+        capture_filename=None,
+    )
+
+    assert reasoning_parts == ["**Plan**\n\ndone"]
+    assert "<!-- -->" in "".join(
+        event["text"] for event in harness.stream_events if event["is_reasoning"]
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_responses_stream_uses_summary_index_for_split_heading_boundary() -> None:
+    harness = _ResponsesHarness()
+    final_response = SimpleNamespace(output=[], usage=None)
+    stream = _FakeResponsesStream(
+        events=[
+            SimpleNamespace(
+                type="response.reasoning_summary_text.delta",
+                item_id="rs_1",
+                summary_index=0,
+                delta="**Planning server initialization**",
+            ),
+            SimpleNamespace(
+                type="response.reasoning_summary_text.delta",
+                item_id="rs_1",
+                summary_index=1,
+                delta="**",
+            ),
+            SimpleNamespace(
+                type="response.reasoning_summary_text.delta",
+                item_id="rs_1",
+                summary_index=1,
+                delta="Reducing endpoint calls**",
+            ),
+            SimpleNamespace(type="response.completed", response=final_response),
+        ],
+        final_response=final_response,
+    )
+
+    _response, reasoning_parts = await harness._process_stream(
+        stream,
+        model="gpt-test",
+        capture_filename=None,
+    )
+
+    reasoning_text = "".join(
+        event["text"] for event in harness.stream_events if event["is_reasoning"]
+    )
+    assert reasoning_text == ("**Planning server initialization**\n\n**Reducing endpoint calls**")
+    assert reasoning_parts == ["**Planning server initialization**\n\n**Reducing endpoint calls**"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_responses_stream_does_not_flush_reasoning_at_tool_event_boundaries() -> None:
+    harness = _ResponsesHarness()
+    final_response = SimpleNamespace(output=[], usage=None)
+    stream = _FakeResponsesStream(
+        events=[
+            SimpleNamespace(
+                type="response.reasoning_summary_text.delta",
+                item_id="rs_1",
+                summary_index=0,
+                delta="**Checking tests**\n\n<!--",
+            ),
+            SimpleNamespace(
+                type="response.output_item.added",
+                output_index=0,
+                item_id="fc_123",
+                item=SimpleNamespace(
+                    type="function_call",
+                    id="fc_123",
+                    call_id="call_123",
+                    name="run_tests",
+                ),
+            ),
+            SimpleNamespace(
+                type="response.function_call_arguments.delta",
+                output_index=0,
+                item_id="fc_123",
+                delta='{"target":"unit"}',
+            ),
+            SimpleNamespace(
+                type="response.reasoning_summary_text.delta",
+                item_id="rs_1",
+                summary_index=0,
+                delta=" -->",
+            ),
+            SimpleNamespace(
+                type="response.output_item.done",
+                output_index=0,
+                item_id="fc_123",
+                item=SimpleNamespace(
+                    type="function_call",
+                    id="fc_123",
+                    call_id="call_123",
+                    name="run_tests",
+                ),
+            ),
+            SimpleNamespace(type="response.completed", response=final_response),
+        ],
+        final_response=final_response,
+    )
+
+    _response, reasoning_parts = await harness._process_stream(
+        stream,
+        model="gpt-test",
+        capture_filename=None,
+    )
+
+    reasoning_text = "".join(
+        event["text"] for event in harness.stream_events if event["is_reasoning"]
+    )
+    assert reasoning_text == "**Checking tests**\n\n<!-- -->"
+    assert reasoning_parts == []
+    assert [event["event_type"] for event in harness.tool_events] == [
+        "start",
+        "delta",
+        "stop",
+    ]
+    assert harness.tool_events[1]["payload"]["chunk"] == '{"target":"unit"}'
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_responses_stream_namespaces_mcp_call_tool_with_server_label() -> None:
+    harness = _ResponsesHarness()
+    final_response = SimpleNamespace(output=[], usage=None)
+    stream = _FakeResponsesStream(
+        events=[
+            SimpleNamespace(
+                type="response.output_item.added",
+                output_index=0,
+                item_id="mcp_123",
+                item=SimpleNamespace(
+                    type="mcp_call",
+                    id="mcp_123",
+                    call_id="call_123",
+                    server_label="stripe",
+                    name="create_payment_link",
+                ),
+            ),
+            SimpleNamespace(
+                type="response.output_item.done",
+                output_index=0,
+                item_id="mcp_123",
+                item=SimpleNamespace(
+                    type="mcp_call",
+                    id="mcp_123",
+                    call_id="call_123",
+                    server_label="stripe",
+                    name="create_payment_link",
+                ),
+            ),
+            SimpleNamespace(type="response.completed", response=final_response),
+        ],
+        final_response=final_response,
+    )
+
+    await harness._process_stream(stream, model="gpt-test", capture_filename=None)
+
+    start_events = [event for event in harness.tool_events if event["event_type"] == "start"]
+    stop_events = [event for event in harness.tool_events if event["event_type"] == "stop"]
+    assert start_events[0]["payload"]["tool_name"] == "stripe/create_payment_link"
+    assert stop_events[-1]["payload"]["tool_name"] == "stripe/create_payment_link"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_openresponses_out_of_order_tool_call_is_recovered_from_completed_items() -> None:
+    """An out-of-order tool item is recovered when the terminal payload arrives empty.
+
+    The provider never sent ``response.output_item.added``, so the tool is not tracked
+    during the stream, and the terminal response reports no output at all. Rather than
+    dropping the call, the completed item is reconstructed into ``output`` so it is
+    surfaced and dispatched.
+    """
+    harness = _OpenResponsesHarness()
+    final_response = SimpleNamespace(output=[], usage=None)
+    completed_item = SimpleNamespace(
+        type="function_call",
+        id="fc_123",
+        call_id="call_123",
+        name="weather",
+    )
+    stream = _FakeResponsesStream(
+        events=[
+            SimpleNamespace(
+                type="response.function_call.in_progress",
+                item_id="fc_123",
+            ),
+            SimpleNamespace(
+                type="response.output_item.done",
+                output_index=5,
+                item_id="fc_123",
+                item=completed_item,
+            ),
+            SimpleNamespace(type="response.completed", response=final_response),
+        ],
+        final_response=final_response,
+    )
+
+    recovered, _reasoning = await harness._process_stream(
+        stream, model="gpt-test", capture_filename=None
+    )
+
+    assert recovered.output == [completed_item]
+    assert final_response.output == []
+
+    stop_events = [event for event in harness.tool_events if event["event_type"] == "stop"]
+    assert [event["payload"]["tool_name"] for event in stop_events] == ["weather"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_openresponses_null_output_index_still_streams_tool_arguments() -> None:
+    harness = _OpenResponsesHarness()
+    final_response = SimpleNamespace(
+        output=[
+            SimpleNamespace(type="reasoning"),
+            SimpleNamespace(
+                type="function_call",
+                id=None,
+                call_id="call_123",
+                name="weather",
+                arguments='{"city":"Paris"}',
+            ),
+        ],
+        usage=None,
+    )
+    stream = _FakeResponsesStream(
+        events=[
+            SimpleNamespace(
+                type="response.output_item.added",
+                output_index=None,
+                item=SimpleNamespace(
+                    type="function_call",
+                    id=None,
+                    call_id="call_123",
+                    name="weather",
+                ),
+            ),
+            SimpleNamespace(
+                type="response.function_call_arguments.delta",
+                output_index=None,
+                item_id="call_123",
+                delta='{"city":"',
+            ),
+            SimpleNamespace(
+                type="response.function_call_arguments.delta",
+                output_index=None,
+                item_id="call_123",
+                delta='Paris"}',
+            ),
+            SimpleNamespace(
+                type="response.output_item.done",
+                output_index=None,
+                item=SimpleNamespace(
+                    type="function_call",
+                    id=None,
+                    call_id="call_123",
+                    name="weather",
+                ),
+            ),
+            SimpleNamespace(type="response.completed", response=final_response),
+        ],
+        final_response=final_response,
+    )
+
+    await harness._process_stream(stream, model="gpt-test", capture_filename=None)
+
+    assert harness.tool_events == [
+        {
+            "event_type": "start",
+            "payload": {
+                "tool_name": "weather",
+                "tool_use_id": "call_123",
+                "index": None,
+                "presentation_family": "tool",
+                "preserve_details": False,
+                "tool_display_name": "weather",
+                "tool_type": "function_call",
+            },
+        },
+        {
+            "event_type": "delta",
+            "payload": {
+                "tool_name": "weather",
+                "tool_use_id": "call_123",
+                "index": None,
+                "presentation_family": "tool",
+                "preserve_details": False,
+                "tool_display_name": "weather",
+                "tool_type": "function_call",
+                "chunk": '{"city":"',
+            },
+        },
+        {
+            "event_type": "delta",
+            "payload": {
+                "tool_name": "weather",
+                "tool_use_id": "call_123",
+                "index": None,
+                "presentation_family": "tool",
+                "preserve_details": False,
+                "tool_display_name": "weather",
+                "tool_type": "function_call",
+                "chunk": 'Paris"}',
+            },
+        },
+        {
+            "event_type": "stop",
+            "payload": {
+                "tool_name": "weather",
+                "tool_use_id": "call_123",
+                "index": -1,
+                "presentation_family": "tool",
+                "preserve_details": False,
+                "tool_display_name": "weather",
+            },
+        },
+    ]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_responses_null_output_index_still_streams_tool_arguments() -> None:
+    harness = _ResponsesHarness()
+    final_response = SimpleNamespace(
+        output=[
+            SimpleNamespace(type="reasoning"),
+            SimpleNamespace(
+                type="function_call",
+                id=None,
+                call_id="call_123",
+                name="weather",
+                arguments='{"city":"Paris"}',
+            ),
+        ],
+        usage=None,
+    )
+    stream = _FakeResponsesStream(
+        events=[
+            SimpleNamespace(
+                type="response.output_item.added",
+                output_index=None,
+                item_id="call_123",
+                item=SimpleNamespace(
+                    type="function_call",
+                    id=None,
+                    call_id="call_123",
+                    name="weather",
+                ),
+            ),
+            SimpleNamespace(
+                type="response.function_call_arguments.delta",
+                output_index=None,
+                item_id="call_123",
+                delta='{"city":"',
+            ),
+            SimpleNamespace(
+                type="response.function_call_arguments.delta",
+                output_index=None,
+                item_id="call_123",
+                delta='Paris"}',
+            ),
+            SimpleNamespace(
+                type="response.output_item.done",
+                output_index=None,
+                item_id="call_123",
+                item=SimpleNamespace(
+                    type="function_call",
+                    id=None,
+                    call_id="call_123",
+                    name="weather",
+                ),
+            ),
+            SimpleNamespace(type="response.completed", response=final_response),
+        ],
+        final_response=final_response,
+    )
+
+    await harness._process_stream(stream, model="gpt-test", capture_filename=None)
+
+    event_types = [event["event_type"] for event in harness.tool_events]
+    assert event_types == ["start", "delta", "delta", "stop"]
+    assert harness.tool_events[0]["payload"]["index"] is None
+    assert harness.tool_events[0]["payload"]["tool_use_id"] == "call_123"
+    assert harness.tool_events[1]["payload"]["chunk"] == '{"city":"'
+    assert harness.tool_events[1]["payload"]["index"] is None
+    assert harness.tool_events[2]["payload"]["chunk"] == 'Paris"}'
+    assert harness.tool_events[2]["payload"]["index"] is None
+    assert harness.tool_events[3]["payload"]["index"] == -1
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("harness_factory", "response_event_type"),
+    [
+        pytest.param(_ResponsesHarness, "response.incomplete", id="responses"),
+        pytest.param(_OpenResponsesHarness, "response.incomplete", id="openresponses"),
+    ],
+)
+async def test_incomplete_responses_return_final_payload(
+    harness_factory: Any,
+    response_event_type: str,
+) -> None:
+    harness = harness_factory()
+    final_response = SimpleNamespace(
+        status="incomplete",
+        incomplete_details=SimpleNamespace(reason="max_output_tokens"),
+        output=[],
+        usage=None,
+    )
+    stream = _FakeResponsesStream(
+        events=[
+            SimpleNamespace(
+                type="response.output_item.added",
+                output_index=0,
+                item_id="fc_123",
+                item=SimpleNamespace(
+                    type="function_call",
+                    id="fc_123",
+                    call_id="call_123",
+                    name="weather",
+                ),
+            ),
+            SimpleNamespace(
+                type="response.function_call_arguments.delta",
+                output_index=0,
+                item_id="fc_123",
+                delta='{"city":"Paris"',
+            ),
+            SimpleNamespace(type=response_event_type, response=final_response),
+        ],
+        final_response=final_response,
+    )
+
+    returned_response, _reasoning_segments = await harness._process_stream(
+        stream,
+        model="gpt-test",
+        capture_filename=None,
+    )
+
+    assert returned_response is final_response
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_failed_responses_raise_provider_error_details() -> None:
+    harness = _ResponsesHarness()
+    final_response = SimpleNamespace(
+        status="failed",
+        error=SimpleNamespace(
+            code="server_error",
+            message="DeepSeek generation failed",
+        ),
+        output=[],
+        usage=None,
+    )
+    stream = _FakeResponsesStream(
+        events=[
+            SimpleNamespace(
+                type="response.failed",
+                response=final_response,
+            )
+        ],
+        final_response=final_response,
+    )
+
+    with pytest.raises(APIError, match="DeepSeek generation failed") as exc_info:
+        await harness._process_stream(
+            stream,
+            model="deepseek-v4-flash",
+            capture_filename=None,
+        )
+
+    assert exc_info.value.body == {
+        "error": {
+            "message": "DeepSeek generation failed",
+            "code": "server_error",
+        }
+    }
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_error_event_raises_provider_error_details() -> None:
+    harness = _ResponsesHarness()
+    error_event = ResponseErrorEvent(
+        code="rate_limit_exceeded",
+        message="Too many requests",
+        param=None,
+        sequence_number=1,
+        type="error",
+    )
+    stream = _FakeResponsesStream(
+        events=[error_event],
+        final_response=SimpleNamespace(output=[], usage=None),
+    )
+
+    with pytest.raises(APIError, match="Too many requests") as exc_info:
+        await harness._process_stream(
+            stream,
+            model="deepseek-v4-flash",
+            capture_filename=None,
+        )
+
+    assert exc_info.value.body == {
+        "error": {
+            "message": "Too many requests",
+            "code": "rate_limit_exceeded",
+        }
+    }

@@ -1,0 +1,27 @@
+{
+  "editor.formatOnSave": true,
+  "editor.defaultFormatter": "esbenp.prettier-vscode",
+  "[python]": {
+    "editor.defaultFormatter": "charliermarsh.ruff",
+    "editor.formatOnSave": true,
+    "editor.rulers": []
+  },
+  "yaml.schemas": {
+    "./.vscode/fastagent.config.schema.json": [
+      "fastagent.config.yaml",
+      "fastagent.secrets.yaml"
+    ]
+  },
+  "python.testing.pytestArgs": ["tests"],
+  "python.testing.unittestEnabled": false,
+  "python.testing.pytestEnabled": true,
+  "python.analysis.typeCheckingMode": "standard",
+  "python.analysis.nodeExecutable": "auto",
+  "python-envs.pythonProjects": [],
+  "python.languageServer": "None",
+  "python-envs.defaultEnvManager": "ms-python.python:venv",
+  "python.analysis.inlayHints.functionReturnTypes": true,
+  "python.analysis.inlayHints.variableTypes": true,
+  "python.analysis.inlayHints.pytestParameters": true,
+  "python.analysis.inlayHints.callArgumentNames": "partial"
+}

@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Clean and recreate dist folder
+rm -rf dist
+mkdir -p dist
+# Build the package
+uv build
+
+# Extract version from the built wheel
+VERSION=$(ls dist/fast_agent_mcp-*.whl | grep -o '[0-9]\+\.[0-9]\+\.[0-9]\+' | head -1)
+
+# Create test folder
+TEST_DIR="dist/test_install"
+rm -rf "$TEST_DIR"
+mkdir -p "$TEST_DIR"
+cd "$TEST_DIR"
+
+# Create virtual environment
+uv venv .venv
+source .venv/bin/activate
+FAST_AGENT_BIN="$PWD/.venv/bin/fast-agent"
+
+# Install the built package
+uv pip install ../../dist/fast_agent_mcp-$VERSION-py3-none-any.whl
+
+# Run the quickstart command
+"$FAST_AGENT_BIN" quickstart workflow
+
+# Check if workflows folder was created AND contains files
+if [ -d "workflow" ] && [ -f "workflow/chaining.py" ] && [ -f "workflow/fast-agent.yaml" ]; then
+    echo "✅ Test successful: workflow examples created!"
+else
+    echo "❌ Test failed: workflow examples not created."
+    echo "Contents of workflow directory:"
+    ls -la workflow/ 2>/dev/null || echo "Directory doesn't exist"
+    exit 1
+fi
+
+# Test the setup command (non-interactive; accept defaults)
+printf '\n' | "$FAST_AGENT_BIN" scaffold --force
+
+# Check that setup created the expected files in the current directory
+if [ -f "fast-agent.yaml" ] && [ -f "fast-agent.secrets.yaml" ] && [ -f "agent.py" ]; then
+    echo "✅ Test successful: setup created config, secrets, and agent.py!"
+else
+    echo "❌ Test failed: setup did not create expected files."
+    echo "Directory contents:"
+    ls -la
+    exit 1
+fi
+
+# Smoke test: import the generated agent module
+echo "Running smoke import test for generated agent.py..."
+python - <<'PY'
+try:
+    import agent  # noqa: F401
+    print("✅ Smoke import successful: agent module imports")
+except Exception as e:
+    print("❌ Smoke import failed:", e)
+    raise
+PY
+
+# Smoke test: cards CLI with home-scoped registry configuration and override
+echo "Running cards CLI home smoke test..."
+FAST_AGENT_BIN="$FAST_AGENT_BIN" bash ../../scripts/test_cards_cli_env.sh
+
+# Smoke test: plugins CLI with env/global config merging and local marketplace
+echo "Running plugins CLI env smoke test..."
+FAST_AGENT_BIN="$FAST_AGENT_BIN" bash ../../scripts/test_plugins_cli_env.sh
+
+# Deactivate the virtual environment
+deactivate
+
+echo "Test completed successfully!"

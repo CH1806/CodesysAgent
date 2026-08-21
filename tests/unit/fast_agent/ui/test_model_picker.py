@@ -1,0 +1,563 @@
+"""
+Testing notes:
+
+- This module owns prompt-toolkit picker behavior and picker-specific rendering
+  contracts.
+- Minimal snapshots built from ProviderOption/CatalogModelEntry are acceptable
+  here because the behavior under test is the picker UI's response to snapshot
+  state, not catalog construction.
+- Keep exact ordering assertions only when keyboard navigation or numbered
+  selection semantics are the product behavior.
+"""
+
+from __future__ import annotations
+
+import types
+from typing import Any, cast
+
+from prompt_toolkit.data_structures import Point
+from prompt_toolkit.keys import Keys
+from prompt_toolkit.layout import Window
+from prompt_toolkit.layout.controls import FormattedTextControl
+from prompt_toolkit.layout.dimension import Dimension
+
+from fast_agent.llm.model_selection import CatalogModelEntry
+from fast_agent.llm.provider_types import Provider
+from fast_agent.ui.model_picker import (
+    _find_initial_model_index,
+    _model_availability_display,
+    _SplitListPicker,
+)
+from fast_agent.ui.model_picker_common import (
+    GENERIC_CUSTOM_MODEL_SENTINEL,
+    LLAMACPP_IMPORT_SENTINEL,
+    LLAMACPP_PROVIDER_KEY,
+    ModelOption,
+    ModelPickerSnapshot,
+    ProviderActivation,
+    ProviderOption,
+    build_snapshot,
+    model_options_for_provider,
+    provider_activation_action,
+)
+
+
+def _enter_binding(picker: _SplitListPicker):
+    return next(
+        binding
+        for binding in picker._create_key_bindings().bindings
+        if binding.keys == (Keys.ControlM,)
+    )
+
+
+def _snapshot_with_single_provider(
+    *,
+    provider: Provider | None,
+    active: bool,
+    curated_entries: tuple[CatalogModelEntry, ...],
+    key: str | None = None,
+    display_name: str | None = None,
+    overlay_group: bool = False,
+) -> ModelPickerSnapshot:
+    return ModelPickerSnapshot(
+        providers=(
+            ProviderOption(
+                provider=provider,
+                active=active,
+                curated_entries=curated_entries,
+                key=key,
+                display_name=display_name,
+                overlay_group=overlay_group,
+            ),
+        ),
+        config_payload={},
+    )
+
+
+def test_prompt_toolkit_window_scrolls_to_keep_cursor_visible() -> None:
+    visible_rows = 5
+    selected_index = 8
+    control = FormattedTextControl(
+        text=[("", "".join(f"item {index}\n" for index in range(12)))],
+        show_cursor=False,
+        get_cursor_position=lambda: Point(x=0, y=selected_index),
+    )
+    window = Window(
+        control,
+        wrap_lines=False,
+        height=Dimension.exact(visible_rows),
+        dont_extend_height=True,
+    )
+
+    content = control.create_content(width=40, height=visible_rows)
+
+    window._scroll_without_linewrapping(content, width=40, height=visible_rows)
+
+    assert window.vertical_scroll == selected_index - visible_rows + 1
+
+
+def test_picker_uses_cursor_position_for_model_scrolling() -> None:
+    picker = _SplitListPicker(config_path=None)
+    picker.state.source = "all"
+
+    provider_index: int | None = None
+    for index, option in enumerate(picker.snapshot.providers):
+        if option.provider is None:
+            continue
+        if (
+            len(model_options_for_provider(picker.snapshot, option.provider, source="all"))
+            > picker.LIST_VISIBLE_ROWS
+        ):
+            provider_index = index
+            break
+
+    assert provider_index is not None
+
+    picker.state.provider_index = provider_index
+    picker.state.model_index = picker.LIST_VISIBLE_ROWS + 1
+
+    cursor = picker._model_cursor_position()
+
+    assert cursor is not None
+    assert cursor.y == picker.state.model_index
+
+
+def test_picker_uses_cursor_position_for_provider_scrolling() -> None:
+    picker = _SplitListPicker(config_path=None)
+    picker.snapshot = ModelPickerSnapshot(
+        providers=tuple(
+            ProviderOption(
+                provider=provider,
+                active=True,
+                curated_entries=(
+                    CatalogModelEntry(
+                        alias=f"{provider.config_name}-demo", model=f"{provider.config_name}.demo"
+                    ),
+                ),
+            )
+            for provider in Provider
+        ),
+        config_payload={},
+    )
+    picker.state.provider_index = len(picker.snapshot.providers) - 1
+
+    cursor = picker._provider_cursor_position()
+
+    assert cursor is not None
+    assert cursor.y == picker.state.provider_index
+
+
+def test_picker_uses_prompt_toolkit_layout_focus() -> None:
+    picker = _SplitListPicker(config_path=None)
+
+    assert picker.app.layout.has_focus(picker.provider_window)
+    assert not picker.app.layout.has_focus(picker.model_window)
+    assert "Focus: providers" in picker._render_status_bar()[0][1]
+
+    picker._focus_models()
+
+    assert picker.app.layout.has_focus(picker.model_window)
+    assert not picker.app.layout.has_focus(picker.provider_window)
+    assert "Focus: models" in picker._render_status_bar()[0][1]
+
+
+def test_provider_display_name_uses_configured_overrides() -> None:
+    assert _SplitListPicker._provider_display_name("responses", "Responses") == "OpenAI"
+    assert _SplitListPicker._provider_display_name("openai", "OpenAI") == "OpenAI (Legacy)"
+    assert _SplitListPicker._provider_display_name("codexresponses", "Codex") == "Codex (Plan)"
+    assert _SplitListPicker._provider_display_name("generic", "Generic") == "Generic (ollama)"
+    assert _SplitListPicker._provider_display_name("fast-agent", "Fast Agent") == "fast-agent"
+    assert _SplitListPicker._provider_display_name("custom", "Custom") == "Custom"
+
+
+def test_provider_display_name_uses_overlays_label_for_overlay_group() -> None:
+    option = ProviderOption(
+        provider=None,
+        active=True,
+        curated_entries=(
+            CatalogModelEntry(
+                alias="qwen-local",
+                model="openresponses.unsloth/Qwen3.5-9B-GGUF",
+                local=True,
+            ),
+        ),
+        key="overlays",
+        display_name="Overlays",
+        overlay_group=True,
+    )
+
+    assert _SplitListPicker._provider_display_name_for_option(option) == "Overlays"
+
+
+def test_provider_display_name_uses_llamacpp_import_label() -> None:
+    picker = _SplitListPicker(config_path=None)
+    option = ProviderOption(
+        provider=None,
+        active=False,
+        curated_entries=(),
+        key=LLAMACPP_PROVIDER_KEY,
+        display_name="llama.cpp",
+    )
+
+    assert _SplitListPicker._provider_display_name_for_option(option) == "llama.cpp"
+    assert picker._provider_availability_label(option) == "available"
+
+
+def test_overlay_group_without_entries_renders_empty_message() -> None:
+    picker = _SplitListPicker(config_path=None)
+    picker.snapshot = _snapshot_with_single_provider(
+        provider=None,
+        active=False,
+        curated_entries=(),
+        key="overlays",
+        display_name="Overlays",
+        overlay_group=True,
+    )
+    picker.state.provider_index = 0
+
+    rendered = "".join(fragment for _, fragment in picker._render_model_panel())
+
+    assert "No local overlays found." in rendered
+    assert picker._provider_availability_label(picker.current_provider) == "none yet"
+
+
+def test_codex_inactive_provider_uses_activation_option() -> None:
+    snapshot = _snapshot_with_single_provider(
+        provider=Provider.CODEX_RESPONSES,
+        active=False,
+        curated_entries=(CatalogModelEntry(alias="codexplan", model="codexresponses.o4-mini"),),
+    )
+
+    activation = ProviderActivation(Provider.CODEX_RESPONSES)
+    assert provider_activation_action(snapshot, Provider.CODEX_RESPONSES) == activation
+
+    options = model_options_for_provider(
+        snapshot,
+        Provider.CODEX_RESPONSES,
+        source="curated",
+    )
+
+    assert len(options) == 1
+    assert options[0].spec == "codexresponses.o4-mini"
+    assert options[0].preset_token == "codexplan"
+    assert options[0].activation_action == activation
+
+
+def test_codex_inactive_provider_is_shown_as_auth_on_select() -> None:
+    picker = _SplitListPicker(config_path=None, initial_provider="codexresponses")
+    picker.snapshot = _snapshot_with_single_provider(
+        provider=Provider.CODEX_RESPONSES,
+        active=False,
+        curated_entries=(CatalogModelEntry(alias="codexplan", model="codexresponses.o4-mini"),),
+    )
+    picker.state.provider_index = 0
+    picker.state.model_index = 0
+
+    provider = picker.current_provider
+    assert picker._provider_availability_label(provider) == "auth on select"
+    status_line = picker._render_status_bar()[0][1]
+    assert "press Enter to authenticate" in status_line
+
+
+def test_codex_active_provider_shows_credential_source_label() -> None:
+    picker = _SplitListPicker(config_path=None, initial_provider="codexresponses")
+    picker.snapshot = ModelPickerSnapshot(
+        providers=(
+            ProviderOption(
+                provider=Provider.CODEX_RESPONSES,
+                active=True,
+                curated_entries=(
+                    CatalogModelEntry(alias="codexplan", model="codexresponses.o4-mini"),
+                ),
+                credential_label="Codex auth.json",
+            ),
+        ),
+        config_payload={},
+    )
+    picker.state.provider_index = 0
+
+    provider = picker.current_provider
+    assert picker._provider_availability_label(provider) == "Codex auth.json"
+    assert picker._provider_availability(provider).available is True
+
+
+def test_codex_inactive_picker_current_models_uses_activation_option() -> None:
+    picker = _SplitListPicker(config_path=None, initial_provider="codexresponses")
+    picker.snapshot = _snapshot_with_single_provider(
+        provider=Provider.CODEX_RESPONSES,
+        active=False,
+        curated_entries=(CatalogModelEntry(alias="codexplan", model="codexresponses.o4-mini"),),
+    )
+    picker.state.provider_index = 0
+    picker.state.model_index = 0
+
+    models = picker.current_models
+    result = picker._selected_result()
+
+    assert len(models) == 1
+    assert models[0].spec == "codexresponses.o4-mini"
+    assert models[0].activation_action == ProviderActivation(Provider.CODEX_RESPONSES)
+    assert result is not None
+    assert result.activation_action == ProviderActivation(Provider.CODEX_RESPONSES)
+    assert result.selected_model == "codexresponses.o4-mini"
+
+
+def test_xai_inactive_provider_keeps_models_selectable_for_login() -> None:
+    snapshot = _snapshot_with_single_provider(
+        provider=Provider.XAI,
+        active=False,
+        curated_entries=(CatalogModelEntry(alias="grok", model="xai.grok-4.5"),),
+    )
+
+    options = model_options_for_provider(snapshot, Provider.XAI, source="curated")
+
+    assert len(options) == 1
+    assert options[0].spec == "xai.grok-4.5"
+    assert options[0].preset_token == "grok"
+    assert options[0].activation_action == ProviderActivation(Provider.XAI)
+
+
+def test_model_availability_and_marker_capture_provider_state() -> None:
+    normal_model = ModelOption(spec="generic.llama3", label="llama3")
+    activation_model = ModelOption(
+        spec="codexresponses.o4-mini",
+        label="Log in to enable Codex (Plan)",
+        activation_action=ProviderActivation(Provider.CODEX_RESPONSES),
+    )
+
+    active = _model_availability_display(normal_model, provider_available=True)
+    attention = _model_availability_display(
+        activation_model,
+        provider_available=False,
+    )
+    inactive = _model_availability_display(normal_model, provider_available=False)
+
+    assert (active.availability, active.marker) == ("active", "✓")
+    assert (attention.availability, attention.marker) == ("attention", "○")
+    assert (inactive.availability, inactive.marker) == ("inactive", "✗")
+
+
+def test_find_initial_model_index_matches_model_identity() -> None:
+    options = [
+        ModelOption(
+            spec="responses.chatgpt-5.3-instant",
+            label="chatgpt → responses.chatgpt-5.3-instant",
+            preset_token="chatgpt",
+        ),
+        ModelOption(
+            spec="responses.gpt-5.4",
+            label="gpt-5.4 → responses.gpt-5.4",
+            preset_token="gpt-5.4",
+        ),
+    ]
+
+    assert _find_initial_model_index(options, "chatgpt") == 0
+
+
+def test_find_initial_model_index_maps_generic_model_to_custom_entry() -> None:
+    options = [
+        ModelOption(
+            spec=GENERIC_CUSTOM_MODEL_SENTINEL,
+            label="Enter local model string (e.g. llama3.2)",
+        )
+    ]
+
+    assert _find_initial_model_index(options, "generic.llama3.2") == 0
+
+
+def test_picker_ignores_blank_initial_model_spec() -> None:
+    picker = _SplitListPicker(config_path=None, initial_model_spec="   ")
+
+    assert picker._initial_model_spec is None
+
+
+def test_tabulate_model_label_uses_compact_columns() -> None:
+    formatted = _SplitListPicker._tabulate_model_label(
+        "qwen-local             → openresponses.unsloth/Qwen3.5-9B-GGUF (local, fast) — Imported from llama.cpp",
+        panel_width=58,
+    )
+
+    assert "qwen-local" in formatted
+    assert "openresponses.unsloth" in formatted
+    assert len(formatted) <= 58
+
+
+def test_picker_returns_overlay_token_as_resolved_model() -> None:
+    class _FakeApp:
+        def __init__(self) -> None:
+            self.result = None
+
+        def exit(self, *, result) -> None:
+            self.result = result
+
+    class _FakeEvent:
+        def __init__(self, app: _FakeApp) -> None:
+            self.app = app
+
+    picker = _SplitListPicker(config_path=None)
+    picker.snapshot = _snapshot_with_single_provider(
+        provider=None,
+        active=True,
+        curated_entries=(
+            CatalogModelEntry(
+                alias="haikutiny",
+                model="anthropic.claude-haiku-4-5?temperature=0.5",
+                local=True,
+            ),
+        ),
+        key="overlays",
+        display_name="Overlays",
+        overlay_group=True,
+    )
+    picker.state.provider_index = 0
+    picker.state.model_index = 0
+
+    enter_binding = _enter_binding(picker)
+
+    app = _FakeApp()
+    cast("Any", enter_binding.handler)(_FakeEvent(app))
+
+    assert app.result is not None
+    assert app.result.selected_model == "haikutiny"
+    assert app.result.resolved_model == "haikutiny"
+
+
+def test_picker_routes_llamacpp_selection_to_follow_up_flow() -> None:
+    class _FakeApp:
+        def __init__(self) -> None:
+            self.result = None
+
+        def exit(self, *, result) -> None:
+            self.result = result
+
+    class _FakeEvent:
+        def __init__(self, app: _FakeApp) -> None:
+            self.app = app
+
+    picker = _SplitListPicker(config_path=None)
+    picker.snapshot = _snapshot_with_single_provider(
+        provider=None,
+        active=False,
+        curated_entries=(),
+        key=LLAMACPP_PROVIDER_KEY,
+        display_name="llama.cpp",
+    )
+    picker.state.provider_index = 0
+    picker.state.model_index = 0
+
+    enter_binding = _enter_binding(picker)
+
+    app = _FakeApp()
+    cast("Any", enter_binding.handler)(_FakeEvent(app))
+
+    assert app.result is not None
+    assert app.result.provider == LLAMACPP_PROVIDER_KEY
+    assert app.result.provider_available is True
+    assert app.result.selected_model == LLAMACPP_IMPORT_SENTINEL
+    assert app.result.resolved_model is None
+
+
+def test_snapshot_adds_anthropic_vertex_group_when_ready(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "fast_agent.llm.provider.anthropic.vertex_config.detect_google_adc",
+        lambda: types.SimpleNamespace(
+            available=True,
+            project_id="proj",
+            credentials=object(),
+        ),
+    )
+
+    snapshot = build_snapshot(
+        config_payload={
+            "anthropic": {
+                "vertex_ai": {
+                    "enabled": True,
+                    "project_id": "proj",
+                    "location": "global",
+                }
+            }
+        }
+    )
+
+    option = next(
+        provider
+        for provider in snapshot.providers
+        if provider.option_key == Provider.ANTHROPIC_VERTEX.config_name
+    )
+
+    assert option.active is True
+    assert option.provider is Provider.ANTHROPIC_VERTEX
+    assert option.display_name is None
+    assert all(entry.model.startswith("anthropic-vertex.") for entry in option.curated_entries)
+
+
+def test_snapshot_disables_anthropic_vertex_group_when_adc_missing(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "fast_agent.llm.provider.anthropic.vertex_config.detect_google_adc",
+        lambda: types.SimpleNamespace(
+            available=False,
+            project_id=None,
+            error=RuntimeError("missing"),
+            credentials=None,
+        ),
+    )
+
+    snapshot = build_snapshot(
+        config_payload={
+            "anthropic": {
+                "vertex_ai": {
+                    "enabled": True,
+                    "project_id": "proj",
+                    "location": "global",
+                }
+            }
+        }
+    )
+
+    option = next(
+        provider
+        for provider in snapshot.providers
+        if provider.option_key == Provider.ANTHROPIC_VERTEX.config_name
+    )
+
+    assert option.active is False
+    assert option.disabled_reason == "Google ADC not found"
+
+
+def test_snapshot_shows_anthropic_vertex_group_without_configuration() -> None:
+    snapshot = build_snapshot(config_payload={})
+
+    option = next(
+        provider
+        for provider in snapshot.providers
+        if provider.option_key == Provider.ANTHROPIC_VERTEX.config_name
+    )
+    picker = _SplitListPicker(config_path=None)
+
+    assert option.active is False
+    assert option.disabled_reason is None
+    assert picker._provider_availability_label(option) == "not configured"
+    assert picker._provider_availability_style(option) == "inactive"
+
+
+def test_snapshot_adds_anthropic_vertex_group_for_env_only_setup(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "fast_agent.llm.provider.anthropic.vertex_config.detect_google_adc",
+        lambda: types.SimpleNamespace(
+            available=True,
+            project_id="proj",
+            credentials=object(),
+        ),
+    )
+    monkeypatch.setenv("ANTHROPIC_VERTEX_PROJECT_ID", "proj")
+
+    snapshot = build_snapshot(config_payload={})
+
+    option = next(
+        provider
+        for provider in snapshot.providers
+        if provider.option_key == Provider.ANTHROPIC_VERTEX.config_name
+    )
+
+    assert option.active is True
+    assert all(entry.model.startswith("anthropic-vertex.") for entry in option.curated_entries)

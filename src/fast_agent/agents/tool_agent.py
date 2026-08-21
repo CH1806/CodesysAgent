@@ -1,0 +1,1166 @@
+from __future__ import annotations
+
+import json
+from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
+from contextlib import suppress
+from contextvars import ContextVar
+from typing import TYPE_CHECKING, Any
+
+from fastmcp.tools import FunctionTool, ToolResult
+from mcp_types import CallToolResult, ContentBlock, ListToolsResult, Tool
+
+from fast_agent.agents.current_user_message import (
+    reset_current_user_message,
+    set_current_user_message,
+    snapshot_current_user_message,
+)
+from fast_agent.agents.llm_agent import LlmAgent
+from fast_agent.agents.subagent_directive import resolve_subagent_directive
+from fast_agent.agents.subagent_labels import requested_subagent_display_label
+from fast_agent.agents.tool_call_planning import (
+    PlannedToolCall,
+    execute_planned_tool_call,
+    plan_tool_calls,
+)
+from fast_agent.agents.tool_loop_progress import ToolLoopProgressEmitter
+from fast_agent.agents.tool_result_channels import build_tool_result_message
+from fast_agent.agents.tool_runner import ToolRunner, ToolRunnerHooks, _ToolLoopAgent
+from fast_agent.constants import (
+    BUILTIN_SUBAGENT_TOOL_NAME,
+    HUMAN_INPUT_TOOL_NAME,
+    should_parallelize_tool_calls,
+)
+from fast_agent.core.logging.logger import get_logger
+from fast_agent.event_progress import ProgressAction
+from fast_agent.interfaces import LlmAgentProtocol, ToolRunnerHookCapable
+from fast_agent.llm.structured_schema import validate_json_schema_definition
+from fast_agent.mcp.helpers.content_helpers import get_text, text_content
+from fast_agent.mcp.prompt import Prompt
+from fast_agent.mcp.tool_result_metadata import (
+    set_url_elicitation_required_payload,
+    url_elicitation_required_payload,
+)
+from fast_agent.tools.elicitation import get_elicitation_fastmcp_tool
+from fast_agent.tools.function_tool_loader import build_default_function_tool
+from fast_agent.tools.invocation_context import local_tool_invocation_context
+from fast_agent.tools.tool_sources import FAST_AGENT_TOOL_SOURCE_META, TOOL_SOURCE_LABELS
+from fast_agent.tools.transient_artifacts import TransientArtifactStore
+from fast_agent.types import LlmStopReason, PromptMessageExtended, RequestParams, ToolTimingInfo
+from fast_agent.ui.message_display_helpers import resolve_highlight_indexes
+from fast_agent.ui.subagent_result_presentation import build_subagent_result_presentation
+from fast_agent.ui.tool_display import ToolCallDisplayRequest, ToolResultDisplayRequest
+from fast_agent.utils.async_utils import gather_with_cancel
+
+if TYPE_CHECKING:
+    from fast_agent.agents.agent_types import AgentConfig
+    from fast_agent.context import Context
+    from fast_agent.mcp.tool_execution_handler import ToolExecutionHandler
+    from fast_agent.tools.execution_environment import EnvironmentTemporaryArtifacts
+
+logger = get_logger(__name__)
+
+_tool_progress_context: ContextVar[tuple[ToolExecutionHandler, str] | None] = ContextVar(
+    "tool_progress_context",
+    default=None,
+)
+
+
+class ToolAgent(LlmAgent, _ToolLoopAgent):
+    """
+    A Tool Calling agent that uses FastMCP Tools for execution.
+
+    Pass either:
+    - native FastMCP FunctionTool objects
+    - regular Python functions (wrapped as FunctionTools)
+
+    Naming note:
+    ``tools`` here means executable local/function tools available to the
+    agent. It does not refer to ``AgentConfig.tools``, which is the MCP
+    filter map used by ``McpAgent``.
+    """
+
+    def __init__(
+        self,
+        config: AgentConfig,
+        tools: Sequence[FunctionTool | Callable[..., Any]] = (),
+        context: Context | None = None,
+    ) -> None:
+        """Create a tool-capable agent.
+
+        Args:
+            config: Agent configuration. ``config.tools`` remains the MCP
+                filter map; it is separate from this ``tools`` argument.
+            tools: Executable local/function tools to expose on the agent.
+            context: Optional runtime context.
+        """
+        super().__init__(config=config, context=context)
+        if self.config.subagent_child:
+            directive = resolve_subagent_directive(self.instruction)
+            self.set_instruction(directive.subagent_instruction)
+
+        self._execution_tools: dict[str, FunctionTool] = {}
+        self._tool_schemas: list[Tool] = []
+        self._agent_tools: dict[str, LlmAgent] = {}
+        self._card_tool_names: set[str] = set()
+        self.last_turn_messages: list[PromptMessageExtended] = []
+        self._transient_artifact_store: TransientArtifactStore | None = None
+
+        # Build a working list of tools and auto-inject human-input tool if missing
+        working_tools: list[FunctionTool | Callable[..., Any]] = list(tools) if tools else []
+        card_tool_source_ids = {id(tool) for tool in working_tools}
+        # Only auto-inject if enabled via AgentConfig
+        if self.config.human_input:
+            existing_names = {
+                t.name if isinstance(t, FunctionTool) else getattr(t, "__name__", "")
+                for t in working_tools
+            }
+            if HUMAN_INPUT_TOOL_NAME not in existing_names:
+                try:
+                    working_tools.append(get_elicitation_fastmcp_tool())
+                except Exception as e:
+                    logger.warning(f"Failed to initialize human-input tool: {e}")
+
+        for tool in working_tools:
+            if isinstance(tool, FunctionTool):
+                fast_tool = tool
+            elif callable(tool):
+                fast_tool = build_default_function_tool(tool)
+            else:
+                logger.warning(f"Skipping unknown tool type: {type(tool)}")
+                continue
+
+            fast_agent_meta = (
+                fast_tool.meta.get("fast_agent") if isinstance(fast_tool.meta, dict) else None
+            )
+            if (
+                self.config.subagent_child
+                and fast_tool.name == BUILTIN_SUBAGENT_TOOL_NAME
+                and isinstance(fast_agent_meta, dict)
+                and fast_agent_meta.get("builtin") == BUILTIN_SUBAGENT_TOOL_NAME
+            ):
+                continue
+
+            self.add_tool(fast_tool)
+            if id(tool) in card_tool_source_ids:
+                self._card_tool_names.add(fast_tool.name)
+
+    def _clone_constructor_kwargs(self) -> dict[str, Any]:
+        """Carry local tool definitions into detached clones."""
+        if not self._execution_tools:
+            return {}
+        tools = [
+            tool
+            for tool in self._execution_tools.values()
+            if not (
+                isinstance(tool.meta, dict)
+                and isinstance((fast_agent_meta := tool.meta.get("fast_agent")), dict)
+                and fast_agent_meta.get("inherit_to_clone") is False
+            )
+        ]
+        return {"tools": tools}
+
+    def _temporary_artifact_environment(self) -> EnvironmentTemporaryArtifacts | None:
+        """Return this agent's model-visible temporary-file capability, if any."""
+
+        return None
+
+    def transient_artifact_store(self) -> TransientArtifactStore | None:
+        """Lazily create the parent-owned temporary artifact store."""
+
+        if self._transient_artifact_store is not None:
+            return self._transient_artifact_store
+        environment = self._temporary_artifact_environment()
+        if environment is None:
+            return None
+        self._transient_artifact_store = TransientArtifactStore(environment)
+        return self._transient_artifact_store
+
+    async def _close_transient_artifact_store(self) -> None:
+        store = self._transient_artifact_store
+        self._transient_artifact_store = None
+        if store is not None:
+            await store.close()
+
+    async def shutdown(self) -> None:
+        await self._close_transient_artifact_store()
+        await super().shutdown()
+
+    def add_tool(self, tool: FunctionTool, *, replace: bool = True) -> None:
+        """Register a new execution tool and expose it to the LLM."""
+        name = tool.name
+        if not replace and name in self._execution_tools:
+            raise ValueError(f"Tool '{name}' already exists")
+
+        self._execution_tools[name] = tool
+        self._tool_schemas = [schema for schema in self._tool_schemas if schema.name != name]
+        self._tool_schemas.append(
+            Tool(
+                name=tool.name,
+                description=tool.description,
+                input_schema=tool.parameters,
+            )
+        )
+
+    def remove_tool(self, name: str) -> None:
+        """Remove a local execution tool and its model-visible schema."""
+        self._execution_tools.pop(name, None)
+        self._tool_schemas = [schema for schema in self._tool_schemas if schema.name != name]
+        self._card_tool_names.discard(name)
+
+    def _tool_display_metadata(self, tool_name: str) -> dict[str, Any] | None:
+        tool = self._execution_tools.get(tool_name)
+        if tool is None or not isinstance(tool.meta, Mapping):
+            return None
+        metadata = dict(tool.meta)
+        return metadata or None
+
+    def resolve_stream_tool_metadata(self, tool_name: str) -> Mapping[str, Any] | None:
+        return self._jsonable_tool_metadata(self._tool_display_metadata(tool_name))
+
+    @staticmethod
+    def _jsonable_tool_metadata(metadata: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not metadata:
+            return None
+        try:
+            json.dumps(metadata)
+        except TypeError:
+            return None
+        return dict(metadata)
+
+    @property
+    def has_before_tool_call_hook(self) -> bool:
+        """Return True if a before_tool_call hook is configured."""
+        return (
+            self.tool_runner_hooks is not None
+            and self.tool_runner_hooks.before_tool_call is not None
+        )
+
+    @property
+    def has_after_tool_call_hook(self) -> bool:
+        """Return True if an after_tool_call hook is configured."""
+        return (
+            self.tool_runner_hooks is not None
+            and self.tool_runner_hooks.after_tool_call is not None
+        )
+
+    @property
+    def agent_backed_tools(self) -> Mapping[str, LlmAgentProtocol]:
+        """Return the public view of child agents exposed as tools."""
+        return self._agent_tools
+
+    @property
+    def card_tool_names(self) -> Collection[str]:
+        """Return the public view of card-sourced tool names."""
+        return self._card_tool_names
+
+    def _card_tools_label(self) -> str | None:
+        if not self._card_tool_names:
+            return None
+        return "card_tools"
+
+    def _card_tools_used(self, message: PromptMessageExtended) -> bool:
+        if not self._card_tool_names or not message.tool_calls:
+            return False
+        return any(
+            tool_request.params.name in self._card_tool_names
+            for tool_request in message.tool_calls.values()
+        )
+
+    def _count_agent_tool_calls(self, tool_call_items: list[tuple[str, Any]]) -> int:
+        if not tool_call_items:
+            return 0
+        agent_tool_names = set(self._agent_tools.keys())
+        if not agent_tool_names:
+            return 0
+        return sum(
+            1 for _, tool_request in tool_call_items if tool_request.params.name in agent_tool_names
+        )
+
+    def _tool_display_source_label(
+        self,
+        tool_name: str,
+        metadata: Mapping[str, Any] | None,
+    ) -> str | None:
+        if tool_name in self._card_tool_names:
+            return "Card"
+        if tool_name in self._agent_tools:
+            return "Agent"
+        if metadata is None:
+            return None
+        source = metadata.get(FAST_AGENT_TOOL_SOURCE_META)
+        if not isinstance(source, str):
+            return None
+        return next(
+            (label for key, label in TOOL_SOURCE_LABELS.items() if key == source),
+            None,
+        )
+
+    def _agent_tool_description(
+        self,
+        child: LlmAgent,
+        description: str | None,
+    ) -> str:
+        if description:
+            return description
+        return (
+            child.config.description
+            or child.instruction
+            or f"Send a message to the {child.name} agent"
+        )
+
+    async def _emit_agent_tool_progress(
+        self,
+        *,
+        child_name: str,
+        progress_step: int,
+        label: str | None,
+    ) -> None:
+        message = f"{child_name} step {progress_step}"
+        if label:
+            message = f"{message} ({label})"
+
+        ctx = _tool_progress_context.get()
+        if ctx:
+            handler, tool_call_id = ctx
+            with suppress(Exception):
+                await handler.on_tool_progress(
+                    tool_call_id,
+                    float(progress_step),
+                    None,
+                    message,
+                )
+
+        logger.info(
+            "Agent tool progress",
+            data={
+                "progress_action": ProgressAction.TOOL_PROGRESS,
+                "agent_name": self.name,
+                "progress": progress_step,
+                "total": None,
+                "details": message,
+            },
+        )
+
+    @staticmethod
+    def _wrap_agent_tool_progress_hooks(
+        clone: "ToolAgent",
+        emit_progress: Callable[[str | None], Awaitable[None]],
+    ) -> None:
+        existing_hooks = clone.tool_runner_hooks
+        before_llm_call = existing_hooks.before_llm_call if existing_hooks else None
+        before_tool_call = existing_hooks.before_tool_call if existing_hooks else None
+        after_llm_call = existing_hooks.after_llm_call if existing_hooks else None
+        after_tool_call = existing_hooks.after_tool_call if existing_hooks else None
+        after_turn_complete = existing_hooks.after_turn_complete if existing_hooks else None
+
+        async def handle_before_llm_call(
+            runner: ToolRunner,
+            messages: list[PromptMessageExtended],
+        ) -> None:
+            if before_llm_call:
+                await before_llm_call(runner, messages)
+            await emit_progress("llm")
+
+        async def handle_before_tool_call(
+            runner: ToolRunner,
+            message: PromptMessageExtended,
+        ) -> None:
+            if before_tool_call:
+                await before_tool_call(runner, message)
+            await emit_progress("tool")
+
+        clone.tool_runner_hooks = ToolRunnerHooks(
+            before_llm_call=handle_before_llm_call,
+            after_llm_call=after_llm_call,
+            before_tool_call=handle_before_tool_call,
+            after_tool_call=after_tool_call,
+            after_turn_complete=after_turn_complete,
+        )
+
+    @staticmethod
+    async def _shutdown_agent_tool_clone(child: LlmAgent, clone: LlmAgent) -> None:
+        try:
+            await clone.shutdown()
+        except Exception as exc:
+            logger.warning(f"Error shutting down tool clone for {child.name}: {exc}")
+        try:
+            child.merge_usage_from(clone)
+        except Exception as exc:
+            logger.warning(f"Failed to merge tool clone usage for {child.name}: {exc}")
+
+    def add_agent_tool(
+        self,
+        child: LlmAgent,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+    ) -> str:
+        """Expose another agent as a tool on this agent."""
+        tool_name = name or f"agent__{child.name}"
+        tool_description = self._agent_tool_description(child, description)
+        self._agent_tools[tool_name] = child
+
+        async def call_agent(message: str) -> str:
+            """Message to send to the child agent."""
+            input_text = message
+            clone = await child.spawn_detached_instance(name=f"{child.name}[tool]")
+            progress_step = 0
+
+            async def emit_progress(label: str | None = None) -> None:
+                nonlocal progress_step
+                progress_step += 1
+                await self._emit_agent_tool_progress(
+                    child_name=child.name,
+                    progress_step=progress_step,
+                    label=label,
+                )
+
+            hooks_set = False
+            if isinstance(clone, ToolAgent):
+                self._wrap_agent_tool_progress_hooks(clone, emit_progress)
+                hooks_set = True
+
+            try:
+                if not hooks_set:
+                    await emit_progress("run")
+                clone.load_message_history([])
+                response = await clone.generate([Prompt.user(input_text)], None)
+                return response.last_text() or ""
+            finally:
+                await self._shutdown_agent_tool_clone(child, clone)
+
+        fast_tool = build_default_function_tool(
+            call_agent,
+            name=tool_name,
+            description=tool_description,
+        )
+        self.add_tool(fast_tool)
+        return tool_name
+
+    async def generate_impl(
+        self,
+        messages: list[PromptMessageExtended],
+        request_params: RequestParams | None = None,
+        tools: list[Tool] | None = None,
+    ) -> PromptMessageExtended:
+        """
+        Generate a response using the LLM, and handle tool calls if necessary.
+        Messages are already normalized to list[PromptMessageExtended].
+        """
+        current_user_token = set_current_user_message(snapshot_current_user_message(messages))
+        try:
+            use_history = (
+                request_params.use_history
+                if request_params is not None and "use_history" in request_params.model_fields_set
+                else self.config.use_history
+            )
+            has_tool_results = any(message.tool_results for message in messages)
+            if use_history and not has_tool_results:
+                history_state = ToolRunner.reconcile_interrupted_history(
+                    self,
+                    use_history=use_history,
+                )
+                if history_state.status == "appended_interrupted_tool_result":
+                    logger.warning(
+                        "History ended with unanswered tool call; auto-healed by "
+                        "appending interrupted tool result marker.",
+                        data={
+                            "history_before": history_state.history_before,
+                            "history_after": history_state.history_after,
+                        },
+                    )
+
+            if tools is None:
+                tools = (await self.list_tools()).tools
+
+            runner = ToolRunner(
+                agent=self,
+                messages=messages,
+                request_params=request_params,
+                tools=tools,
+                hooks=self._build_tool_runner_hooks(request_params),
+            )
+            try:
+                return await runner.until_done()
+            finally:
+                self.last_turn_messages = [
+                    message.model_copy(deep=True) for message in runner.turn_messages
+                ]
+        finally:
+            reset_current_user_message(current_user_token)
+
+    async def structured_schema_impl(
+        self,
+        messages: list[PromptMessageExtended],
+        schema: dict[str, Any],
+        request_params: RequestParams | None = None,
+    ) -> tuple[Any | None, PromptMessageExtended]:
+        """Run raw-schema structured output through the normal tool loop."""
+        llm = self._require_llm()
+        normalized_schema = validate_json_schema_definition(schema)
+        structured_params = llm.get_request_params(request_params).model_copy(
+            update={"structured_schema": normalized_schema}
+        )
+
+        response = await self.generate_impl(messages, structured_params)
+        return llm.parse_structured_schema_response(response, normalized_schema)
+
+    def _tool_runner_hooks(self) -> ToolRunnerHooks | None:
+        if isinstance(self, ToolRunnerHookCapable):
+            return self.tool_runner_hooks
+        return None
+
+    def _build_tool_runner_hooks(
+        self, request_params: RequestParams | None
+    ) -> ToolRunnerHooks | None:
+        base_hooks = self._tool_runner_hooks()
+        if (
+            request_params is None
+            or not request_params.emit_loop_progress
+            or not request_params.tool_execution_handler
+        ):
+            return base_hooks
+
+        progress_hooks = self._build_loop_progress_hooks(request_params.tool_execution_handler)
+        return self._merge_tool_runner_hooks(base_hooks, progress_hooks)
+
+    def _build_loop_progress_hooks(self, handler: ToolExecutionHandler) -> ToolRunnerHooks:
+        emitter = ToolLoopProgressEmitter(handler, self.name)
+        error_reasons = (
+            LlmStopReason.ERROR.value,
+            LlmStopReason.CANCELLED.value,
+            LlmStopReason.TIMEOUT.value,
+            LlmStopReason.SAFETY.value,
+        )
+
+        def tool_label(request: PromptMessageExtended) -> str:
+            tool_calls = request.tool_calls or {}
+            names = [call.params.name for call in tool_calls.values()]
+            if len(names) == 1:
+                return f"tool {names[0]}"
+            if len(names) > 1:
+                return f"tools x{len(names)}"
+            return "tool"
+
+        async def before_llm_call(runner, messages):
+            await emitter.step("llm")
+
+        async def before_tool_call(runner, request):
+            await emitter.step(tool_label(request))
+
+        async def after_llm_call(runner, message):
+            if message.stop_reason == LlmStopReason.TOOL_USE:
+                return
+            stop_reason = message.stop_reason
+            if stop_reason in error_reasons:
+                if isinstance(stop_reason, LlmStopReason):
+                    reason_label = stop_reason.value
+                else:
+                    reason_label = str(stop_reason) if stop_reason is not None else "unknown"
+                await emitter.finish(False, error=f"stopped: {reason_label}")
+            else:
+                await emitter.finish(True)
+
+        return ToolRunnerHooks(
+            before_llm_call=before_llm_call,
+            after_llm_call=after_llm_call,
+            before_tool_call=before_tool_call,
+        )
+
+    @staticmethod
+    def _merge_tool_runner_hooks(
+        base: ToolRunnerHooks | None, extra: ToolRunnerHooks | None
+    ) -> ToolRunnerHooks | None:
+        if base is None:
+            return extra
+        if extra is None:
+            return base
+
+        def merge(one, two):
+            if one is None:
+                return two
+            if two is None:
+                return one
+
+            async def merged(runner, payload):
+                await one(runner, payload)
+                await two(runner, payload)
+
+            return merged
+
+        return ToolRunnerHooks(
+            before_llm_call=merge(base.before_llm_call, extra.before_llm_call),
+            after_llm_call=merge(base.after_llm_call, extra.after_llm_call),
+            before_tool_call=merge(base.before_tool_call, extra.before_tool_call),
+            after_tool_call=merge(base.after_tool_call, extra.after_tool_call),
+            after_turn_complete=merge(base.after_turn_complete, extra.after_turn_complete),
+        )
+
+    async def _tool_runner_llm_step(
+        self,
+        messages: list[PromptMessageExtended],
+        request_params: RequestParams | None = None,
+        tools: list[Tool] | None = None,
+    ) -> PromptMessageExtended:
+        return await super().generate_impl(messages, request_params=request_params, tools=tools)
+
+    def should_finalize_deferred_structured_turn(
+        self,
+        messages: list[PromptMessageExtended],
+        request_params: RequestParams | None,
+        tools: list[Tool] | None,
+        assistant_message: PromptMessageExtended,
+    ) -> bool:
+        del assistant_message
+        if self.llm is None:
+            return False
+        final_params = self.llm.get_request_params(request_params)
+        return (
+            final_params.structured_schema is not None
+            and bool(tools)
+            and self.llm.resolve_structured_tool_policy(final_params) == "defer"
+            and not any(message.tool_results for message in messages)
+        )
+
+    def should_suppress_tools_for_structured_turn(
+        self,
+        messages: list[PromptMessageExtended],
+        request_params: RequestParams | None,
+        tools: list[Tool] | None,
+    ) -> bool:
+        del messages
+        if self.llm is None or not tools:
+            return False
+        final_params = self.llm.get_request_params(request_params)
+        return (
+            final_params.structured_schema is not None
+            and self.llm.resolve_structured_tool_policy(final_params) == "no_tools"
+        )
+
+    def _should_display_user_message(self, message: PromptMessageExtended) -> bool:
+        return not message.tool_results
+
+    def _consume_pending_media_attachments(self) -> list[ContentBlock]:
+        """Return pending media blocks to send as the next user input."""
+        return []
+
+    # we take care of tool results, so skip displaying them
+    def show_user_message(self, message: PromptMessageExtended) -> None:
+        if message.tool_results:
+            return
+        super().show_user_message(message)
+
+    @staticmethod
+    def _tool_names(tool_schemas: Sequence[Tool]) -> list[str]:
+        return [tool.name for tool in tool_schemas]
+
+    def _close_streaming_for_parallel_subagents(
+        self,
+        tool_call_items: list[tuple[str, Any]],
+        *,
+        should_parallel: bool,
+    ) -> None:
+        if not should_parallel or not tool_call_items:
+            return
+        subagent_calls = self._count_agent_tool_calls(tool_call_items)
+        if subagent_calls <= 1:
+            return
+
+        did_close = self.close_active_streaming_display(reason="parallel subagent tool calls")
+        if did_close:
+            logger.info(
+                "Closing streaming display due to parallel subagent tool calls",
+                agent_name=self.name,
+                tool_call_count=len(tool_call_items),
+                subagent_call_count=subagent_calls,
+            )
+
+    def _plan_tool_calls(
+        self,
+        tool_call_items: list[tuple[str, Any]],
+        *,
+        known_tool_names: Collection[str],
+        case_insensitive_tool_names: Collection[str],
+        available_tools: Collection[str],
+        should_parallel: bool,
+        tool_results: dict[str, CallToolResult],
+    ) -> list[PlannedToolCall]:
+        plan = plan_tool_calls(
+            tool_call_items,
+            known_tool_names=known_tool_names,
+            case_insensitive_tool_names=case_insensitive_tool_names,
+        )
+        available_tool_list = sorted(available_tools)
+        available_summary = (
+            f" Available tools: {', '.join(available_tool_list)}."
+            if available_tool_list
+            else " No tools are currently available."
+        )
+        for unavailable_call in plan.unavailable_calls:
+            error_message = f"Tool '{unavailable_call.name}' is not available.{available_summary}"
+            logger.warning(error_message)
+            self._record_tool_error_result(
+                correlation_id=unavailable_call.correlation_id,
+                error_message=error_message,
+                tool_results=tool_results,
+                tool_call_id=unavailable_call.correlation_id if should_parallel else None,
+            )
+        return plan.planned_calls
+
+    def _planned_tool_call_display_request(
+        self,
+        planned_call: PlannedToolCall,
+        *,
+        available_tools: list[str],
+        tool_metadata: dict[str, dict[str, Any]],
+    ) -> ToolCallDisplayRequest | None:
+        metadata = self._jsonable_tool_metadata(self._tool_display_metadata(planned_call.name))
+        if metadata:
+            tool_metadata[planned_call.correlation_id] = metadata
+
+        if self._is_builtin_subagent_tool(metadata):
+            self._show_subagent_message(planned_call.arguments)
+            return None
+
+        return ToolCallDisplayRequest(
+            tool_args=planned_call.arguments,
+            bottom_items=available_tools,
+            tool_name=planned_call.name,
+            highlight_indexes=resolve_highlight_indexes(available_tools, planned_call.name),
+            max_item_length=12,
+            name=self.name,
+            metadata=metadata,
+            tool_call_id=planned_call.correlation_id,
+            source_label=self._tool_display_source_label(planned_call.name, metadata),
+            show_hook_indicator=self.has_before_tool_call_hook,
+        )
+
+    def _show_planned_tool_call(
+        self,
+        planned_call: PlannedToolCall,
+        *,
+        available_tools: list[str],
+        tool_metadata: dict[str, dict[str, Any]],
+    ) -> None:
+        request = self._planned_tool_call_display_request(
+            planned_call,
+            available_tools=available_tools,
+            tool_metadata=tool_metadata,
+        )
+        if request is not None:
+            self.display.show_tool_call(
+                request.tool_name,
+                request.tool_args,
+                bottom_items=request.bottom_items,
+                highlight_indexes=request.highlight_indexes,
+                max_item_length=request.max_item_length,
+                name=request.name,
+                metadata=request.metadata,
+                tool_call_id=request.tool_call_id,
+                source_label=request.source_label,
+                show_hook_indicator=request.show_hook_indicator,
+            )
+
+    @staticmethod
+    def _is_builtin_subagent_tool(metadata: Mapping[str, Any] | None) -> bool:
+        if metadata is None:
+            return False
+        builtin = metadata.get("fast_agent")
+        return isinstance(builtin, Mapping) and builtin.get("builtin") == BUILTIN_SUBAGENT_TOOL_NAME
+
+    def _show_subagent_message(self, arguments: Mapping[str, Any]) -> None:
+        """Render a built-in subagent request as an ordinary user message."""
+        message = arguments.get("message")
+        if not isinstance(message, str):
+            return
+        self.display.show_user_message(
+            message,
+            name=f"{self.name} → {requested_subagent_display_label(arguments.get('label'))}",
+        )
+
+    async def _tool_result_display_request(
+        self,
+        planned_call: PlannedToolCall,
+        result: CallToolResult,
+        *,
+        duration_ms: float,
+        tool_call_id: str | None,
+    ) -> ToolResultDisplayRequest | None:
+        metadata = self._tool_display_metadata(planned_call.name)
+        if self._is_builtin_subagent_tool(metadata):
+            await self._show_subagent_result(result)
+            return None
+        return ToolResultDisplayRequest(
+            result=result,
+            name=self.name,
+            tool_name=planned_call.name,
+            timing_ms=duration_ms,
+            tool_call_id=tool_call_id,
+            source_label=self._tool_display_source_label(planned_call.name, metadata),
+            show_hook_indicator=self.has_after_tool_call_hook,
+        )
+
+    async def _show_tool_result(
+        self,
+        planned_call: PlannedToolCall,
+        result: CallToolResult,
+        *,
+        duration_ms: float,
+        tool_call_id: str | None,
+    ) -> None:
+        request = await self._tool_result_display_request(
+            planned_call,
+            result,
+            duration_ms=duration_ms,
+            tool_call_id=tool_call_id,
+        )
+        if request is not None:
+            self.display.show_tool_result(
+                request.result,
+                name=request.name,
+                tool_name=request.tool_name,
+                timing_ms=request.timing_ms,
+                tool_call_id=request.tool_call_id,
+                source_label=request.source_label,
+                show_hook_indicator=request.show_hook_indicator,
+            )
+
+    async def _show_subagent_result(
+        self,
+        result: CallToolResult,
+    ) -> None:
+        presentation = build_subagent_result_presentation(result)
+        await self.display.show_assistant_message(
+            message_text=presentation.message_text,
+            name=presentation.name,
+            model=presentation.model,
+            bottom_items=presentation.bottom_items,
+            highlight_indexes=presentation.highlight_indexes,
+        )
+
+    async def _execute_planned_tool_call(
+        self,
+        planned_call: PlannedToolCall,
+        *,
+        request_params: RequestParams | None,
+    ) -> tuple[CallToolResult, float]:
+        planned_result = await execute_planned_tool_call(
+            planned_call,
+            execute_tool=self._execute_tool_for_plan,
+            request_params=request_params,
+        )
+        return planned_result.result, planned_result.duration_ms
+
+    async def _execute_tool_for_plan(
+        self,
+        planned_call: PlannedToolCall,
+        request_params: RequestParams | None,
+    ) -> CallToolResult:
+        return await self.call_tool(
+            planned_call.name,
+            planned_call.arguments,
+            planned_call.correlation_id,
+            request_params=request_params,
+        )
+
+    async def _run_parallel_tool_calls(
+        self,
+        planned_calls: list[PlannedToolCall],
+        *,
+        request_params: RequestParams | None,
+    ) -> tuple[dict[str, CallToolResult], dict[str, ToolTimingInfo]]:
+        async def run_one(
+            planned_call: PlannedToolCall,
+        ) -> tuple[
+            str,
+            CallToolResult,
+            float,
+            ToolResultDisplayRequest | None,
+            Exception | None,
+        ]:
+            result, duration_ms = await self._execute_planned_tool_call(
+                planned_call,
+                request_params=request_params,
+            )
+            try:
+                display_request = await self._tool_result_display_request(
+                    planned_call,
+                    result,
+                    duration_ms=duration_ms,
+                    tool_call_id=planned_call.correlation_id,
+                )
+            except Exception as exc:
+                return planned_call.correlation_id, result, duration_ms, None, exc
+            return planned_call.correlation_id, result, duration_ms, display_request, None
+
+        results = await gather_with_cancel(run_one(call) for call in planned_calls)
+        tool_results: dict[str, CallToolResult] = {}
+        tool_timings: dict[str, ToolTimingInfo] = {}
+        display_requests: list[ToolResultDisplayRequest] = []
+        presentation_errors: list[Exception] = []
+        for planned_call, item in zip(planned_calls, results, strict=False):
+            if isinstance(item, BaseException):
+                result = CallToolResult(
+                    content=[text_content(f"Error: {item!s}")],
+                    is_error=True,
+                )
+                duration_ms = 0.0
+                display_request = await self._tool_result_display_request(
+                    planned_call,
+                    result,
+                    duration_ms=duration_ms,
+                    tool_call_id=planned_call.correlation_id,
+                )
+            else:
+                _, result, duration_ms, display_request, presentation_error = item
+                if presentation_error is not None:
+                    presentation_errors.append(presentation_error)
+
+            tool_results[planned_call.correlation_id] = result
+            tool_timings[planned_call.correlation_id] = ToolTimingInfo(
+                timing_ms=duration_ms,
+                transport_channel=None,
+            )
+            if display_request is not None:
+                display_requests.append(display_request)
+        if presentation_errors:
+            raise presentation_errors[0]
+        self.display.show_parallel_tool_results(display_requests)
+        return tool_results, tool_timings
+
+    async def _run_sequential_tool_calls(
+        self,
+        planned_calls: list[PlannedToolCall],
+        *,
+        request_params: RequestParams | None,
+    ) -> tuple[dict[str, CallToolResult], dict[str, ToolTimingInfo]]:
+        tool_results: dict[str, CallToolResult] = {}
+        tool_timings: dict[str, ToolTimingInfo] = {}
+        for planned_call in planned_calls:
+            result, duration_ms = await self._execute_planned_tool_call(
+                planned_call,
+                request_params=request_params,
+            )
+            tool_results[planned_call.correlation_id] = result
+            tool_timings[planned_call.correlation_id] = ToolTimingInfo(
+                timing_ms=duration_ms,
+                transport_channel=None,
+            )
+            await self._show_tool_result(
+                planned_call,
+                result,
+                duration_ms=duration_ms,
+                tool_call_id=planned_call.correlation_id,
+            )
+        return tool_results, tool_timings
+
+    async def run_tools(
+        self,
+        request: PromptMessageExtended,
+        request_params: RequestParams | None = None,
+    ) -> PromptMessageExtended:
+        """Runs the tools in the request, and returns a new User message with the results"""
+        if not request.tool_calls:
+            logger.warning("No tool calls found in request", data=request)
+            return PromptMessageExtended(role="user", tool_results={})
+
+        tool_results: dict[str, CallToolResult] = {}
+        tool_timings: dict[str, ToolTimingInfo] = {}
+        tool_metadata: dict[str, dict[str, Any]] = {}
+        tool_schemas = (await self.list_tools()).tools
+        available_tools = self._tool_names(tool_schemas)
+
+        tool_call_items = list(request.tool_calls.items())
+        should_parallel = should_parallelize_tool_calls(len(tool_call_items))
+        self._close_streaming_for_parallel_subagents(
+            tool_call_items,
+            should_parallel=should_parallel,
+        )
+        planned_calls = self._plan_tool_calls(
+            tool_call_items,
+            known_tool_names={*available_tools, *self._execution_tools},
+            case_insensitive_tool_names={*available_tools, *self._execution_tools},
+            available_tools=available_tools,
+            should_parallel=should_parallel,
+            tool_results=tool_results,
+        )
+
+        if should_parallel and planned_calls:
+            display_requests = [
+                display_request
+                for planned_call in planned_calls
+                if (
+                    display_request := self._planned_tool_call_display_request(
+                        planned_call,
+                        available_tools=available_tools,
+                        tool_metadata=tool_metadata,
+                    )
+                )
+                is not None
+            ]
+            self.display.show_parallel_tool_calls(display_requests)
+            executed_results, executed_timings = await self._run_parallel_tool_calls(
+                planned_calls,
+                request_params=request_params,
+            )
+            tool_results.update(executed_results)
+            tool_timings.update(executed_timings)
+
+            return self._finalize_tool_results(
+                tool_results,
+                tool_timings=tool_timings,
+                tool_metadata=tool_metadata,
+            )
+
+        for planned_call in planned_calls:
+            self._show_planned_tool_call(
+                planned_call,
+                available_tools=available_tools,
+                tool_metadata=tool_metadata,
+            )
+        executed_results, executed_timings = await self._run_sequential_tool_calls(
+            planned_calls,
+            request_params=request_params,
+        )
+        tool_results.update(executed_results)
+        tool_timings.update(executed_timings)
+
+        return self._finalize_tool_results(
+            tool_results,
+            tool_timings=tool_timings,
+            tool_metadata=tool_metadata,
+        )
+
+    def _record_tool_error_result(
+        self,
+        *,
+        correlation_id: str,
+        error_message: str,
+        tool_results: dict[str, CallToolResult],
+        tool_call_id: str | None = None,
+    ) -> None:
+        error_result = CallToolResult(
+            content=[text_content(error_message)],
+            is_error=True,
+        )
+        tool_results[correlation_id] = error_result
+        self.display.show_tool_result(
+            name=self.name,
+            result=error_result,
+            tool_call_id=tool_call_id,
+            show_hook_indicator=self.has_after_tool_call_hook,
+        )
+
+    def _finalize_tool_results(
+        self,
+        tool_results: dict[str, CallToolResult],
+        *,
+        tool_timings: dict[str, ToolTimingInfo] | None = None,
+        tool_metadata: dict[str, dict[str, Any]] | None = None,
+        tool_loop_error: str | None = None,
+    ) -> PromptMessageExtended:
+        return build_tool_result_message(
+            tool_results,
+            tool_timings=tool_timings,
+            tool_metadata=tool_metadata,
+            tool_loop_error=tool_loop_error,
+            pending_media=self._consume_pending_media_attachments(),
+        )
+
+    async def list_tools(self) -> ListToolsResult:
+        """Return available tools for this agent. Overridable by subclasses."""
+        return ListToolsResult(tools=list(self._tool_schemas))
+
+    async def call_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any] | None = None,
+        tool_use_id: str | None = None,
+        *,
+        request_params: RequestParams | None = None,
+    ) -> CallToolResult:
+        """Execute a tool by name using local FastMCP tools. Overridable by subclasses."""
+        fast_tool = self._execution_tools.get(name)
+        if not fast_tool:
+            logger.warning(f"Unknown tool: {name}")
+            return CallToolResult(
+                content=[text_content(f"Unknown tool: {name}")],
+                is_error=True,
+            )
+
+        tool_handler = self._get_tool_handler(request_params)
+        tool_call_id = None
+        if tool_handler:
+            try:
+                tool_call_id = await tool_handler.on_tool_start(
+                    name, "local", arguments, tool_use_id
+                )
+            except Exception:
+                tool_call_id = None
+
+        token = None
+        if tool_handler and tool_call_id:
+            token = _tool_progress_context.set((tool_handler, tool_call_id))
+
+        try:
+            with local_tool_invocation_context(
+                tool_name=name,
+                arguments=arguments or {},
+                tool_use_id=tool_use_id,
+            ):
+                native_result = await fast_tool.run(arguments or {})
+            tool_result = self._native_tool_result_to_mcp_result(native_result)
+            if tool_handler and tool_call_id:
+                with suppress(Exception):
+                    content = tool_result.content or None
+                    error = None
+                    if tool_result.is_error:
+                        text_parts = [text for block in content or [] if (text := get_text(block))]
+                        error = "\n".join(text_parts) if text_parts else None
+                        content = None
+                    await tool_handler.on_tool_complete(
+                        tool_call_id,
+                        not tool_result.is_error,
+                        content,
+                        error,
+                    )
+            return tool_result
+        except Exception as e:
+            logger.error(f"Tool {name} failed: {e}")
+            tool_result = CallToolResult(
+                content=[text_content(f"Error: {e!s}")],
+                is_error=True,
+            )
+            payload = url_elicitation_required_payload(e)
+            if payload is not None:
+                with suppress(Exception):
+                    set_url_elicitation_required_payload(tool_result, payload)
+            if tool_handler and tool_call_id:
+                with suppress(Exception):
+                    await tool_handler.on_tool_complete(tool_call_id, False, None, str(e))
+            return tool_result
+        finally:
+            if token is not None:
+                _tool_progress_context.reset(token)
+
+    def _get_tool_handler(
+        self, request_params: RequestParams | None = None
+    ) -> ToolExecutionHandler | None:
+        if request_params and request_params.tool_execution_handler:
+            return request_params.tool_execution_handler
+        context = getattr(self, "_context", None)
+        acp = getattr(context, "acp", None) if context else None
+        if acp is not None:
+            progress_manager = getattr(acp, "progress_manager", None)
+            if progress_manager is not None:
+                return progress_manager
+        return None
+
+    @staticmethod
+    def _native_tool_result_to_mcp_result(result: ToolResult) -> CallToolResult:
+        return CallToolResult(
+            content=result.content,
+            structured_content=result.structured_content,
+            _meta=result.meta,
+            is_error=result.is_error,
+        )

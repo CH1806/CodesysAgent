@@ -1,0 +1,122 @@
+"""
+Events and event filters for the logger module for the MCP Agent
+"""
+
+import logging
+from datetime import datetime
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field
+
+EventType = Literal["debug", "info", "warning", "error", "progress"]
+"""Broad categories for events (severity or role)."""
+
+
+class EventContext(BaseModel):
+    """
+    Stores correlation or cross-cutting data (workflow IDs, user IDs, etc.).
+    Also used for distributed environments or advanced logging.
+    """
+
+    session_id: str | None = None
+    workflow_id: str | None = None
+    # request_id: str | None = None
+    # parent_event_id: str | None = None
+    # correlation_id: str | None = None
+    # user_id: str | None = None
+
+    model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
+
+
+class Event(BaseModel):
+    """
+    Core event structure. Allows both a broad 'type' (EventType)
+    and a more specific 'name' string for domain-specific labeling (e.g. "ORDER_PLACED").
+    """
+
+    type: EventType
+    name: str | None = None
+    namespace: str
+    message: str
+    timestamp: datetime = Field(default_factory=datetime.now)
+    data: dict[str, Any] = Field(default_factory=dict)
+    context: EventContext | None = None
+
+    # For distributed tracing
+    span_id: str | None = None
+    trace_id: str | None = None
+
+    model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
+
+
+class EventFilter(BaseModel):
+    """
+    Filter events by:
+      - allowed EventTypes (types)
+      - allowed event 'names'
+      - allowed namespace prefixes
+      - a minimum severity level (DEBUG < INFO < WARNING < ERROR)
+    """
+
+    types: set[EventType] = Field(default_factory=set)
+    names: set[str] = Field(default_factory=set)
+    namespaces: set[str] = Field(default_factory=set)
+    min_level: EventType | None = "debug"
+
+    def matches(self, event: Event) -> bool:
+        """
+        Check if an event matches this EventFilter criteria.
+        """
+        # 1) Filter by broad event type
+        if self.types and event.type not in self.types:
+            return False
+
+        # 2) Filter by custom event name
+        if self.names and (not event.name or event.name not in self.names):
+            return False
+
+        # 3) Filter by namespace prefix
+        if self.namespaces and not any(event.namespace.startswith(ns) for ns in self.namespaces):
+            return False
+
+        # 4) Minimum severity
+        if self.min_level:
+            level_map: dict[EventType, int] = {
+                "debug": logging.DEBUG,
+                "info": logging.INFO,
+                "warning": logging.WARNING,
+                "error": logging.ERROR,
+            }
+
+            min_val = level_map.get(self.min_level, logging.DEBUG)
+            event_val = level_map.get(event.type, logging.DEBUG)
+            if event_val < min_val:
+                return False
+
+        return True
+
+
+class StreamingExclusionFilter(EventFilter):
+    """
+    Event filter that excludes high-frequency UI progress events from logs.
+
+    These events still reach the unfiltered progress listener, but token and
+    process-output refreshes do not flood configured log transports.
+    """
+
+    def matches(self, event: Event) -> bool:
+        # First check if it passes the base filter
+        if not super().matches(event):
+            return False
+
+        # Exclude event-driven display refreshes by their stable message.
+        if event.message in {"Streaming progress", "Process output progress"}:
+            return False
+
+        # Also check for events with progress_action = STREAMING in data
+        if event.data and isinstance(event.data.get("data"), dict):
+            event_data = event.data["data"]
+            if event_data.get("progress_action") == "Streaming":
+                return False
+
+        return True

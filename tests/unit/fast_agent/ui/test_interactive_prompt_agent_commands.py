@@ -1,0 +1,1321 @@
+from __future__ import annotations
+
+import asyncio
+from typing import TYPE_CHECKING, Any, cast
+
+import pytest
+from mcp import CallToolRequest
+from mcp_types import CallToolRequestParams, CallToolResult, TextContent
+
+from fast_agent.agents.agent_types import AgentType
+from fast_agent.agents.tool_runner import HistoryRollbackState
+from fast_agent.commands.results import CommandMessage, CommandOutcome
+from fast_agent.constants import (
+    ANTHROPIC_ASSISTANT_RAW_CONTENT,
+    ANTHROPIC_CITATIONS_CHANNEL,
+    ANTHROPIC_SERVER_TOOLS_CHANNEL,
+)
+from fast_agent.core.agent_app import AgentCardLoadResult, AgentRefreshResult
+from fast_agent.core.exceptions import PromptExitError
+from fast_agent.mcp.prompt import Prompt
+from fast_agent.mcp.prompt_message_extended import PromptMessageExtended
+from fast_agent.session.session_manager import SessionManager
+from fast_agent.types.llm_stop_reason import LlmStopReason
+from fast_agent.ui import enhanced_prompt, interactive_prompt
+from fast_agent.ui.command_payloads import EOFCommand, InterruptCommand
+from fast_agent.ui.interactive_prompt import (
+    InteractivePrompt,
+    PromptLoopAgents,
+    PromptLoopRuntimeState,
+)
+
+if TYPE_CHECKING:
+    from fast_agent.core.agent_app import AgentApp
+
+
+class _FakeAgent:
+    agent_type = AgentType.BASIC
+
+    def __init__(self) -> None:
+        self.name = "test"
+        self.usage_accumulator = None
+        self._message_history: list[object] = []
+        self._last_turn_cancelled = False
+        self._last_turn_cancel_reason = "cancelled"
+        self._last_turn_history_state = None
+
+    @property
+    def last_turn_cancelled(self) -> bool:
+        return getattr(self, "_last_turn_cancelled", False)
+
+    @property
+    def last_turn_cancel_reason(self) -> str:
+        return getattr(self, "_last_turn_cancel_reason", "cancelled")
+
+    @property
+    def last_turn_history_state(self):
+        return getattr(self, "_last_turn_history_state", None)
+
+    def record_last_turn_cancellation(self, *, reason: str, rollback_state) -> None:
+        self._last_turn_cancelled = True
+        self._last_turn_cancel_reason = reason
+        self._last_turn_history_state = rollback_state
+
+    def clear_last_turn_cancellation(self) -> None:
+        self._last_turn_cancelled = False
+        self._last_turn_history_state = None
+
+    @property
+    def message_history(self):
+        return self._message_history
+
+    def load_message_history(self, history):
+        self._message_history = list(history or [])
+
+    def pop_last_message(self):
+        if not self._message_history:
+            return None
+        return self._message_history.pop()
+
+    def clear(self, *, clear_prompts: bool = False):
+        del clear_prompts
+        self._message_history.clear()
+
+
+class _FakeAgentApp:
+    def __init__(self, agent_names: list[str]) -> None:
+        self._agents = {name: _FakeAgent() for name in agent_names}
+        self.attached: list[str] = []
+        self.detached: list[str] = []
+        self.loaded: list[str] = []
+        self.no_home_mode = False
+        self.missing_shell_cwd_policy_override: str | None = None
+
+    async def refresh_if_needed(self) -> bool:
+        return False
+
+    def latest_refresh_result(self) -> AgentRefreshResult:
+        return AgentRefreshResult(changed=False)
+
+    def visible_agent_names(self, *, force_include: str | None = None) -> list[str]:
+        del force_include
+        return list(self._agents.keys())
+
+    def visible_agent_types(self, *, force_include: str | None = None) -> dict[str, AgentType]:
+        del force_include
+        return {name: agent.agent_type for name, agent in self._agents.items()}
+
+    def registered_agent_names(self) -> list[str]:
+        return list(self._agents.keys())
+
+    def registered_agents(self) -> dict[str, _FakeAgent]:
+        return self._agents
+
+    def resolve_target_agent_name(self, agent_name: str | None = None) -> str | None:
+        return agent_name if agent_name is not None else next(iter(self._agents), None)
+
+    def can_attach_agent_tools(self) -> bool:
+        return True
+
+    async def attach_agent_tools(self, _parent: str, child_names: list[str]) -> list[str]:
+        self.attached.extend(child_names)
+        return child_names
+
+    def can_detach_agent_tools(self) -> bool:
+        return True
+
+    async def detach_agent_tools(self, _parent: str, child_names: list[str]) -> list[str]:
+        self.detached.extend(child_names)
+        return child_names
+
+    def can_dump_agent_cards(self) -> bool:
+        return True
+
+    async def dump_agent_card(self, name: str) -> str:
+        return f"card:{name}"
+
+    def can_load_agent_cards(self) -> bool:
+        return True
+
+    async def load_agent_card(
+        self, filename: str, _parent: str | None = None
+    ) -> AgentCardLoadResult:
+        self.loaded.append(filename)
+        loaded = ["sizer"]
+        attached = ["sizer"] if _parent else []
+        return AgentCardLoadResult(loaded_names=loaded, attached_names=attached)
+
+    def can_reload_agents(self) -> bool:
+        return False
+
+    async def attach_mcp_server(
+        self,
+        _agent_name: str,
+        server_name: str,
+        server_config: object | None = None,
+        options: object | None = None,
+    ) -> object:
+        del server_config, options
+        self.attached.append(server_name)
+        return object()
+
+    async def detach_mcp_server(self, _agent_name: str, server_name: str) -> object:
+        self.detached.append(server_name)
+        return object()
+
+    async def list_attached_mcp_servers(self, _agent_name: str) -> list[str]:
+        return []
+
+    async def list_configured_detached_mcp_servers(self, _agent_name: str) -> list[str]:
+        return []
+
+
+class _ReloadAgentApp(_FakeAgentApp):
+    def __init__(
+        self,
+        agent_names: list[str],
+        changed: bool,
+        *,
+        active_agent: str | None = None,
+    ) -> None:
+        super().__init__(agent_names)
+        self._changed = changed
+        self._latest_refresh_result = AgentRefreshResult(
+            changed=changed,
+            active_agent=active_agent,
+        )
+
+    def can_reload_agents(self) -> bool:
+        return True
+
+    async def reload_agents(self) -> bool:
+        return self._changed
+
+    def latest_refresh_result(self) -> AgentRefreshResult:
+        return self._latest_refresh_result
+
+
+class _DetachCancelledAgentApp(_FakeAgentApp):
+    async def detach_mcp_server(self, _agent_name: str, server_name: str) -> object:
+        self.detached.append(server_name)
+        raise asyncio.CancelledError()
+
+
+class _PreAttachedMcpAgentApp(_FakeAgentApp):
+    async def list_attached_mcp_servers(self, _agent_name: str) -> list[str]:
+        return ["demo"]
+
+
+@pytest.mark.asyncio
+async def test_clear_current_task_cancellation_requests_resets_task_state() -> None:
+    task = asyncio.current_task()
+    assert task is not None
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.sleep(0)
+
+    assert task.cancelling() == 1
+    assert interactive_prompt._clear_current_task_cancellation_requests() == 1
+    assert task.cancelling() == 0
+
+
+def _patch_input(monkeypatch, inputs: list[str]) -> None:
+    iterator = iter(inputs)
+
+    async def fake_get_enhanced_input(*_args: Any, **kwargs: Any) -> str:
+        available_agent_names = kwargs.get("available_agent_names")
+        if available_agent_names is not None:
+            enhanced_prompt.available_agents = set(available_agent_names)
+        return next(iterator)
+
+    monkeypatch.setattr(interactive_prompt, "get_enhanced_input", fake_get_enhanced_input)
+
+
+@pytest.mark.asyncio
+async def test_prompt_loop_skips_shell_cwd_startup_prompt_when_policy_not_ask(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_input(monkeypatch, ["STOP"])
+
+    def _unexpected_collect(*_args: Any, **_kwargs: Any) -> list[Any]:
+        raise AssertionError("Shell cwd startup collection should not run outside ask policy.")
+
+    async def _unexpected_selection(*_args: Any, **_kwargs: Any) -> str:
+        raise AssertionError("Shell cwd startup prompt should not run outside ask policy.")
+
+    monkeypatch.setattr(
+        interactive_prompt,
+        "collect_shell_cwd_issues_from_runtime_agents",
+        _unexpected_collect,
+    )
+    monkeypatch.setattr(interactive_prompt, "get_selection_input", _unexpected_selection)
+
+    async def fake_send(*_args: Any, **_kwargs: Any) -> str:
+        return ""
+
+    prompt_ui = InteractivePrompt()
+    agent_app = _FakeAgentApp(["vertex-rag"])
+    agent_app.missing_shell_cwd_policy_override = "warn"
+
+    await prompt_ui.prompt_loop(
+        send_func=fake_send,
+        default_agent="vertex-rag",
+        available_agents=["vertex-rag"],
+        prompt_provider=cast("AgentApp", agent_app),
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_command_missing_agent(monkeypatch, capsys: Any) -> None:
+    _patch_input(monkeypatch, ["/agent tool add sizer", "STOP"])
+
+    async def fake_send(*_args: Any, **_kwargs: Any) -> str:
+        return ""
+
+    prompt_ui = InteractivePrompt()
+    agent_app = _FakeAgentApp(["vertex-rag"])
+
+    await prompt_ui.prompt_loop(
+        send_func=fake_send,
+        default_agent="vertex-rag",
+        available_agents=["vertex-rag"],
+        prompt_provider=cast("AgentApp", agent_app),
+    )
+
+    output = capsys.readouterr().out
+    assert "Agent 'sizer' not found" in output
+
+
+@pytest.mark.asyncio
+async def test_agent_command_attach_and_detach(monkeypatch, capsys: Any) -> None:
+    _patch_input(monkeypatch, ["/agent tool add sizer", "/agent tool remove sizer", "STOP"])
+
+    async def fake_send(*_args: Any, **_kwargs: Any) -> str:
+        return ""
+
+    prompt_ui = InteractivePrompt()
+    agent_app = _FakeAgentApp(["vertex-rag", "sizer"])
+
+    await prompt_ui.prompt_loop(
+        send_func=fake_send,
+        default_agent="vertex-rag",
+        available_agents=["vertex-rag", "sizer"],
+        prompt_provider=cast("AgentApp", agent_app),
+    )
+
+    output = capsys.readouterr().out
+    assert "Attached agent tool: sizer" in output
+    assert "Detached agent tool: sizer" in output
+
+
+@pytest.mark.asyncio
+async def test_card_command_show(monkeypatch, capsys: Any) -> None:
+    _patch_input(monkeypatch, ["/card show sizer", "STOP"])
+
+    async def fake_send(*_args: Any, **_kwargs: Any) -> str:
+        return ""
+
+    prompt_ui = InteractivePrompt()
+    agent_app = _FakeAgentApp(["vertex-rag", "sizer"])
+
+    await prompt_ui.prompt_loop(
+        send_func=fake_send,
+        default_agent="vertex-rag",
+        available_agents=["vertex-rag", "sizer"],
+        prompt_provider=cast("AgentApp", agent_app),
+    )
+
+    output = capsys.readouterr().out
+    assert "card:sizer" in output
+
+
+@pytest.mark.asyncio
+async def test_card_command_attach(monkeypatch, capsys: Any) -> None:
+    _patch_input(monkeypatch, ["/card load sizer.md --as-tool", "STOP"])
+
+    async def fake_send(*_args: Any, **_kwargs: Any) -> str:
+        return ""
+
+    prompt_ui = InteractivePrompt()
+    agent_app = _FakeAgentApp(["vertex-rag"])
+
+    await prompt_ui.prompt_loop(
+        send_func=fake_send,
+        default_agent="vertex-rag",
+        available_agents=["vertex-rag"],
+        prompt_provider=cast("AgentApp", agent_app),
+    )
+
+    output = capsys.readouterr().out
+    assert "Loaded AgentCard: sizer" in output
+    assert "Attached agent tool: sizer" in output
+
+
+@pytest.mark.asyncio
+async def test_history_fix_trims_pending_tool_call(monkeypatch, capsys: Any) -> None:
+    _patch_input(monkeypatch, ["/history fix", "STOP"])
+
+    class _HistoryAgent(_FakeAgent):
+        def __init__(self) -> None:
+            pending_tool_call = CallToolRequest(
+                params=CallToolRequestParams(name="fake_tool", arguments={})
+            )
+            self._message_history = [
+                Prompt.assistant(
+                    "pending",
+                    stop_reason=LlmStopReason.TOOL_USE,
+                    tool_calls={"call-1": pending_tool_call},
+                )
+            ]
+
+        @property
+        def message_history(self):
+            return self._message_history
+
+        def load_message_history(self, history):
+            self._message_history = list(history)
+
+    class _HistoryAgentApp(_FakeAgentApp):
+        def __init__(self):
+            super().__init__(["test"])
+            self._agents["test"] = _HistoryAgent()
+
+        def _agent(self, agent_name: str | None):
+            if agent_name is None:
+                return self._agents["test"]
+            return self._agents[agent_name]
+
+    async def fake_send(*_args: Any, **_kwargs: Any) -> str:
+        return ""
+
+    prompt_ui = InteractivePrompt()
+    agent_app = _HistoryAgentApp()
+
+    await prompt_ui.prompt_loop(
+        send_func=fake_send,
+        default_agent="test",
+        available_agents=["test"],
+        prompt_provider=cast("AgentApp", agent_app),
+    )
+
+    output = capsys.readouterr().out
+    assert "Removed pending tool call" in output
+    assert agent_app._agent("test").message_history == []
+
+
+def test_cancelled_history_description_uses_singular_removed_message_label() -> None:
+    prompt_ui = InteractivePrompt()
+    history_state = HistoryRollbackState(
+        status=cast("Any", "removed_pending_tool_call"),
+        history_before=1,
+        history_after=0,
+        removed_messages=1,
+    )
+
+    assert (
+        prompt_ui._describe_cancelled_history_state(history_state)
+        == "History reconciliation completed (removed 1 message)."
+    )
+
+
+def test_cancelled_history_description_uses_plural_removed_message_label() -> None:
+    prompt_ui = InteractivePrompt()
+    history_state = HistoryRollbackState(
+        status=cast("Any", "removed_pending_tool_call"),
+        history_before=3,
+        history_after=1,
+        removed_messages=2,
+    )
+
+    assert (
+        prompt_ui._describe_cancelled_history_state(history_state)
+        == "History reconciliation completed (removed 2 messages)."
+    )
+
+
+@pytest.mark.asyncio
+async def test_history_fix_notice_on_cancelled_turn(monkeypatch, capsys: Any) -> None:
+    _patch_input(monkeypatch, ["STOP"])
+
+    class _CancelledAgent(_FakeAgent):
+        def __init__(self) -> None:
+            self._last_turn_cancelled = True
+            self._last_turn_cancel_reason = "cancelled"
+
+    class _CancelledAgentApp(_FakeAgentApp):
+        def __init__(self):
+            super().__init__(["test"])
+            self._agents["test"] = _CancelledAgent()
+
+        def _agent(self, agent_name: str | None):
+            if agent_name is None:
+                return self._agents["test"]
+            return self._agents[agent_name]
+
+    async def fake_send(*_args: Any, **_kwargs: Any) -> str:
+        return ""
+
+    prompt_ui = InteractivePrompt()
+    agent_app = _CancelledAgentApp()
+
+    await prompt_ui.prompt_loop(
+        send_func=fake_send,
+        default_agent="test",
+        available_agents=["test"],
+        prompt_provider=cast("AgentApp", agent_app),
+    )
+
+    output = capsys.readouterr().out
+    assert "Previous turn was cancelled" in output
+
+
+@pytest.mark.asyncio
+async def test_prepare_prompt_turn_reports_cancelled_agent_before_refresh_switch(
+    capsys: Any,
+) -> None:
+    class _CancelledAgent(_FakeAgent):
+        def __init__(self) -> None:
+            self._last_turn_cancelled = True
+            self._last_turn_cancel_reason = "cancelled"
+
+    cancelled_agent = _CancelledAgent()
+
+    class _RefreshSwitchAgentApp(_FakeAgentApp):
+        def __init__(self) -> None:
+            super().__init__(["old", "new"])
+            self._agents = {
+                "old": cancelled_agent,
+                "new": _FakeAgent(),
+            }
+            self._refreshed = False
+
+        async def refresh_if_needed(self) -> bool:
+            if self._refreshed:
+                return False
+            self._agents.pop("old", None)
+            self._refreshed = True
+            return True
+
+        def _agent(self, agent_name: str | None):
+            if agent_name is None:
+                return self._agents["new"]
+            return self._agents[agent_name]
+
+    prompt_ui = InteractivePrompt()
+    agent_app = _RefreshSwitchAgentApp()
+
+    turn_preparation = await prompt_ui._prepare_prompt_turn(
+        prompt_provider=cast("AgentApp", agent_app),
+        agent_state=PromptLoopAgents(
+            current_agent="old",
+            available_agents=["old", "new"],
+            available_agents_set={"old", "new"},
+        ),
+        pinned_agent=None,
+        runtime_state=PromptLoopRuntimeState(),
+        ctrl_c_exit_window_seconds=2.0,
+        shell_cwd_policy="warn",
+    )
+
+    assert turn_preparation.agent_state is not None
+    assert turn_preparation.agent_state.current_agent == "new"
+    assert cancelled_agent._last_turn_cancelled is False
+    output = capsys.readouterr().out
+    assert "Previous turn was cancelled" in output
+    assert "Use /history" in output
+
+
+@pytest.mark.asyncio
+async def test_prompt_loop_switch_agent_command_updates_active_agent_for_next_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_input(monkeypatch, ["@new", "hello", "STOP"])
+
+    sent_messages: list[tuple[str, str]] = []
+
+    async def fake_send(message: object, agent_name: str) -> str:
+        sent_messages.append((agent_name, str(message)))
+        return ""
+
+    prompt_ui = InteractivePrompt()
+    agent_app = _FakeAgentApp(["old", "new"])
+
+    await prompt_ui.prompt_loop(
+        send_func=fake_send,
+        default_agent="old",
+        available_agents=["old", "new"],
+        prompt_provider=cast("AgentApp", agent_app),
+    )
+
+    assert sent_messages == [("new", "hello")]
+
+
+@pytest.mark.asyncio
+async def test_history_webclear_removes_web_channels(monkeypatch, capsys: Any) -> None:
+    _patch_input(monkeypatch, ["/history webclear", "STOP"])
+
+    class _HistoryAgent(_FakeAgent):
+        def __init__(self) -> None:
+            class _LlmStub:
+                web_tools_enabled = (True, False)
+
+            self.llm = _LlmStub()
+            self._message_history = [
+                PromptMessageExtended(
+                    role="assistant",
+                    content=[TextContent(type="text", text="done")],
+                    channels={
+                        ANTHROPIC_SERVER_TOOLS_CHANNEL: [
+                            TextContent(type="text", text='{"type":"server_tool_use"}')
+                        ],
+                        ANTHROPIC_ASSISTANT_RAW_CONTENT: [
+                            TextContent(
+                                type="text",
+                                text='{"type":"server_tool_use","name":"web_search","id":"srv_1"}',
+                            )
+                        ],
+                        ANTHROPIC_CITATIONS_CHANNEL: [
+                            TextContent(
+                                type="text",
+                                text='{"type":"web_search_result_location","url":"https://example.com"}',
+                            )
+                        ],
+                    },
+                )
+            ]
+
+        @property
+        def message_history(self):
+            return self._message_history
+
+        def load_message_history(self, history):
+            self._message_history = list(history)
+
+    class _HistoryAgentApp(_FakeAgentApp):
+        def __init__(self):
+            super().__init__(["test"])
+            self._agents["test"] = _HistoryAgent()
+
+        def _agent(self, agent_name: str | None):
+            if agent_name is None:
+                return self._agents["test"]
+            return self._agents[agent_name]
+
+    async def fake_send(*_args: Any, **_kwargs: Any) -> str:
+        return ""
+
+    prompt_ui = InteractivePrompt()
+    agent_app = _HistoryAgentApp()
+
+    await prompt_ui.prompt_loop(
+        send_func=fake_send,
+        default_agent="test",
+        available_agents=["test"],
+        prompt_provider=cast("AgentApp", agent_app),
+    )
+
+    output = capsys.readouterr().out
+    assert "Removed 3 web metadata blocks" in output
+    channels = agent_app._agent("test").message_history[0].channels
+    assert channels is None
+
+
+@pytest.mark.asyncio
+async def test_cancelled_turn_reports_interrupted_tool_marker(monkeypatch, capsys: Any) -> None:
+    _patch_input(monkeypatch, ["STOP"])
+
+    class _CancelledHistoryAgent(_FakeAgent):
+        def __init__(self) -> None:
+            class _State:
+                status = "appended_interrupted_tool_result"
+                removed_messages = 0
+
+            pending_tool_call = CallToolRequest(
+                params=CallToolRequestParams(name="fake_tool", arguments={})
+            )
+            self._last_turn_cancelled = True
+            self._last_turn_cancel_reason = "interrupted"
+            self._last_turn_history_state = _State()
+            self._message_history = [
+                Prompt.user("hello"),
+                Prompt.assistant(
+                    "pending",
+                    stop_reason=LlmStopReason.TOOL_USE,
+                    tool_calls={"call-1": pending_tool_call},
+                ),
+                PromptMessageExtended(
+                    role="user",
+                    content=[
+                        TextContent(type="text", text="**The user interrupted this tool call**")
+                    ],
+                    tool_results={
+                        "call-1": CallToolResult(
+                            content=[
+                                TextContent(
+                                    type="text",
+                                    text="**The user interrupted this tool call**",
+                                )
+                            ],
+                            is_error=True,
+                        )
+                    },
+                ),
+            ]
+
+        @property
+        def message_history(self):
+            return self._message_history
+
+        def load_message_history(self, history):
+            self._message_history = list(history)
+
+    class _CancelledHistoryAgentApp(_FakeAgentApp):
+        def __init__(self):
+            super().__init__(["test"])
+            self._agents["test"] = _CancelledHistoryAgent()
+
+        def _agent(self, agent_name: str | None):
+            if agent_name is None:
+                return self._agents["test"]
+            return self._agents[agent_name]
+
+    async def fake_send(*_args: Any, **_kwargs: Any) -> str:
+        return ""
+
+    prompt_ui = InteractivePrompt()
+    agent_app = _CancelledHistoryAgentApp()
+
+    await prompt_ui.prompt_loop(
+        send_func=fake_send,
+        default_agent="test",
+        available_agents=["test"],
+        prompt_provider=cast("AgentApp", agent_app),
+    )
+
+    output = capsys.readouterr().out
+    assert "Added an interrupted tool-result marker" in output
+    history = agent_app._agent("test").message_history
+    assert len(history) == 3
+    assert history[0].role == "user"
+    assert history[1].role == "assistant"
+    assert history[2].role == "user"
+    assert history[2].tool_results is not None
+    assert "call-1" in history[2].tool_results
+
+
+@pytest.mark.asyncio
+async def test_reload_agents_no_changes(monkeypatch, capsys: Any) -> None:
+    _patch_input(monkeypatch, ["/reload", "STOP"])
+
+    async def fake_send(*_args: Any, **_kwargs: Any) -> str:
+        return ""
+
+    prompt_ui = InteractivePrompt()
+    agent_app = _ReloadAgentApp(["vertex-rag"], changed=False)
+
+    await prompt_ui.prompt_loop(
+        send_func=fake_send,
+        default_agent="vertex-rag",
+        available_agents=["vertex-rag"],
+        prompt_provider=cast("AgentApp", agent_app),
+    )
+
+    output = capsys.readouterr().out
+    assert "No AgentCard changes detected" in output
+
+
+@pytest.mark.asyncio
+async def test_reload_agents_with_changes(monkeypatch, capsys: Any) -> None:
+    _patch_input(monkeypatch, ["/reload", "STOP"])
+
+    async def fake_send(*_args: Any, **_kwargs: Any) -> str:
+        return ""
+
+    prompt_ui = InteractivePrompt()
+    agent_app = _ReloadAgentApp(["vertex-rag"], changed=True)
+
+    await prompt_ui.prompt_loop(
+        send_func=fake_send,
+        default_agent="vertex-rag",
+        available_agents=["vertex-rag"],
+        prompt_provider=cast("AgentApp", agent_app),
+    )
+
+    output = capsys.readouterr().out
+    assert "AgentCards reloaded" in output
+
+
+@pytest.mark.asyncio
+async def test_reload_agents_switches_to_hydrated_active_agent(monkeypatch) -> None:
+    seen_agents: list[str] = []
+    inputs = iter(["/reload", "STOP"])
+
+    async def fake_get_enhanced_input(*_args: Any, **kwargs: Any) -> str:
+        agent_name = kwargs.get("agent_name")
+        if isinstance(agent_name, str):
+            seen_agents.append(agent_name)
+        return next(inputs)
+
+    monkeypatch.setattr(interactive_prompt, "get_enhanced_input", fake_get_enhanced_input)
+
+    async def fake_send(*_args: Any, **_kwargs: Any) -> str:
+        return ""
+
+    prompt_ui = InteractivePrompt()
+    agent_app = _ReloadAgentApp(["old", "new"], changed=True, active_agent="new")
+
+    await prompt_ui.prompt_loop(
+        send_func=fake_send,
+        default_agent="old",
+        available_agents=["old", "new"],
+        prompt_provider=cast("AgentApp", agent_app),
+    )
+
+    assert seen_agents[:2] == ["old", "new"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_connect_ctrl_c_cancels_and_returns_to_prompt(monkeypatch, capsys: Any) -> None:
+    _patch_input(monkeypatch, ["/mcp connect --name demo npx demo-server", "STOP"])
+
+    async def fake_send(*_args: Any, **_kwargs: Any) -> str:
+        return ""
+
+    async def fake_handle_mcp_connect(*_args: Any, **_kwargs: Any):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(
+        interactive_prompt.mcp_runtime_handlers,
+        "handle_mcp_connect",
+        fake_handle_mcp_connect,
+    )
+
+    prompt_ui = InteractivePrompt()
+    agent_app = _FakeAgentApp(["vertex-rag"])
+
+    await prompt_ui.prompt_loop(
+        send_func=fake_send,
+        default_agent="vertex-rag",
+        available_agents=["vertex-rag"],
+        prompt_provider=cast("AgentApp", agent_app),
+    )
+
+    output = capsys.readouterr().out
+    assert "MCP connect cancelled; returned to prompt" in output
+    assert "demo" in agent_app.detached
+
+
+@pytest.mark.asyncio
+async def test_mcp_connect_cancel_survives_detach_cancelled_error(monkeypatch, capsys: Any) -> None:
+    _patch_input(monkeypatch, ["/mcp connect --name demo npx demo-server", "STOP"])
+
+    async def fake_send(*_args: Any, **_kwargs: Any) -> str:
+        return ""
+
+    async def fake_handle_mcp_connect(*_args: Any, **_kwargs: Any):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(
+        interactive_prompt.mcp_runtime_handlers,
+        "handle_mcp_connect",
+        fake_handle_mcp_connect,
+    )
+
+    prompt_ui = InteractivePrompt()
+    agent_app = _DetachCancelledAgentApp(["vertex-rag"])
+
+    await prompt_ui.prompt_loop(
+        send_func=fake_send,
+        default_agent="vertex-rag",
+        available_agents=["vertex-rag"],
+        prompt_provider=cast("AgentApp", agent_app),
+    )
+
+    output = capsys.readouterr().out
+    assert "MCP connect cancelled; returned to prompt" in output
+    assert "demo" in agent_app.detached
+
+
+@pytest.mark.asyncio
+async def test_mcp_connect_cancel_does_not_detach_previously_attached_server(
+    monkeypatch, capsys: Any
+) -> None:
+    _patch_input(monkeypatch, ["/mcp connect --name demo --reconnect npx demo-server", "STOP"])
+
+    async def fake_send(*_args: Any, **_kwargs: Any) -> str:
+        return ""
+
+    async def fake_handle_mcp_connect(*_args: Any, **_kwargs: Any):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(
+        interactive_prompt.mcp_runtime_handlers,
+        "handle_mcp_connect",
+        fake_handle_mcp_connect,
+    )
+
+    prompt_ui = InteractivePrompt()
+    agent_app = _PreAttachedMcpAgentApp(["vertex-rag"])
+
+    await prompt_ui.prompt_loop(
+        send_func=fake_send,
+        default_agent="vertex-rag",
+        available_agents=["vertex-rag"],
+        prompt_provider=cast("AgentApp", agent_app),
+    )
+
+    output = capsys.readouterr().out
+    assert "MCP connect cancelled; returned to prompt" in output
+    assert "demo" not in agent_app.detached
+
+
+@pytest.mark.asyncio
+async def test_mcp_connect_cancel_allows_stop_immediately(monkeypatch, capsys: Any) -> None:
+    inputs = iter(
+        [
+            "/mcp connect --name demo npx demo-server",
+            "STOP",
+        ]
+    )
+    input_calls = {"count": 0}
+
+    async def fake_get_enhanced_input(*_args: Any, **kwargs: Any) -> str:
+        available_agent_names = kwargs.get("available_agent_names")
+        if available_agent_names is not None:
+            enhanced_prompt.available_agents = set(available_agent_names)
+        input_calls["count"] += 1
+        return next(inputs)
+
+    async def fake_send(*_args: Any, **_kwargs: Any) -> str:
+        return ""
+
+    async def fake_handle_mcp_connect(*_args: Any, **_kwargs: Any):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(interactive_prompt, "get_enhanced_input", fake_get_enhanced_input)
+    monkeypatch.setattr(
+        interactive_prompt.mcp_runtime_handlers,
+        "handle_mcp_connect",
+        fake_handle_mcp_connect,
+    )
+
+    prompt_ui = InteractivePrompt()
+    agent_app = _FakeAgentApp(["vertex-rag"])
+
+    await prompt_ui.prompt_loop(
+        send_func=fake_send,
+        default_agent="vertex-rag",
+        available_agents=["vertex-rag"],
+        prompt_provider=cast("AgentApp", agent_app),
+    )
+
+    output = capsys.readouterr().out
+    assert "MCP connect cancelled; returned to prompt" in output
+    # STOP immediately exits after cancellation.
+    assert input_calls["count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_mcp_connect_oauth_link_is_not_repeated_in_final_outcome(
+    monkeypatch,
+    capsys: Any,
+) -> None:
+    _patch_input(monkeypatch, ["/connect https://example.com/api", "STOP"])
+
+    async def fake_send(*_args: Any, **_kwargs: Any) -> str:
+        return ""
+
+    auth_url = "https://auth.example.com/authorize?state=abc"
+
+    async def fake_handle_mcp_connect(*_args: Any, **kwargs: Any):
+        progress_cb = kwargs.get("on_progress")
+        if progress_cb is not None:
+            await progress_cb(f"Open this link to authorize: {auth_url}")
+
+        return CommandOutcome(
+            messages=[
+                CommandMessage("Connected MCP server 'example-com' (url)."),
+                CommandMessage(f"OAuth authorization link: {auth_url}", channel="info"),
+            ]
+        )
+
+    monkeypatch.setattr(
+        interactive_prompt.mcp_runtime_handlers,
+        "handle_mcp_connect",
+        fake_handle_mcp_connect,
+    )
+
+    prompt_ui = InteractivePrompt()
+    agent_app = _FakeAgentApp(["vertex-rag"])
+
+    await prompt_ui.prompt_loop(
+        send_func=fake_send,
+        default_agent="vertex-rag",
+        available_agents=["vertex-rag"],
+        prompt_provider=cast("AgentApp", agent_app),
+    )
+
+    output = capsys.readouterr().out
+    assert output.count(auth_url) == 1
+    assert "OAuth authorization link:" not in output
+
+
+@pytest.mark.asyncio
+async def test_prompt_loop_recovers_from_keyboard_interrupt_in_input(
+    monkeypatch, capsys: Any
+) -> None:
+    inputs = iter(["STOP"])
+    input_calls = {"count": 0}
+
+    async def fake_get_enhanced_input(*_args: Any, **kwargs: Any) -> str:
+        available_agent_names = kwargs.get("available_agent_names")
+        if available_agent_names is not None:
+            enhanced_prompt.available_agents = set(available_agent_names)
+        input_calls["count"] += 1
+        if input_calls["count"] == 1:
+            raise KeyboardInterrupt()
+        return next(inputs)
+
+    async def fake_send(*_args: Any, **_kwargs: Any) -> str:
+        return ""
+
+    monkeypatch.setattr(interactive_prompt, "get_enhanced_input", fake_get_enhanced_input)
+
+    prompt_ui = InteractivePrompt()
+    agent_app = _FakeAgentApp(["vertex-rag"])
+
+    await prompt_ui.prompt_loop(
+        send_func=fake_send,
+        default_agent="vertex-rag",
+        available_agents=["vertex-rag"],
+        prompt_provider=cast("AgentApp", agent_app),
+    )
+
+    output = capsys.readouterr().out
+    assert "Press Ctrl+C again within 2 seconds" in output
+    # KeyboardInterrupt + STOP(exit)
+    assert input_calls["count"] == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_session", [False, True])
+async def test_prompt_loop_second_keyboard_interrupt_reports_session(
+    monkeypatch,
+    capsys: Any,
+    tmp_path,
+    *,
+    with_session: bool,
+) -> None:
+    async def fake_get_enhanced_input(*_args: Any, **_kwargs: Any) -> str:
+        raise KeyboardInterrupt()
+
+    async def fake_send(*_args: Any, **_kwargs: Any) -> str:
+        return ""
+
+    monkeypatch.setattr(interactive_prompt, "get_enhanced_input", fake_get_enhanced_input)
+
+    session_manager = None
+    if with_session:
+        session_manager = SessionManager(
+            cwd=tmp_path,
+            home_override=tmp_path / ".fast-agent",
+            respect_env_override=False,
+        )
+        session_manager.create_session_with_id("session-123")
+
+    with pytest.raises(PromptExitError):
+        await InteractivePrompt().prompt_loop(
+            send_func=fake_send,
+            default_agent="vertex-rag",
+            available_agents=["vertex-rag"],
+            prompt_provider=cast("AgentApp", _FakeAgentApp(["vertex-rag"])),
+            session_manager=session_manager,
+        )
+
+    output = capsys.readouterr().out
+    if with_session:
+        assert "Second Ctrl+C received; exiting fast-agent session." in output
+        assert "Resume with: fast-agent --resume session-123" in output
+    else:
+        assert "Second Ctrl+C received; exiting fast-agent session." in output
+        assert "Resume with:" not in output
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_session", [False, True])
+async def test_prompt_loop_ctrl_d_reports_session(
+    monkeypatch,
+    capsys: Any,
+    tmp_path,
+    *,
+    with_session: bool,
+) -> None:
+    async def fake_get_enhanced_input(*_args: Any, **_kwargs: Any) -> EOFCommand:
+        return EOFCommand()
+
+    async def fake_send(*_args: Any, **_kwargs: Any) -> str:
+        return ""
+
+    monkeypatch.setattr(interactive_prompt, "get_enhanced_input", fake_get_enhanced_input)
+
+    session_manager = None
+    if with_session:
+        session_manager = SessionManager(
+            cwd=tmp_path,
+            home_override=tmp_path / ".fast-agent",
+            respect_env_override=False,
+        )
+        session_manager.create_session_with_id("session-123")
+
+    await InteractivePrompt().prompt_loop(
+        send_func=fake_send,
+        default_agent="vertex-rag",
+        available_agents=["vertex-rag"],
+        prompt_provider=cast("AgentApp", _FakeAgentApp(["vertex-rag"])),
+        session_manager=session_manager,
+    )
+
+    output = capsys.readouterr().out
+    if with_session:
+        assert "Ctrl+D received; exiting fast-agent session." in output
+        assert "Resume with: fast-agent --resume session-123" in output
+    else:
+        assert "Ctrl+D received; exiting fast-agent session." in output
+        assert "Resume with:" not in output
+
+
+@pytest.mark.asyncio
+async def test_prompt_loop_recovers_from_keyboard_interrupt_during_send(
+    monkeypatch,
+    capsys: Any,
+) -> None:
+    inputs = iter(["hello", "STOP"])
+    input_calls = {"count": 0}
+    send_calls = {"count": 0}
+
+    async def fake_get_enhanced_input(*_args: Any, **kwargs: Any) -> str:
+        available_agent_names = kwargs.get("available_agent_names")
+        if available_agent_names is not None:
+            enhanced_prompt.available_agents = set(available_agent_names)
+        input_calls["count"] += 1
+        return next(inputs)
+
+    async def fake_send(*_args: Any, **_kwargs: Any) -> str:
+        send_calls["count"] += 1
+        if send_calls["count"] == 1:
+            raise KeyboardInterrupt()
+        return ""
+
+    monkeypatch.setattr(interactive_prompt, "get_enhanced_input", fake_get_enhanced_input)
+
+    prompt_ui = InteractivePrompt()
+    agent_app = _FakeAgentApp(["vertex-rag"])
+
+    await prompt_ui.prompt_loop(
+        send_func=fake_send,
+        default_agent="vertex-rag",
+        available_agents=["vertex-rag"],
+        prompt_provider=cast("AgentApp", agent_app),
+    )
+
+    output = capsys.readouterr().out
+    assert "Generation cancelled by user." in output
+    assert input_calls["count"] == 2
+    assert send_calls["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_prompt_loop_recovers_from_cancelled_error_during_send(
+    monkeypatch,
+    capsys: Any,
+) -> None:
+    inputs = iter(["hello", "STOP"])
+
+    async def fake_get_enhanced_input(*_args: Any, **kwargs: Any) -> str:
+        available_agent_names = kwargs.get("available_agent_names")
+        if available_agent_names is not None:
+            enhanced_prompt.available_agents = set(available_agent_names)
+        return next(inputs)
+
+    async def fake_send(*_args: Any, **_kwargs: Any) -> str:
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(interactive_prompt, "get_enhanced_input", fake_get_enhanced_input)
+
+    prompt_ui = InteractivePrompt()
+    agent_app = _FakeAgentApp(["vertex-rag"])
+
+    await prompt_ui.prompt_loop(
+        send_func=fake_send,
+        default_agent="vertex-rag",
+        available_agents=["vertex-rag"],
+        prompt_provider=cast("AgentApp", agent_app),
+    )
+
+    output = capsys.readouterr().out
+    assert "Generation cancelled by user." in output
+
+
+@pytest.mark.asyncio
+async def test_prompt_loop_propagates_task_cancellation_during_send(
+    monkeypatch,
+) -> None:
+    inputs = iter(["hello", "STOP"])
+    send_calls = {"count": 0}
+
+    async def fake_get_enhanced_input(*_args: Any, **kwargs: Any) -> str:
+        available_agent_names = kwargs.get("available_agent_names")
+        if available_agent_names is not None:
+            enhanced_prompt.available_agents = set(available_agent_names)
+        return next(inputs)
+
+    async def fake_send(*_args: Any, **_kwargs: Any) -> str:
+        send_calls["count"] += 1
+        task = asyncio.current_task()
+        assert task is not None
+        task.cancel()
+        await asyncio.sleep(0)
+        return ""
+
+    monkeypatch.setattr(interactive_prompt, "get_enhanced_input", fake_get_enhanced_input)
+
+    prompt_ui = InteractivePrompt()
+    agent_app = _FakeAgentApp(["vertex-rag"])
+
+    with pytest.raises(asyncio.CancelledError):
+        await prompt_ui.prompt_loop(
+            send_func=fake_send,
+            default_agent="vertex-rag",
+            available_agents=["vertex-rag"],
+            prompt_provider=cast("AgentApp", agent_app),
+        )
+
+    assert send_calls["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_prompt_loop_propagates_external_cancellation_during_send(
+    monkeypatch,
+) -> None:
+    inputs = iter(["hello", "STOP"])
+    send_started = asyncio.Event()
+
+    async def fake_get_enhanced_input(*_args: Any, **kwargs: Any) -> str:
+        available_agent_names = kwargs.get("available_agent_names")
+        if available_agent_names is not None:
+            enhanced_prompt.available_agents = set(available_agent_names)
+        return next(inputs)
+
+    async def fake_send(*_args: Any, **_kwargs: Any) -> str:
+        send_started.set()
+        await asyncio.Event().wait()
+        return ""
+
+    monkeypatch.setattr(interactive_prompt, "get_enhanced_input", fake_get_enhanced_input)
+
+    prompt_ui = InteractivePrompt()
+    agent_app = _FakeAgentApp(["vertex-rag"])
+
+    task = asyncio.create_task(
+        prompt_ui.prompt_loop(
+            send_func=fake_send,
+            default_agent="vertex-rag",
+            available_agents=["vertex-rag"],
+            prompt_provider=cast("AgentApp", agent_app),
+        )
+    )
+
+    await asyncio.wait_for(send_started.wait(), timeout=1.0)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_prompt_loop_double_ctrl_c_exits(monkeypatch) -> None:
+    inputs = iter([InterruptCommand(), InterruptCommand()])
+
+    async def fake_get_enhanced_input(*_args: Any, **kwargs: Any) -> InterruptCommand:
+        available_agent_names = kwargs.get("available_agent_names")
+        if available_agent_names is not None:
+            enhanced_prompt.available_agents = set(available_agent_names)
+        return next(inputs)
+
+    async def fake_send(*_args: Any, **_kwargs: Any) -> str:
+        return ""
+
+    monkeypatch.setattr(interactive_prompt, "get_enhanced_input", fake_get_enhanced_input)
+
+    prompt_ui = InteractivePrompt()
+    agent_app = _FakeAgentApp(["vertex-rag"])
+
+    with pytest.raises(PromptExitError):
+        await prompt_ui.prompt_loop(
+            send_func=fake_send,
+            default_agent="vertex-rag",
+            available_agents=["vertex-rag"],
+            prompt_provider=cast("AgentApp", agent_app),
+        )
+
+
+@pytest.mark.asyncio
+async def test_prompt_loop_stop_exits_after_cancelled_generation(
+    monkeypatch,
+) -> None:
+    class _CancelledGenerationAgent(_FakeAgent):
+        def __init__(self) -> None:
+            super().__init__()
+            self._message_history = []
+
+    class _CancelledGenerationApp(_FakeAgentApp):
+        def __init__(self) -> None:
+            super().__init__(["test"])
+            self._agents["test"] = _CancelledGenerationAgent()
+
+        def _agent(self, agent_name: str | None):
+            if agent_name is None:
+                return self._agents["test"]
+            return self._agents[agent_name]
+
+    inputs = iter(["hello", "STOP"])
+    input_calls = {"count": 0}
+    send_calls = {"count": 0}
+
+    async def fake_get_enhanced_input(*_args: Any, **kwargs: Any) -> str:
+        available_agent_names = kwargs.get("available_agent_names")
+        if available_agent_names is not None:
+            enhanced_prompt.available_agents = set(available_agent_names)
+        input_calls["count"] += 1
+        return next(inputs)
+
+    async def fake_send(_message: Any, _agent_name: str) -> str:
+        send_calls["count"] += 1
+        return ""
+
+    monkeypatch.setattr(interactive_prompt, "get_enhanced_input", fake_get_enhanced_input)
+
+    prompt_ui = InteractivePrompt()
+    agent_app = _CancelledGenerationApp()
+
+    async def send_wrapper(message: Any, agent_name: str) -> str:
+        result = await fake_send(message, agent_name)
+        if send_calls["count"] == 1:
+            cancelled_message = Prompt.assistant(
+                "",
+                stop_reason=LlmStopReason.CANCELLED,
+            )
+            agent_app._agent(agent_name).message_history.append(cancelled_message)
+        return result
+
+    await prompt_ui.prompt_loop(
+        send_func=send_wrapper,
+        default_agent="test",
+        available_agents=["test"],
+        prompt_provider=cast("AgentApp", agent_app),
+    )
+
+    # hello + STOP(exit)
+    assert input_calls["count"] == 2
+    assert send_calls["count"] == 1

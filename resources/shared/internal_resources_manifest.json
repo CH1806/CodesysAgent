@@ -1,0 +1,29 @@
+[
+  {
+    "uri": "internal://fast-agent/agent-cards",
+    "title": "AgentCard Guidance",
+    "description": "AgentCard schema, placeholders, and execution behavior reference.",
+    "why": "Use when creating, validating, or loading AgentCards and ToolCards.",
+    "mime_type": "text/markdown",
+    "source": "agent_cards.md",
+    "tags": ["agent-cards", "reference"]
+  },
+  {
+    "uri": "internal://fast-agent/model-overlays",
+    "title": "Model Overlay Reference",
+    "description": "Model overlay manifest format, auth options, defaults, metadata, and llama.cpp import behavior.",
+    "why": "Use when creating, validating, or editing local model overlays and overlay-related model config.",
+    "mime_type": "text/markdown",
+    "source": "model_overlays.md",
+    "tags": ["models", "overlays", "reference"]
+  },
+  {
+    "uri": "internal://fast-agent/execution-environments",
+    "title": "Execution Environment Configuration Reference",
+    "description": "Generated named execution environment config schema, examples, and rules.",
+    "why": "Use when creating, validating, or editing local, Docker, Hugging Face Sandbox, or custom execution environments in fast-agent.yaml.",
+    "mime_type": "text/markdown",
+    "source": "execution_environments.md",
+    "tags": ["environments", "config", "reference"]
+  }
+]
